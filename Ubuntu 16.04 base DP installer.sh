@@ -4825,7 +4825,11 @@ show_usage_help() {
 
 ────────────────────────────────────────────────────────────'
 
-  show_paged "$msg"
+  # Save content to temporary file and display with show_textbox
+  local tmp_help_file="/tmp/xdr_dp_usage_help_$(date '+%Y%m%d-%H%M%S').txt"
+  echo "${msg}" > "${tmp_help_file}"
+  show_textbox "XDR Platform Installer Usage Guide" "${tmp_help_file}"
+  rm -f "${tmp_help_file}"
 }
 
 

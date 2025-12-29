@@ -5147,7 +5147,7 @@ show_usage_help() {
   ────────────────────────────────────────────
 
   ● OS Requirements
-    - Ubuntu Server 20.04 / 22.04 / 24.04 LTS
+    - Ubuntu Server 24.04 LTS
     - Keep default options during initial installation (SSH enabled)
     - **Note:** When executing the script, Netplan will be disabled and switched to **ifupdown**.
 

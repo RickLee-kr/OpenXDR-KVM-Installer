@@ -91,14 +91,28 @@ show_textbox() {
     WIDTH=100
   fi
 
+  # Set default values
   [ -z "${HEIGHT}" ] && HEIGHT=25
   [ -z "${WIDTH}" ] && WIDTH=100
-  [ "${HEIGHT}" -lt 15 ] && HEIGHT=15
-  [ "${WIDTH}" -lt 60 ] && WIDTH=60
+  
+  # Ensure minimum size and limit maximum size
+  [ "${HEIGHT}" -lt 20 ] && HEIGHT=20
+  [ "${HEIGHT}" -gt 50 ] && HEIGHT=50
+  [ "${WIDTH}" -lt 80 ] && WIDTH=80
+  [ "${WIDTH}" -gt 120 ] && WIDTH=120
+
+  # Ensure sufficient margin for scrolling in whiptail
+  local box_height=$((HEIGHT-6))
+  local box_width=$((WIDTH-6))
+  
+  # Ensure minimum display size
+  [ "${box_height}" -lt 15 ] && box_height=15
+  [ "${box_width}" -lt 70 ] && box_width=70
 
   if ! whiptail --title "${title}" \
-                --textbox "${file}" $((HEIGHT-4)) $((WIDTH-4)); then
-    # Cancel (ESC) is ignored and just return
+                --scrolltext \
+                --textbox "${file}" "${box_height}" "${box_width}"; then
+    # Ignore cancel (ESC) and just return
     :
   fi
 }
@@ -5421,7 +5435,11 @@ show_usage_help() {
 
 ────────────────────────────────────────────────────────────'
 
-  show_paged "$msg"
+  # Save content to temporary file and display with show_textbox
+  local tmp_help_file="/tmp/xdr_dp_usage_help_$(date '+%Y%m%d-%H%M%S').txt"
+  echo "${msg}" > "${tmp_help_file}"
+  show_textbox "XDR Platform Installer Usage Guide" "${tmp_help_file}"
+  rm -f "${tmp_help_file}"
 }
 
 

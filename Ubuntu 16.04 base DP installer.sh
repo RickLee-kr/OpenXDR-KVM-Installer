@@ -54,6 +54,7 @@ STEP_IDS=(
   "10_dl_master_deploy"
   "11_da_master_deploy"
   "12_sriov_cpu_affinity"
+  "13_install_dp_cli"
 )
 
 # STEP display names (shown in UI)
@@ -70,6 +71,7 @@ STEP_NAMES=(
   "10. Deploy DL-master VM"
   "11. Deploy DA-master VM"
   "12. SR-IOV / CPU Affinity / PCI Passthrough"
+  "13. Install DP Appliance CLI package"
 )
 
 NUM_STEPS=${#STEP_IDS[@]}
@@ -410,6 +412,9 @@ run_step() {
       ;;
     "12_sriov_cpu_affinity")
       step_12_sriov_cpu_affinity || rc=$?
+      ;;
+    "13_install_dp_cli")
+      step_13_install_dp_cli || rc=$?
       ;;
     *)
       log "ERROR: Undefined STEP ID: ${step_id}"
@@ -4068,6 +4073,214 @@ EOF
 }
 
 
+###############################################################################
+# STEP 13 – Install DP Appliance CLI package (use local files, no internet download)
+###############################################################################
+step_13_install_dp_cli() {
+    local STEP_ID="13_install_dp_cli"
+    local STEP_NAME="13. Install DP Appliance CLI package"
+    local _DRY="${DRY_RUN:-0}"
+    _DRY="${_DRY//\"/}"
+
+    local VENV_DIR="/opt/dp_cli_venv"
+    local ERRLOG="/var/log/aella/dp_cli_step13_error.log"
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Installing/Applying DP Appliance CLI package"
+
+    if type load_config >/dev/null 2>&1; then
+        load_config || true
+    fi
+
+    if ! whiptail --title "STEP 13 Execution Confirmation" \
+                  --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar files in current directory)\n\nDo you want to continue?" 15 85
+    then
+        log "User cancelled STEP 13 execution."
+        return 0
+    fi
+
+    # 0) Prepare error log file
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Preparing error log file: ${ERRLOG}"
+    else
+        mkdir -p /var/log/aella || true
+        : > "${ERRLOG}" || true
+        chmod 644 "${ERRLOG}" || true
+    fi
+
+    # 1) Search for local dp_cli package
+    local pkg=""
+    pkg="$(ls -1 ./dp_cli-*.tar.gz 2>/dev/null | sort -V | tail -n 1 || true)"
+    if [[ -z "${pkg}" ]]; then
+        pkg="$(ls -1 ./dp_cli-*.tar 2>/dev/null | sort -V | tail -n 1 || true)"
+    fi
+
+    if [[ -z "${pkg}" ]]; then
+        whiptail --title "STEP 13 - DP CLI Installation" \
+                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample) dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp_cli package not found in current directory."
+        return 1
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] dp_cli package file detected: ${pkg}"
+
+    # 2) required packages
+    run_cmd "apt-get update -y"
+    run_cmd "apt-get install -y python3-pip python3-venv"
+
+    # 3) Create/initialize venv then install dp-cli
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Creating venv: ${VENV_DIR}"
+        log "[DRY-RUN] Installing dp-cli in venv: ${pkg}"
+        log "[DRY-RUN] Runtime verification performed based on import"
+    else
+        rm -rf "${VENV_DIR}" || true
+        python3 -m venv "${VENV_DIR}" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv creation failed: ${VENV_DIR}" | tee -a "${ERRLOG}"
+            return 1
+        }
+
+        "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+
+        # setuptools<81 pin
+        "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv pip/setuptools installation failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            return 1
+        }
+
+        "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall "${pkg}" >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli installation failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            return 1
+        }
+
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp_cli import failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            return 1
+        }
+
+        if [[ ! -x "${VENV_DIR}/bin/aella_cli" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: ${VENV_DIR}/bin/aella_cli does not exist." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: dp-cli package must include console_scripts (aella_cli) entry point." | tee -a "${ERRLOG}"
+            return 1
+        fi
+
+        # Runtime verification performed only based on import (removed aella_cli execution smoke test)
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli runtime import verification failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            return 1
+        }
+    fi
+
+    # 4) /usr/local/bin/aella_cli wrapper
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Creating/overwriting /usr/local/bin/aella_cli as venv wrapper"
+    else
+        cat > /usr/local/bin/aella_cli <<EOF
+#!/bin/bash
+exec "${VENV_DIR}/bin/aella_cli" "\$@"
+EOF
+        chmod +x /usr/local/bin/aella_cli
+
+        if [[ -x "${VENV_DIR}/bin/aella_cli_disk_encrypt" ]]; then
+            cat > /usr/local/bin/aella_cli_disk_encrypt <<EOF
+#!/bin/bash
+exec "${VENV_DIR}/bin/aella_cli_disk_encrypt" "\$@"
+EOF
+            chmod +x /usr/local/bin/aella_cli_disk_encrypt
+        fi
+    fi
+
+    # 5) /usr/bin/aella_cli (for login shell)
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Creating /usr/bin/aella_cli wrapper script."
+    else
+        cat > /usr/bin/aella_cli <<'EOF'
+#!/bin/bash
+[ $# -ge 1 ] && exit 1
+cd /tmp || exit 1
+exec sudo /usr/local/bin/aella_cli
+EOF
+        chmod +x /usr/bin/aella_cli
+    fi
+
+    # 6) Register in /etc/shells
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Adding /usr/bin/aella_cli to /etc/shells (if not present)."
+    else
+        if ! grep -qx "/usr/bin/aella_cli" /etc/shells 2>/dev/null; then
+            echo "/usr/bin/aella_cli" >> /etc/shells
+        fi
+    fi
+
+    # 7) stellar sudo NOPASSWD
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Creating /etc/sudoers.d/stellar: 'stellar ALL=(ALL) NOPASSWD: ALL'"
+    else
+        echo "stellar ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/stellar
+        chmod 440 /etc/sudoers.d/stellar
+        visudo -cf /etc/sudoers.d/stellar >/dev/null 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: sudoers syntax invalid: /etc/sudoers.d/stellar" | tee -a "${ERRLOG}"
+            return 1
+        }
+    fi
+
+    # 8) syslog group
+    if id stellar >/dev/null 2>&1; then
+        run_cmd "usermod -a -G syslog stellar"
+    else
+        log "[WARN] User 'stellar' does not exist, skipping syslog group addition."
+    fi
+
+    # 9) Change login shell
+    if id stellar >/dev/null 2>&1; then
+        if [[ "${_DRY}" -eq 1 ]]; then
+            log "[DRY-RUN] Changing stellar login shell to /usr/bin/aella_cli."
+        else
+            chsh -s /usr/bin/aella_cli stellar || true
+        fi
+    fi
+
+    # 10) Change /var/log/aella ownership
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Creating /var/log/aella directory/changing ownership (stellar)"
+    else
+        mkdir -p /var/log/aella
+        if id stellar >/dev/null 2>&1; then
+            chown -R stellar:stellar /var/log/aella || true
+        fi
+    fi
+
+    # 11) Verification
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Skipping installation verification step."
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: /usr/local/bin/aella_cli*"
+        ls -l /usr/local/bin/aella_cli* 2>/dev/null || true
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv dp_cli import"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || true
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv pkg_resources"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; print('pkg_resources OK')") >>"${ERRLOG}" 2>&1 || true
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: runtime import check"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: error log path => ${ERRLOG}"
+        tail -n 40 "${ERRLOG}" 2>/dev/null || true
+    fi
+
+    if type mark_step_done >/dev/null 2>&1; then
+        mark_step_done "${STEP_ID}"
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 13. Install DP Appliance CLI package ====="
+    echo
+}
 
 
 

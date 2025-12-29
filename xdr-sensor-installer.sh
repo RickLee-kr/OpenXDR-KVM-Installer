@@ -287,9 +287,9 @@ load_config() {
   # Default values (set only if not already set)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
   : "${SENSOR_VERSION:=6.2.0}"
-  : "${ACPS_USERNAME:=AellaMeta}"
+  : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
-  : "${ACPS_PASSWORD:=WroTQfm/W6x10}"
+  : "${ACPS_PASSWORD:=}"
 
   # Auto-reboot related default values
   : "${ENABLE_AUTO_REBOOT:=1}"

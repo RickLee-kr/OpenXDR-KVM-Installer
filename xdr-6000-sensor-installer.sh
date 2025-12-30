@@ -237,7 +237,7 @@ restart_vm_safely() {
 
   # 1. Check if running and attempt shutdown
   if virsh list --name | grep -q "^${vm_name}$"; then
-    log "   -> '${vm_name}' Running. Attempting normal shutdown (Shutdown)..."
+    log "   -> '${vm_name}' is running. Attempting normal shutdown..."
     virsh shutdown "${vm_name}" > /dev/null 2>&1
 
     # 2. Wait for shutdown (Loop)
@@ -255,19 +255,19 @@ restart_vm_safely() {
         break
       fi
     done
-    log "   -> '${vm_name}' Shutdown confirmed."
+    log "   -> '${vm_name}' shutdown confirmed."
   else
-    log "   -> '${vm_name}'is Already powered off."
+    log "   -> '${vm_name}' is already powered off."
   fi
 
   # 4. VM start
-  log "   -> '${vm_name}' Restarting..."
+  log "   -> '${vm_name}' is restarting..."
   virsh start "${vm_name}"
   
   if [ $? -eq 0 ]; then
-    log "[SUCCESS] '${vm_name}' Restart completed."
+    log "[SUCCESS] '${vm_name}' restart completed."
   else
-    log "[ERROR] '${vm_name}' Start failed."
+    log "[ERROR] '${vm_name}' start failed."
     return 1
   fi
 }
@@ -591,7 +591,7 @@ run_step() {
                 --yesno "${step_name}\n\nDo you want to execute this step?" 12 70
   then
     # User cancellation is considered "normal flow" (not an error)
-    log "User STEP ${step_id} execution was cancelled."
+    log "User canceled execution of STEP ${step_id}."
     return 0   # Must end with 0 here so set -e doesn't trigger in main case.
   fi
 
@@ -744,11 +744,11 @@ run_step() {
     # On failure, guide to the log file location
     local log_info=""
     if [[ -f "${LOG_FILE}" ]]; then
-      log_info="\n\nCheck detailed log: tail -f ${LOG_FILE}"
+      log_info="\n\nCheck the detailed log: tail -f ${LOG_FILE}"
     fi
     
     whiptail --title "STEP Failed - ${step_id}" \
-             --msgbox "STEP ${step_id} (${step_name}) An error occurred during execution.\n\nPlease check the log and re-run the STEP if necessary.\nThe script can continue to be used.${log_info}" 16 80
+             --msgbox "An error occurred during execution of STEP ${step_id} (${step_name}).\n\nPlease check the log and re-run the STEP if necessary.\nThe installer can continue to run.${log_info}" 16 80
   fi
 
   # ★ run_step always exits with 0 so set -e doesn't trigger here
@@ -823,7 +823,7 @@ step_01_hw_detect() {
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
       [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- NAT top NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB"
+      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB"
     fi
   fi
   
@@ -869,10 +869,10 @@ step_01_hw_detect() {
   fi
 
   sensor_vcpus=$(whiptail --title "STEP 01 - Sensor vCPU (Total) Configuration" \
-                          --inputbox "Enter the total vCPU (total) that 2 sensor VMs will use.\n\nTotal logical CPUs: ${total_cpus}\nDefault value (total): ${default_sensor_total_vcpus}\nExample) Enter 44 → mds 22 / mds2 22" \
+                          --inputbox "Enter the total vCPU (total) that 2 sensor VMs will use.\n\nTotal logical CPUs: ${total_cpus}\nDefault value (total): ${default_sensor_total_vcpus}\nExample: Enter 44 → mds 22 / mds2 22" \
                           13 78 "${SENSOR_TOTAL_VCPUS:-${default_sensor_total_vcpus}}" \
                           3>&1 1>&2 2>&3) || {
-    log "User cancelled sensor vCPU configuration."
+    log "User canceled sensor vCPU configuration."
     return 1
   }
 
@@ -952,10 +952,10 @@ step_01_hw_detect() {
   fi
 
   sensor_gb=$(whiptail --title "STEP 01 - Sensor Memory (Total) Configuration" \
-                       --inputbox "Enter the total memory (GB, total) that 2 sensor VMs will use.\n\nTotal memory: ${total_mem_gb}GB\nRecommended value (total): ${default_sensor_total_gb}GB\nExample) Enter 64 → mds 32 / mds2 32" \
+                       --inputbox "Enter the total memory (GB, total) that 2 sensor VMs will use.\n\nTotal memory: ${total_mem_gb}GB\nRecommended value (total): ${default_sensor_total_gb}GB\nExample: Enter 64 → mds 32 / mds2 32" \
                        13 80 "${SENSOR_TOTAL_MEMORY_GB:-${default_sensor_total_gb}}" \
                        3>&1 1>&2 2>&3) || {
-    log "User cancelled sensor memory configuration."
+    log "User canceled sensor memory configuration."
     return 1
   }
 
@@ -1019,10 +1019,10 @@ step_01_hw_detect() {
   local total_lv_size_gb
   while true; do
     total_lv_size_gb=$(whiptail --title "STEP 01 - Sensor Storage Size Configuration" \
-                         --inputbox "Please enter the total storage size (GB, Total) that 2 Sensor VMs will use.\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Minimum size(Total): 160GB (Per VM 80GB Standard)\n- Default value (total): 1000GB\n\nExample) Enter 1000 → mds 500 / mds2 500\n\nSize (GB):" \
+                         --inputbox "Please enter the total storage size (GB, Total) that 2 Sensor VMs will use.\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Minimum size (Total): 160GB (Per VM 80GB Standard)\n- Default value (total): 1000GB\n\nExample: Enter 1000 → mds 500 / mds2 500\n\nSize (GB):" \
                          18 80 "1000" \
                          3>&1 1>&2 2>&3) || {
-      log "User cancelled sensor storage size configuration."
+      log "User canceled sensor storage size configuration."
       return 1
     }
 
@@ -1113,7 +1113,7 @@ step_01_hw_detect() {
   
   if [[ "${net_mode}" == "bridge" ]]; then
     # Bridge Mode: HOST NIC + DATA NIC Selection
-    log "[STEP 01] Bridge Mode - HOST NICand DATA NICobject marker Select each."
+    log "[STEP 01] Bridge Mode - HOST NIC and DATA NIC selection"
     
     # HOST NIC Selection
     local host_nic
@@ -1122,7 +1122,7 @@ step_01_hw_detect() {
                        20 80 10 \
                        "${nic_list[@]}" \
                        3>&1 1>&2 2>&3) || {
-      log "User cancelled HOST NIC selection."
+      log "User canceled HOST NIC selection."
       return 1
     }
 
@@ -1137,7 +1137,7 @@ step_01_hw_detect() {
                        20 80 10 \
                        "${nic_list[@]}" \
                        3>&1 1>&2 2>&3) || {
-      log "User cancelled Data NIC selection."
+      log "User canceled Data NIC selection."
       return 1
     }
 
@@ -1146,28 +1146,28 @@ step_01_hw_detect() {
     save_config_var "DATA_NIC" "${DATA_NIC}"
     
   elif [[ "${net_mode}" == "nat" ]]; then
-    # NAT Mode: Select only 1 NAT top NIC
-    log "[STEP 01] NAT Mode - NAT top NIC Select only one."
+    # NAT Mode: Select only 1 NAT uplink NIC
+    log "[STEP 01] NAT Mode - NAT uplink NIC selection (select one)"
     
     local nat_nic
-    nat_nic=$(whiptail --title "STEP 01 - NAT top NIC Selection (NAT Mode)" \
-                      --menu "Select NAT network top NIC.\nThis NIC will be 'mgt'renamed to and used for external connections.\nSensor VM will be virbr0 connected to NAT bridge.\nCurrent setting: ${HOST_NIC:-<None>}" \
+    nat_nic=$(whiptail --title "STEP 01 - NAT uplink NIC Selection (NAT Mode)" \
+                      --menu "Select NAT network uplink NIC.\nThis NIC will be renamed to 'mgt' and used for external connections.\nSensor VM will be connected to virbr0 NAT bridge.\nCurrent setting: ${HOST_NIC:-<None>}" \
                       20 90 10 \
                       "${nic_list[@]}" \
                       3>&1 1>&2 2>&3) || {
-      log "User cancelled NAT top NIC selection."
+      log "User canceled NAT uplink NIC selection."
       return 1
     }
 
-    log "Selected NAT top NIC: ${nat_nic}"
-    HOST_NIC="${nat_nic}"  # HOST_NIC in variable NAT top NIC Store
+    log "Selected NAT uplink NIC: ${nat_nic}"
+    HOST_NIC="${nat_nic}"  # HOST_NIC in variable NAT uplink NIC Store
     DATA_NIC=""  # DATA NIC is not used in NAT mode
     save_config_var "HOST_NIC" "${HOST_NIC}"
     save_config_var "DATA_NIC" "${DATA_NIC}"
     
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Configuration Error" --msgbox "Unknown is the Sensor network mode: ${net_mode}\n\nPlease select the correct mode in environment settings(bridge or nat)Please select." 12 70
+    whiptail --title "Configuration Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
     return 1
   fi
 
@@ -1218,7 +1218,7 @@ step_01_hw_detect() {
                                 20 80 10 \
                                 "${span_nic_list[@]}" \
                                 3>&1 1>&2 2>&3) || {
-    log "User cancelled SPAN NIC selection."
+    log "User canceled SPAN NIC selection."
     return 1
   }
 
@@ -1229,19 +1229,19 @@ step_01_hw_detect() {
   SPAN_NICS="${selected_span_nics}"
   save_config_var "SPAN_NICS" "${SPAN_NICS}"
 
-  # ===== Additional: mds2(Second sensor)to assign to SPAN NIC Selection =====
+  # ===== Additional: SPAN NIC Selection for mds2 (second sensor) =====
   local mds2_candidates=()
   for n in ${SPAN_NICS}; do
-    mds2_candidates+=("${n}" "mds2assign to" "OFF")
+    mds2_candidates+=("${n}" "Assign to mds2" "OFF")
   done
 
   local selected_span_nics_mds2
   selected_span_nics_mds2=$(whiptail --title "STEP 01 - mds2 SPAN NIC Selection" \
-    --checklist "From all SPAN NICs mds2(Second sensor)Select NICs to assign to.\n\nNICs not selected will be mds(First sensor)automatically assigned to." \
+    --checklist "Select NICs from all SPAN NICs to assign to mds2 (second sensor).\n\nNICs not selected will be automatically assigned to mds (first sensor)." \
     18 80 10 \
     "${mds2_candidates[@]}" \
     3>&1 1>&2 2>&3) || {
-      log "User cancelled mds2 SPAN NIC selection."
+      log "User canceled mds2 SPAN NIC selection."
       return 1
     }
 
@@ -1284,7 +1284,7 @@ step_01_hw_detect() {
     for nic in ${SPAN_NICS_MDS1}; do
       pci_addr=$(readlink -f "/sys/class/net/${nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
       if [[ -z "${pci_addr}" ]]; then
-        log "WARNING: ${nic}PCI address could not be found for."
+        log "WARNING: ${nic} PCI address could not be found."
         continue
       fi
       span_pci_list_mds1="${span_pci_list_mds1} ${pci_addr}"
@@ -1294,7 +1294,7 @@ step_01_hw_detect() {
     for nic in ${SPAN_NICS_MDS2}; do
       pci_addr=$(readlink -f "/sys/class/net/${nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
       if [[ -z "${pci_addr}" ]]; then
-        log "WARNING: ${nic}PCI address could not be found for."
+        log "WARNING: ${nic} PCI address could not be found."
         continue
       fi
       span_pci_list_mds2="${span_pci_list_mds2} ${pci_addr}"
@@ -1381,8 +1381,8 @@ EOF
 - Sensor memory     : ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)
 - LV location          : ${LV_LOCATION}
 - LV size          : ${LV_SIZE_GB}GB
-- NAT top NIC     : ${HOST_NIC}
-- Data NIC         : N/A (NAT in mode virbr0 is used)
+- NAT uplink NIC     : ${HOST_NIC}
+- Data NIC         : N/A (NAT mode using virbr0)
 - SPAN NICs       : ${SPAN_NICS}
 - SPAN attachment mode    : ${SPAN_ATTACH_MODE}
 - ${pci_label}     : ${SENSOR_SPAN_VF_PCIS}
@@ -1452,7 +1452,7 @@ step_02_hwe_kernel() {
   {
     echo "Current kernel version(uname -r): ${cur_kernel}"
     echo
-    echo "${pkg_name} Installation status: ${hwe_installed}"
+    echo "${pkg_name} installation status: ${hwe_installed}"
     echo
     echo "This STEP performs the following tasks:"
     echo "  1) apt update"
@@ -1468,10 +1468,10 @@ step_02_hwe_kernel() {
   # ... After calculating cur_kernel, hwe_installed, show Overview textbox ...
 
   if [[ "${hwe_installed}" == "yes" ]]; then
-    if ! whiptail --title "STEP 02 - Already HWE Kernel Installationdone" \
-                  --yesno "linux-generic-hwe-24.04 package is Already is installed...." 18 80
+    if ! whiptail --title "STEP 02 - HWE Kernel Already Installed" \
+                  --yesno "linux-generic-hwe-24.04 package is already installed.\n\nDo you want to skip this STEP?" 18 80
     then
-      log "User 'Already Installed' judged STEP 02 skipped entire."
+      log "User chose to skip STEP 02 entirely (already installed)."
       save_state "02_hwe_kernel"
       return 0
     fi
@@ -1483,7 +1483,7 @@ step_02_hwe_kernel() {
   if ! whiptail --title "STEP 02 Execution Confirmation" \
                  --yesno "Do you want to proceed with the above tasks?\n\n(yes: Continue / no: Cancel)" 12 70
   then
-    log "User cancelled STEP 02 execution."
+    log "User canceled STEP 02 execution."
     return 0
   fi
 
@@ -1513,10 +1513,10 @@ step_02_hwe_kernel() {
   # 2) HWE Kernel Package install
   #######################################
   if [[ "${hwe_installed}" == "yes" ]]; then
-    log "[STEP 02] ${pkg_name} package is Already is installed → skip installation step"
+    log "[STEP 02] ${pkg_name} package is already installed → skip installation step"
   else
-    echo "=== HWE Kernel Package Installing (This may take some time) ==="
-    log "[STEP 02] ${pkg_name} package Installing..."
+    echo "=== Installing HWE Kernel Package (This may take some time) ==="
+    log "[STEP 02] Installing ${pkg_name} package..."
     log "Install HWE kernel to ensure latest hardware compatibility."
     run_cmd "sudo DEBIAN_FRONTEND=noninteractive apt install -y ${pkg_name}"
     echo "=== HWE Kernel Package Installation completed ==="
@@ -1527,11 +1527,11 @@ step_02_hwe_kernel() {
   #######################################
   local new_kernel hwe_now
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    # DRY-RUN in mode does not actually install, so uname -r / Installation status all Existing use value
+    # In DRY-RUN mode, installation is not actually performed, so use existing uname -r and installation status values
     new_kernel="${cur_kernel}"
     hwe_now="${hwe_installed}"
   else
-    # in actual execution mode Current kernel versionand HWE package re-check installation status
+    # In actual execution mode, check current kernel version and HWE package installation status again
     new_kernel=$(uname -r 2>/dev/null || echo "unknown")
     if dpkg -l | grep -q "^ii  ${pkg_name}[[:space:]]"; then
       hwe_now="yes"
@@ -1541,7 +1541,7 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "STEP 02 execution Result Summary"
+    echo "STEP 02 execution summary"
     echo "----------------------"
     echo "Previous kernel(uname -r): ${cur_kernel}"
     echo "Current kernel(uname -r): ${new_kernel}"
@@ -1559,7 +1559,7 @@ step_02_hwe_kernel() {
   show_textbox "STEP 02 Result Summary" "${tmp_status}"
 
   # reboot itself STEP 05 upon completion, common logic(AUTO_REBOOT_AFTER_STEP_ID)performed only once in
-  log "[STEP 02] HWE Kernel Installation step has been completed. New HWE kernel will be after will be applied on host reboot."
+  log "[STEP 02] HWE Kernel Installation step has been completed. New HWE kernel will be applied on host reboot."
 
   return 0
 }
@@ -1575,7 +1575,7 @@ step_03_nic_ifupdown() {
 
   # Execute branch by mode
   if [[ "${net_mode}" == "bridge" ]]; then
-    log "[STEP 03] Bridge Mode - Existing execute L2 bridge method"
+    log "[STEP 03] Bridge Mode - Configuring L2 bridge method"
     step_03_bridge_mode
     return $?
   elif [[ "${net_mode}" == "nat" ]]; then
@@ -1584,7 +1584,7 @@ step_03_nic_ifupdown() {
     return $?
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Network mode Error" --msgbox "Unknown Sensor network mode: ${net_mode}\n\nPlease select the correct mode in environment settings(bridge or nat)Please select." 12 70
+    whiptail --title "Network Mode Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
     return 1
   fi
 }
@@ -1595,11 +1595,11 @@ step_03_nic_ifupdown() {
 step_03_bridge_mode() {
   log "[STEP 03 Bridge Mode] L2 bridge based network configuration"
 
-  # HOST_NICand DATA_NICcheck if this is set
+  # Check if HOST_NIC and DATA_NIC are set
   if [[ -z "${HOST_NIC:-}" || -z "${DATA_NIC:-}" ]]; then
-    whiptail --title "STEP 03 - NIC Not configured" \
-             --msgbox "HOST_NIC or DATA_NICis is not set.\n\nFirst STEP 01in NICmust be selected." 12 70
-    log "HOST_NIC or DATA_NICis is empty, so STEP 03 Bridge Mode cannot proceed."
+    whiptail --title "STEP 03 - NIC Not Configured" \
+             --msgbox "HOST_NIC or DATA_NIC is not set.\n\nPlease select NICs in STEP 01 first." 12 70
+    log "HOST_NIC or DATA_NIC is empty, so STEP 03 Bridge Mode cannot proceed."
     return 1
   fi
 
@@ -1619,8 +1619,8 @@ step_03_bridge_mode() {
     echo
 
     if [[ -z "${SPAN_NIC_LIST:-}" ]]; then
-      echo "  Warning: SPAN_NIC_LISTcan is not set."
-      echo "  First STEP 01in SPAN NICmust be selected."
+      echo "  Warning: SPAN_NIC_LIST is not set."
+      echo "  Please select SPAN NICs in STEP 01 first."
     else
       local span_error=0 
       for span_nic in ${SPAN_NIC_LIST}; do
@@ -1636,8 +1636,8 @@ step_03_bridge_mode() {
       
       if [[ ${span_error} -eq 1 ]]; then
         echo
-        echo "※ some SPAN NICcould not retrieve PCI information for."
-        echo "   STEP 01in correct NICplease check if you selected."
+        echo "※ Could not retrieve PCI information for some SPAN NICs."
+        echo "   Please check if you selected correct NICs in STEP 01."
       fi
     fi
   } > "${tmp_pci}"
@@ -1665,16 +1665,16 @@ step_03_bridge_mode() {
 
   if [[ "${maybe_done}" -eq 1 ]]; then
     if whiptail --title "STEP 03 - Already configured thing same" \
-                --yesno "udev rules and /etc/network/interfaceslooking at Already seems to be configured.\n\nDo you want to skip this STEP?" 18 80
+                --yesno "Looking at udev rules and /etc/network/interfaces, configuration seems to be already done.\n\nDo you want to skip this STEP?" 18 80
     then
-      log "User 'Already configured' judged STEP 03 skipped entire."
+      log "User chose to skip STEP 03 entirely (already configured)."
       return 0
     fi
-    log "User STEP 03chose to force re-execute."
+    log "User chose to force re-execute STEP 03."
   fi
 
   #######################################
-  # 1) HOST IP collect configuration values (default valueextracted from Current setting)
+  # 1) Collect HOST IP configuration values (default values extracted from current setting)
   #######################################
   local cur_cidr cur_ip cur_prefix cur_gw cur_dns
   cur_cidr=$(ip -4 -o addr show dev "${HOST_NIC}" 2>/dev/null | awk '{print $4}' | head -n1)
@@ -1698,8 +1698,8 @@ step_03_bridge_mode() {
     new_ip="${cur_ip}"
     log "[DRY-RUN] HOST IP configuration: ${new_ip} (default value Use)"
   else
-    new_ip=$(whiptail --title "STEP 03 - HOST IP configuration" \
-                      --inputbox "HOST of interface IP addressPlease enter.\nExample: 10.4.0.210" \
+    new_ip=$(whiptail --title "STEP 03 - HOST IP Configuration" \
+                      --inputbox "Enter HOST interface IP address:\nExample: 10.4.0.210" \
                       10 60 "${cur_ip}" \
                       3>&1 1>&2 2>&3) || return 0
   fi
@@ -1756,7 +1756,7 @@ step_03_bridge_mode() {
     30) netmask="255.255.255.252" ;;
     *)
       netmask=$(whiptail --title "STEP 03 - HOST Netmask direct input" \
-                         --inputbox "Unknown HOST prefix(/${new_prefix}) is.\nPlease enter netmask directly.\nExample: 255.255.255.0" \
+                         --inputbox "Unknown HOST prefix: /${new_prefix}.\nPlease enter netmask directly.\nExample: 255.255.255.0" \
                          10 70 "255.255.255.0" \
                          3>&1 1>&2 2>&3) || return 1
       ;;
@@ -1801,7 +1801,7 @@ step_03_bridge_mode() {
 # SPAN Interface ${span_nic} PCI-bus ${span_pci} (PF PCI passthrough specific, SR-IOV not used)
 ACTION==\"add\", SUBSYSTEM==\"net\", KERNELS==\"${span_pci}\", NAME:=\"${span_nic}\""
       else
-        log "WARNING: SPAN NIC ${span_nic}PCI address could not be found for."
+        log "WARNING: SPAN NIC ${span_nic} PCI address could not be found."
       fi
     done
   fi
@@ -2145,16 +2145,16 @@ EOF
 }
 
 #######################################
-# STEP 03 - NAT Mode (OpenXDR NAT configure porting)
+# STEP 03 - NAT Mode (OpenXDR NAT configuration)
 #######################################
 step_03_nat_mode() {
-  log "[STEP 03 NAT Mode] OpenXDR NAT configure based network configure"
+  log "[STEP 03 NAT Mode] OpenXDR NAT-based network configuration"
 
-  # NAT mode requires only HOST_NIC (NAT top NIC)
+  # NAT mode requires only HOST_NIC (NAT uplink NIC)
   if [[ -z "${HOST_NIC:-}" ]]; then
     whiptail --title "STEP 03 - NAT NIC Not configured" \
-             --msgbox "NAT top NIC(HOST_NIC)is is not set.\n\nFirst STEP 01in NAT top NICmust be selected." 12 70
-    log "HOST_NIC(NAT top NIC)is is empty, so STEP 03 NAT Mode cannot proceed."
+             --msgbox "NAT uplink NIC (HOST_NIC) is not set.\n\nPlease select NAT uplink NIC in STEP 01 first." 12 70
+    log "HOST_NIC (NAT uplink NIC) is empty, so STEP 03 NAT Mode cannot proceed."
     return 1
   fi
 
@@ -2175,7 +2175,7 @@ step_03_nat_mode() {
   {
     echo "Selected NAT network NIC and PCI information"
     echo "------------------------------------"
-    echo "NAT top NIC  : ${HOST_NIC}"
+    echo "NAT uplink NIC  : ${HOST_NIC}"
     echo "  -> PCI     : ${nat_pci}"
     echo
     echo "Sensor VM will be virbr0 connected to NAT bridge."
@@ -2204,7 +2204,7 @@ step_03_nat_mode() {
     if whiptail --title "STEP 03 - Already configured thing same" \
                 --yesno "Looking at udev rules and /etc/network/interfaces, NAT configuration seems to be already done.\n\nDo you want to skip this STEP?" 12 80
     then
-      log "User judged 'Already configured' and skipped STEP 03 NAT Mode."
+      log "User chose to skip STEP 03 NAT Mode (already configured)."
       return 0
     fi
     log "User chose to force re-execute STEP 03 NAT Mode."
@@ -2233,12 +2233,12 @@ step_03_nat_mode() {
 
   # IP configuration Receive input
   local new_ip new_netmask new_gw new_dns
-  new_ip=$(whiptail --title "STEP 03 - mgt NIC IP configuration" \
-                    --inputbox "NAT top NIC(mgt)of  IP addressPlease enter:" \
+  new_ip=$(whiptail --title "STEP 03 - mgt NIC IP Configuration" \
+                    --inputbox "Enter NAT uplink NIC (mgt) IP address:" \
                     8 60 "${cur_ip}" \
                     3>&1 1>&2 2>&3)
   if [[ -z "${new_ip}" ]]; then
-    log "User cancelled IP input."
+    log "User canceled IP input."
     return 1
   fi
 
@@ -2251,21 +2251,21 @@ step_03_nat_mode() {
     *)  netmask="255.255.255.0" ;;
   esac
 
-  new_netmask=$(whiptail --title "STEP 03 - netmask configuration" \
-                         --inputbox "netmaskPlease enter:" \
+  new_netmask=$(whiptail --title "STEP 03 - Netmask Configuration" \
+                         --inputbox "Enter netmask:" \
                          8 60 "${netmask}" \
                          3>&1 1>&2 2>&3)
   if [[ -z "${new_netmask}" ]]; then
-    log "User cancelled netmask input."
+    log "User canceled netmask input."
     return 1
   fi
 
-  new_gw=$(whiptail --title "STEP 03 - Gateway configuration" \
-                    --inputbox "Gateway IPPlease enter:" \
+  new_gw=$(whiptail --title "STEP 03 - Gateway Configuration" \
+                    --inputbox "Enter gateway IP:" \
                     8 60 "${cur_gw}" \
                     3>&1 1>&2 2>&3)
   if [[ -z "${new_gw}" ]]; then
-    log "User cancelled Gateway input."
+    log "User canceled gateway input."
     return 1
   fi
 
@@ -2274,12 +2274,12 @@ step_03_nat_mode() {
                      8 60 "${cur_dns}" \
                      3>&1 1>&2 2>&3)
   if [[ -z "${new_dns}" ]]; then
-    log "User cancelled DNS input."
+    log "User canceled DNS input."
     return 1
   fi
 
   #######################################
-  # 2) Create udev rule (NAT top NIC → mgt rename + SPAN NIC name fixed)
+  # 2) Create udev rule (NAT uplink NIC → mgt rename + SPAN NIC name fixed)
   #######################################
   log "[STEP 03 NAT Mode] Create udev rule (${HOST_NIC} → mgt + SPAN NIC name fixed)"
   
@@ -2295,7 +2295,7 @@ step_03_nat_mode() {
 # SPAN Interface ${span_nic} PCI-bus ${span_pci} (PF PCI passthrough specific, SR-IOV not used)
 SUBSYSTEM==\"net\", ACTION==\"add\", KERNELS==\"${span_pci}\", NAME:=\"${span_nic}\""
       else
-        log "WARNING: SPAN NIC ${span_nic}PCI address could not be found for."
+        log "WARNING: SPAN NIC ${span_nic} PCI address could not be found."
       fi
     done
   fi
@@ -2314,9 +2314,9 @@ EOF
   #######################################
   # 3) /etc/network/interfaces configuration (OpenXDR method)
   #######################################
-  log "[STEP 03 NAT Mode] /etc/network/interfaces configure"
+  log "[STEP 03 NAT Mode] Configuring /etc/network/interfaces"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] /etc/network/interfaces mgt NIC configure"
+    log "[DRY-RUN] Configuring /etc/network/interfaces for mgt NIC"
   else
     cp /etc/network/interfaces /etc/network/interfaces.backup.$(date +%Y%m%d-%H%M%S)
     
@@ -2338,7 +2338,7 @@ iface mgt inet static
     gateway ${new_gw}
     dns-nameservers ${new_dns}
 EOF
-    log "/etc/network/interfaces configure Completed"
+    log "/etc/network/interfaces configuration completed"
   fi
 
   #######################################
@@ -2374,10 +2374,10 @@ EOF
   summary=$(cat <<EOF
 [STEP 03 NAT Mode Completed]
 
-NAT network configureis Completeddone.
+NAT network configuration completed.
 
-network configure:
-- NAT top NIC  : ${HOST_NIC} → mgt (${new_ip}/${new_netmask})
+Network configuration:
+- NAT uplink NIC  : ${HOST_NIC} → mgt (${new_ip}/${new_netmask})
 - Gateway      : ${new_gw}
 - DNS          : ${new_dns}
 - Sensor VM      : Connected to virbr0 NAT bridge (192.168.122.0/24)
@@ -2437,7 +2437,7 @@ step_04_kvm_libvirt() {
     echo "libvirtd service active: ${libvirtd_ok}"
     echo
     echo "This STEP performs the following tasks:"
-    echo "  1) KVM / Libvirt related package install"
+    echo "  1) KVM / Libvirt related package installation"
     echo "  2) Add user to libvirt group"
     echo "  3) Enable libvirtd / virtlogd services"
     if [[ "${net_mode}" == "bridge" ]]; then
@@ -2456,7 +2456,7 @@ step_04_kvm_libvirt() {
     then
       log "User chose to force re-execute STEP 04."
     else
-      log "User 'Already configured' judged STEP 04 skipped entire."
+      log "User chose to skip STEP 04 entirely (already configured)."
       return 0
     fi
   fi
@@ -2464,7 +2464,7 @@ step_04_kvm_libvirt() {
   if ! whiptail --title "STEP 04 Execution Confirmation" \
                  --yesno "Do you want to proceed with KVM / Libvirt installation?" 10 60
   then
-    log "User STEP 04 execution was cancelled."
+    log "User canceled STEP 04 execution."
     return 0
   fi
 
@@ -2472,7 +2472,7 @@ step_04_kvm_libvirt() {
   # 1) package install
   #######################################
   echo "=== Installing KVM/virtualization environment (This may take some time) ==="
-  log "[STEP 04] KVM / Libvirt related package install"
+  log "[STEP 04] KVM / Libvirt related package installation"
   log "Installing essential packages for building virtualization environment..."
 
   local packages=(
@@ -2492,8 +2492,8 @@ step_04_kvm_libvirt() {
   
   for pkg in "${packages[@]}"; do
     ((pkg_count++))
-    echo "=== package $pkg_count/$total_pkgs: $pkg Installing ==="
-    log "package Installing: $pkg ($pkg_count/$total_pkgs)"
+    echo "=== Installing package $pkg_count/$total_pkgs: $pkg ==="
+    log "Installing package: $pkg ($pkg_count/$total_pkgs)"
     run_cmd "sudo DEBIAN_FRONTEND=noninteractive apt install -y ${pkg}"
     echo "=== $pkg Installation completed ==="
   done
@@ -2563,7 +2563,7 @@ EOF
     log "Sensor VM will use virbr0 NAT bridge (192.168.122.0/24)."
     
   else
-    log "ERROR: Unknown Network mode: ${net_mode}"
+    log "ERROR: Unknown network mode: ${net_mode}"
     return 1
   fi
 
@@ -2595,7 +2595,7 @@ EOF
   fi
 
   {
-    echo "STEP 04 execution result"
+    echo "STEP 04 execution summary"
     echo "------------------"
     echo "KVM acceleration Use possible: ${final_kvm_ok}"
     echo "libvirtd service: ${final_libvirtd_ok}"
@@ -2664,7 +2664,7 @@ step_05_kernel_tuning() {
     then
       log "User chose to force re-execute STEP 05."
     else
-      log "User 'Already configured' judged STEP 05 skipped entire."
+      log "User chose to skip STEP 05 entirely (already configured)."
       return 0
     fi
   fi
@@ -2672,7 +2672,7 @@ step_05_kernel_tuning() {
   if ! whiptail --title "STEP 05 Execution Confirmation" \
                  --yesno "Do you want to proceed with kernel tuning?" 10 60
   then
-    log "User STEP 05 execution was cancelled."
+    log "User canceled STEP 05 execution."
     return 0
   fi
 
@@ -2817,14 +2817,14 @@ step_05_kernel_tuning() {
     
     log "Swap disable and cleanup completed"
   else
-    log "User cancelled swap disable"
+    log "User canceled swap disable"
   fi
 
   #######################################
   # 5) Result Summary
   #######################################
   {
-    echo "STEP 05 execution result"
+    echo "STEP 05 execution summary"
     echo "------------------"
     echo "GRUB IOMMU configuration: Completed"
     echo "Kernel parameter tuning: Completed"
@@ -2856,18 +2856,18 @@ step_06_libvirt_hooks() {
     step_06_bridge_hooks
     return $?
   elif [[ "${net_mode}" == "nat" ]]; then
-    log "[STEP 06] NAT Mode - OpenXDR NAT hooks install"
+    log "[STEP 06] NAT Mode - Installing OpenXDR NAT hooks"
     step_06_nat_hooks
     return $?
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Network mode Error" --msgbox "Unknown Sensor network mode: ${net_mode}\n\nPlease select the correct mode in environment settings(bridge or nat)Please select." 12 70
+    whiptail --title "Network Mode Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
     return 1
   fi
 }
 
 #######################################
-# STEP 08 - Bridge Mode (Existing sensor hooks)
+# STEP 06 - Bridge Mode (Existing sensor hooks)
 #######################################
 step_06_bridge_hooks() {
   log "[STEP 06 Bridge Mode] Sensor specific libvirt Hooks Installation"
@@ -2906,10 +2906,10 @@ step_06_bridge_hooks() {
 
   show_textbox "STEP 06 - Current hooks status" "${tmp_info}"
 
-  if ! whiptail --title "STEP 08 Execution Confirmation" \
+  if ! whiptail --title "STEP 06 Execution Confirmation" \
                  --yesno "Scripts /etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu will be\ncompletely created/overwritten based on documentation.\n\nDo you want to continue?" 13 80
   then
-    log "User STEP 06 execution was cancelled."
+    log "User canceled STEP 06 execution."
     return 0
   fi
 
@@ -2962,7 +2962,7 @@ EOF
   local HOOK_QEMU="/etc/libvirt/hooks/qemu"
   local HOOK_QEMU_BAK="/etc/libvirt/hooks/qemu.backup.$(date +%Y%m%d-%H%M%S)"
 
-  log "[STEP 08] ${HOOK_QEMU} create/update (OOM restart script only, NAT removed)"
+  log "[STEP 06] ${HOOK_QEMU} create/update (OOM restart script only, NAT removed)"
 
   if [[ -f "${HOOK_QEMU}" ]]; then
     if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -3004,7 +3004,7 @@ EOF
   ########################################
   # 4) Install OOM recovery scripts (last_known_good_pid, check_vm_state)
   ########################################
-  log "[STEP 08] Install OOM recovery scripts (last_known_good_pid, check_vm_state)"
+  log "[STEP 06] Installing OOM recovery scripts (last_known_good_pid, check_vm_state)"
 
   local _DRY="${DRY_RUN:-0}"
 
@@ -3093,9 +3093,9 @@ EOF
     rm -f "${tmp_cron}"
 
     if [[ "${added_flag}" = "1" ]]; then
-      log "[STEP 08] Registered/updated SHELL=/bin/bash and check_vm_state entry in root crontab."
+      log "[STEP 06] Registered/updated SHELL=/bin/bash and check_vm_state entry in root crontab."
     else
-      log "[STEP 08] SHELL=/bin/bash and check_vm_state entry already exist in root crontab."
+      log "[STEP 06] SHELL=/bin/bash and check_vm_state entry already exist in root crontab."
     fi
   fi
 
@@ -3104,7 +3104,7 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 08 execution Result Summary"
+    echo "STEP 06 execution summary"
     echo "----------------------"
     echo
     echo "# /etc/libvirt/hooks/network (first 30 lines)"
@@ -3130,10 +3130,10 @@ EOF
 }
 
 #######################################
-# STEP 06 - NAT Mode (OpenXDR NAT hooks porting)
+# STEP 06 - NAT Mode (OpenXDR NAT hooks configuration)
 #######################################
 step_06_nat_hooks() {
-  log "[STEP 08 NAT Mode] OpenXDR NAT libvirt Hooks Installation"
+  log "[STEP 06 NAT Mode] OpenXDR NAT libvirt Hooks Installation"
 
   local tmp_info="${STATE_DIR}/xdr_step06_nat_info.txt"
   : > "${tmp_info}"
@@ -3156,12 +3156,12 @@ step_06_nat_hooks() {
     echo "- External interface: mgt"
   } > "${tmp_info}"
 
-  show_textbox "STEP 06 NAT Mode - install Overview" "${tmp_info}"
+  show_textbox "STEP 06 NAT Mode - Installation Overview" "${tmp_info}"
 
   if ! whiptail --title "STEP 06 NAT Mode Execution Confirmation" \
                  --yesno "Install libvirt hooks for NAT Mode.\n\n- Apply OpenXDR NAT structure\n- Sensor VM(mds) DNAT configuration\n- OOM monitoring function\n\nDo you want to continue?" 15 70
   then
-    log "User STEP 06 NAT Mode execution was cancelled."
+    log "User canceled STEP 06 NAT Mode execution."
     return 0
   fi
 
@@ -3181,7 +3181,7 @@ step_06_nat_hooks() {
   local HOOK_NET="/etc/libvirt/hooks/network"
   local HOOK_NET_BAK="/etc/libvirt/hooks/network.backup.$(date +%Y%m%d-%H%M%S)"
 
-  log "[STEP 08 NAT Mode] ${HOOK_NET} create (NAT MASQUERADE)"
+  log "[STEP 06 NAT Mode] ${HOOK_NET} create (NAT MASQUERADE)"
 
   if [[ -f "${HOOK_NET}" ]]; then
     if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -3234,7 +3234,7 @@ EOF
   local HOOK_QEMU="/etc/libvirt/hooks/qemu"
   local HOOK_QEMU_BAK="/etc/libvirt/hooks/qemu.backup.$(date +%Y%m%d-%H%M%S)"
 
-  log "[STEP 06 NAT Mode] ${HOOK_QEMU} create (sensor DNAT + OOM monitoring)"
+  log "[STEP 06 NAT Mode] Creating ${HOOK_QEMU} (sensor DNAT + OOM monitoring)"
 
   if [[ -f "${HOOK_QEMU}" ]]; then
     if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -3363,7 +3363,7 @@ EOF
   #######################################
   # 4) Install OOM monitoring scripts (common with Bridge Mode)
   #######################################
-  log "[STEP 06 NAT Mode] Install OOM monitoring script (/usr/bin/last_known_good_pid)"
+  log "[STEP 06 NAT Mode] Installing OOM monitoring script (/usr/bin/last_known_good_pid)"
   # Reuse OOM monitoring scripts same as Bridge Mode
   # (Same as OOM script part in existing step_06_bridge_hooks)
 
@@ -3393,10 +3393,10 @@ OOM monitoring: enabled
 EOF
 )
 
-  whiptail --title "STEP 08 NAT Mode Completed" \
+  whiptail --title "STEP 06 NAT Mode Completed" \
            --msgbox "${summary}" 18 80
 
-  log "[STEP 06 NAT Mode] NAT libvirt Hooks Installation Completed"
+  log "[STEP 06 NAT Mode] NAT libvirt hooks installation completed"
 
   return 0
 }
@@ -3488,7 +3488,7 @@ step_07_sensor_download() {
   if ! whiptail --title "STEP 07 Execution Confirmation" \
                  --yesno "Do you want to proceed with Sensor LV creation and image download?" 10 60
   then
-    log "User STEP 07 execution was cancelled."
+    log "User canceled STEP 07 execution."
     return 0
   fi
 
@@ -3651,9 +3651,9 @@ step_07_sensor_download() {
         exit 1
       fi
       
-      # 2) qcow2 image download (large capacity, local qcow2 not used case only)
+      # 2) qcow2 image download (large capacity, only if local qcow2 is not used)
       if [[ "${need_qcow2}" -eq 1 ]]; then
-        log "[STEP 07] ${qcow2_name} download start: ${image_url}"
+        log "[STEP 07] ${qcow2_name} download started: ${image_url}"
         echo "=== ${qcow2_name} downloading (large capacity file, may take a long time) ==="
         echo "File size may be very large, please wait..."
         if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${image_url}" 2>&1 | tee -a "${LOG_FILE}"; then
@@ -3734,7 +3734,7 @@ step_07_sensor_download() {
   fi
 
   {
-    echo "STEP 07 execution result"
+    echo "STEP 07 execution summary"
     echo "------------------"
     echo "LV(mds)  ${lv_path_mds}  : ${final_lv_mds}"
     echo "LV(mds2) ${lv_path_mds2} : ${final_lv_mds2}"
@@ -3806,7 +3806,7 @@ step_08_sensor_deploy() {
     if ! whiptail --title "STEP 08 - Existing VM Found" \
                   --yesno "mds or mds2 VM already exists.\n\nDo you want to delete existing VMs and redeploy?" 12 80
     then
-      log "User cancelled existing VM redeployment."
+      log "User canceled existing VM redeployment."
       return 0
     else
       for vm in "${SENSOR_VMS[@]}"; do
@@ -3822,7 +3822,7 @@ step_08_sensor_deploy() {
   fi
 
   if ! whiptail --title "STEP 08 Execution Confirmation" --yesno "Do you want to proceed with Sensor VM deployment for 2 VMs (mds, mds2)?" 10 60; then
-    log "User STEP 08 execution was cancelled."
+    log "User canceled STEP 08 execution."
     return 0
   fi
 
@@ -3838,7 +3838,7 @@ step_08_sensor_deploy() {
   #######################################
   # 2) Sensor VM deployment loop (sequential deployment for 2 VMs)
   #######################################
-  log "[STEP 08] Sensor VM sequential deployment start for 2 VMs (mds -> mds2)"
+  log "[STEP 08] Starting sensor VM sequential deployment for 2 VMs (mds -> mds2)"
 
   local release="${SENSOR_VERSION}"
   local nodownload="1"
@@ -3858,7 +3858,7 @@ step_08_sensor_deploy() {
   export disksize="${disksize}"
 
   for hostname in "mds" "mds2"; do
-    log "[STEP 08] -------- ${hostname} deployment start (sequential) --------"
+    log "[STEP 08] -------- ${hostname} deployment started (sequential) --------"
     
     local installdir="/var/lib/libvirt/images/${hostname}"
     local cpus="${cpus_mds}"
@@ -4067,12 +4067,12 @@ step_08_sensor_deploy() {
   fi
 
   {
-    echo "STEP 08 execution result"
+    echo "STEP 08 execution summary"
     echo "------------------"
     echo "VM create status: ${final_vm}"
     echo "VM execution status: ${final_running}"
     echo
-    echo "network configure:"
+    echo "Network configuration:"
     echo "- br-data bridge: Connected as L2-only bridge"
     echo "- SPAN attachment mode: ${SPAN_ATTACH_MODE}"
     echo
@@ -4255,7 +4255,7 @@ step_09_sensor_passthrough() {
         fi
 
         if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${VM_PCIS}" ]]; then
-            log "[STEP 09] ${SENSOR_VM}: PCI Passthrough device connection start... (pcis=${VM_PCIS})"
+            log "[STEP 09] ${SENSOR_VM}: Starting PCI passthrough device connection (pcis=${VM_PCIS})"
 
             for pci_full in ${VM_PCIS}; do
                 if [[ "${pci_full}" =~ ^([0-9a-f]{4}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-9a-f])$ ]]; then
@@ -4275,7 +4275,7 @@ EOF
                     if virsh dumpxml "${SENSOR_VM}" | grep -q "address.*bus='${b}'.*slot='${s}'.*function='${f}'"; then
                         log "[INFO] ${SENSOR_VM}: PCI device(${pci_full}) is already connected."
                     else
-                        log "[ACTION] ${SENSOR_VM}: Connect PCI device(${pci_full}) to VM..."
+                        log "[ACTION] ${SENSOR_VM}: Connecting PCI device (${pci_full}) to VM..."
                         if [[ "${_DRY}" -eq 0 ]]; then
                             if virsh attach-device "${SENSOR_VM}" "${pci_xml}" --config --live; then
                                 log "[SUCCESS] ${SENSOR_VM}: Device connection successful"
@@ -4291,7 +4291,7 @@ EOF
                 fi
             done
         else
-            log "[INFO] ${SENSOR_VM}: PCI Passthrough mode is not enabled or no target device. (pcis=${VM_PCIS:-<empty>})"
+            log "[INFO] ${SENSOR_VM}: PCI passthrough mode is not configured or no target device. (pcis=${VM_PCIS:-<empty>})"
         fi
 
         #######################################################################
@@ -4324,7 +4324,7 @@ EOF
                 local cpu_list_str
                 cpu_list_str="$(lscpu -p=CPU | grep -v '^#' | tr '\n' ' ' | xargs)"
                 if [[ -z "${cpu_list_str}" ]]; then
-                    log "[WARN] ${SENSOR_VM}: Cannot get available CPU list, cannot apply Affinity."
+                    log "[WARN] ${SENSOR_VM}: Cannot retrieve available CPU list, cannot apply Affinity."
                     cpuset_for_vm=""
                 else
                     read -r -a cpu_arr <<< "${cpu_list_str}"
@@ -4381,7 +4381,7 @@ EOF
             if [[ "${hostdev_count}" -gt 0 ]]; then
                 echo "  (Success: PCI Passthrough is working normally)"
             else
-                echo "  (Failure: PCI device not connected. Please check Step 01 configuration)"
+                echo "  (Failure: PCI device not connected. Please check STEP 01 configuration)"
             fi
         } > "${result_file}"
 
@@ -4419,7 +4419,7 @@ step_10_install_dp_cli() {
     if ! whiptail --title "STEP 10 Execution Confirmation" \
                   --yesno "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar file in current directory)\n\nDo you want to continue?" 15 85
     then
-        log "User STEP 10 execution was cancelled."
+        log "User canceled STEP 10 execution."
         return 0
     fi
 
@@ -4441,7 +4441,7 @@ step_10_install_dp_cli() {
 
     if [[ -z "${pkg}" ]]; then
         whiptail --title "STEP 10 - DP CLI install" \
-                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample) dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and execute STEP 10 again." 14 90
+                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and execute STEP 10 again." 14 90
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp_cli package not found in current directory."
         return 1
     fi
@@ -4533,7 +4533,7 @@ EOF
 
     # 6) Register in /etc/shells
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] Add /usr/bin/aella_cli to /etc/shells (if not exists)."
+        log "[DRY-RUN] Adding /usr/bin/aella_cli to /etc/shells (if not exists)"
     else
         if ! grep -qx "/usr/bin/aella_cli" /etc/shells 2>/dev/null; then
             echo "/usr/bin/aella_cli" >> /etc/shells
@@ -4640,7 +4640,7 @@ menu_config() {
           new_dry_run=1
         fi
         save_config_var "DRY_RUN" "${new_dry_run}"
-        whiptail --title "Configuration changed" --msgbox "DRY_RUN changed to ${new_dry_run}." 8 60
+        whiptail --title "Configuration Changed" --msgbox "DRY_RUN changed to ${new_dry_run}." 8 60
         ;;
       2)
         local new_version
@@ -4650,7 +4650,7 @@ menu_config() {
                                3>&1 1>&2 2>&3)
         if [[ -n "${new_version}" ]]; then
           save_config_var "SENSOR_VERSION" "${new_version}"
-          whiptail --title "Configuration changed" --msgbox "Sensor version changed to ${new_version}." 8 60
+          whiptail --title "Configuration Changed" --msgbox "Sensor version changed to ${new_version}." 8 60
         fi
         ;;
       3)
@@ -4661,7 +4661,7 @@ menu_config() {
                                 3>&1 1>&2 2>&3)
         if [[ -n "${new_username}" ]]; then
           save_config_var "ACPS_USERNAME" "${new_username}"
-          whiptail --title "Configuration changed" --msgbox "ACPS username changed." 8 60
+          whiptail --title "Configuration Changed" --msgbox "ACPS username changed." 8 60
         fi
         ;;
       4)
@@ -4672,18 +4672,18 @@ menu_config() {
                                 3>&1 1>&2 2>&3)
         if [[ -n "${new_password}" ]]; then
           save_config_var "ACPS_PASSWORD" "${new_password}"
-          whiptail --title "Configuration changed" --msgbox "ACPS password changed." 8 60
+          whiptail --title "Configuration Changed" --msgbox "ACPS password changed." 8 60
         fi
         ;;
       5)
         local new_url
         new_url=$(whiptail --title "ACPS URL configuration" \
-                           --inputbox "ACPS URL Please enter:" \
+                           --inputbox "Please enter ACPS URL:" \
                            8 80 "${ACPS_BASE_URL}" \
                            3>&1 1>&2 2>&3)
         if [[ -n "${new_url}" ]]; then
           save_config_var "ACPS_BASE_URL" "${new_url}"
-          whiptail --title "Configuration changed" --msgbox "ACPS URL changed." 8 60
+          whiptail --title "Configuration Changed" --msgbox "ACPS URL changed." 8 60
         fi
         ;;
       6)
@@ -4694,19 +4694,19 @@ menu_config() {
           new_reboot=1
         fi
         save_config_var "ENABLE_AUTO_REBOOT" "${new_reboot}"
-        whiptail --title "Configuration changed" --msgbox "Auto Reboot changed to ${new_reboot}." 8 60
+        whiptail --title "Configuration Changed" --msgbox "Auto Reboot changed to ${new_reboot}." 8 60
         ;;
       7)
         local new_mode
         new_mode=$(whiptail --title "SPAN attachment mode selection" \
                              --menu "Select method to connect SPAN NIC to Sensor VM:" \
                              12 70 2 \
-                             "pci"    "PCI passthrough (PF direct assignment, host traffic not used)" \
+                             "pci"    "PCI passthrough (PF direct assignment, host traffic is not used)" \
                              "bridge" "L2 bridge virtio NIC" \
                              3>&1 1>&2 2>&3)
         if [[ -n "${new_mode}" ]]; then
           save_config_var "SPAN_ATTACH_MODE" "${new_mode}"
-          whiptail --title "Configuration changed" --msgbox "SPAN attachment mode changed to ${new_mode}." 8 60
+          whiptail --title "Configuration Changed" --msgbox "SPAN attachment mode changed to ${new_mode}." 8 60
         fi
         ;;
       8)
@@ -4719,7 +4719,7 @@ menu_config() {
                              3>&1 1>&2 2>&3)
         if [[ -n "${new_net_mode}" ]]; then
           save_config_var "SENSOR_NET_MODE" "${new_net_mode}"
-          whiptail --title "Configuration changed" --msgbox "Sensor network mode changed to ${new_net_mode}.\n\nChanges will be applied from STEP 01, please execute again." 12 70
+          whiptail --title "Configuration Changed" --msgbox "Sensor network mode changed to ${new_net_mode}.\n\nChanges will be applied starting from STEP 01. Please execute again." 12 70
         fi
         ;;
       9)
@@ -4829,7 +4829,7 @@ menu_auto_continue_from_state() {
   for ((i=next_idx; i<NUM_STEPS; i++)); do
     if ! run_step "${i}"; then
       whiptail --title "Automatic execution stopped" \
-               --msgbox "Problem occurred during STEP ${STEP_IDS[$i]} execution.\n\nAutomatic execution stopped." 10 70
+               --msgbox "An error occurred during STEP ${STEP_IDS[$i]} execution.\n\nAutomatic execution stopped." 10 70
       break
     fi
   done
@@ -4847,7 +4847,7 @@ main_menu() {
 
     local status_msg
     if [[ -z "${LAST_COMPLETED_STEP}" ]]; then
-      status_msg="No completed step yet."
+      status_msg="No steps completed yet."
     else
       status_msg="Last completed step: ${LAST_COMPLETED_STEP}\nLast execution time: ${LAST_RUN_TIME}"
     fi
@@ -4856,11 +4856,11 @@ main_menu() {
     choice=$(whiptail --title "XDR Sensor Installer Main Menu" \
                       --menu "${status_msg}\n\nDRY_RUN=${DRY_RUN}, STATE_FILE=${STATE_FILE}" \
                       20 90 10 \
-                      "1" "Automatic execution of all steps (Proceed from next step based on current status)" \
-                      "2" "Select specific step only for execution" \
-                      "3" "Environment configuration (DRY_RUN etc)" \
-                      "4" "All configure details verify" \
-                      "5" "Script Usage Guide" \
+                      "1" "Auto execute all steps (continue from next step based on current state)" \
+                      "2" "Select and run specific step only" \
+                      "3" "Configuration (DRY_RUN, etc.)" \
+                      "4" "Full configuration validation" \
+                      "5" "Script usage guide" \
                       "6" "View log" \
                       "7" "Exit" \
                       3>&1 1>&2 2>&3) || continue
@@ -4883,13 +4883,13 @@ main_menu() {
         ;;
       6)
         if [[ -f "${LOG_FILE}" ]]; then
-          show_textbox "XDR Installer log" "${LOG_FILE}"
+          show_textbox "XDR Installer Log" "${LOG_FILE}"
         else
-          whiptail --title "Log not found" --msgbox "Log file does not exist yet." 8 60
+          whiptail --title "Log Not Found" --msgbox "Log file does not exist yet." 8 60
         fi
         ;;
       7)
-        if whiptail --title "Exit confirmation" --yesno "Do you want to exit XDR Installer?" 8 60; then
+        if whiptail --title "Exit Confirmation" --yesno "Do you want to exit XDR Installer?" 8 60; then
           log "XDR Installer exit"
           exit 0
         fi
@@ -4899,11 +4899,11 @@ main_menu() {
 }
 
 #######################################
-# All configure details verify
+# Full Configuration Verification
 #######################################
 
 menu_full_validation() {
-  # All verification read specific commands must execute actual commands regardless of DRY_RUN
+  # All verification commands must execute actual commands regardless of DRY_RUN
   # Due to set -e, if any fails in the middle it will exit, so temporarily ignore errors in this block
   set +e
 
@@ -4911,35 +4911,35 @@ menu_full_validation() {
 
   {
     echo "========================================"
-    echo " XDR Sensor Installer All configure details verify"
+    echo " XDR Sensor Installer Full Configuration Verification"
     echo " Execution time: $(date '+%F %T')"
     echo
-    echo " *** Press space bar or down arrow key to see next message." 
+    echo " *** Press spacebar or down arrow key to see next message." 
     echo " *** Press q to exit this message."
     echo "========================================"
     echo
 
     ##################################################
-    # 1. HWE kernel / IOMMU / GRUB configuration verify
+    # 1. HWE kernel / IOMMU / GRUB Configuration Verification
     ##################################################
-    echo "## 1. HWE kernel / IOMMU / GRUB configuration verify"
+    echo "## 1. HWE kernel / IOMMU / GRUB Configuration Verification"
     echo
     echo "\$ uname -r"
     uname -r 2>&1 || echo "[WARN] uname -r execution failed"
     echo
 
     echo "\$ dpkg -l | grep linux-image"
-    dpkg -l | grep linux-image 2>&1 || echo "[INFO] linux-image package is not displayed."
+    dpkg -l | grep linux-image 2>&1 || echo "[INFO] linux-image packages not displayed."
     echo
 
     echo "\$ grep GRUB_CMDLINE_LINUX /etc/default/grub"
-    grep GRUB_CMDLINE_LINUX /etc/default/grub 2>&1 || echo "[WARN] GRUB_CMDLINE_LINUX not found in /etc/default/grub."
+    grep GRUB_CMDLINE_LINUX /etc/default/grub 2>&1 || echo "[WARN] Could not find GRUB_CMDLINE_LINUX in /etc/default/grub."
     echo
 
     ##################################################
-    # 2. SR-IOV / NIC verify
+    # 2. SR-IOV / NIC Verification
     ##################################################
-    echo "## 2. SR-IOV / NIC verify"
+    echo "## 2. SR-IOV / NIC Verification"
     echo
     echo "\$ ip link show"
     ip link show 2>&1 || echo "[WARN] ip link show execution failed"
@@ -4950,18 +4950,18 @@ menu_full_validation() {
     echo
 
     ##################################################
-    # 3. KVM / Libvirt verify
+    # 3. KVM / Libvirt Verification
     ##################################################
-    echo "## 3. KVM / Libvirt verify"
+    echo "## 3. KVM / Libvirt Verification"
     echo
 
     echo "\$ lsmod | grep kvm"
-    lsmod | grep kvm 2>&1 || echo "[WARN] kvm related kernel modules are not loaded."
+    lsmod | grep kvm 2>&1 || echo "[WARN] kvm kernel module is not loaded."
     echo
 
     echo "\$ kvm-ok"
     if command -v kvm-ok >/dev/null 2>&1; then
-      kvm-ok 2>&1 || echo "[WARN] kvm-ok result is not OK."
+      kvm-ok 2>&1 || echo "[WARN] kvm-ok check failed (KVM may not be available)."
     else
       echo "[INFO] kvm-ok command not found (cpu-checker package not installed)."
     fi
@@ -5024,7 +5024,7 @@ menu_full_validation() {
     echo "STATE_FILE: ${STATE_FILE}"
     if [[ -f "${STATE_FILE}" ]]; then
       echo "--- ${STATE_FILE} content ---"
-      cat "${STATE_FILE}" 2>&1 || echo "[WARN] State file read failed"
+      cat "${STATE_FILE}" 2>&1 || echo "[WARN] Status file read failed"
     else
       echo "[INFO] State file not found."
     fi
@@ -5040,12 +5040,12 @@ menu_full_validation() {
     echo
 
     echo "========================================"
-    echo " verify Completed: $(date '+%F %T')"
+    echo "Verification completed: $(date '+%F %T')"
     echo "========================================"
 
   } > "${tmp_file}" 2>&1
 
-  show_textbox "XDR Sensor All configure details verify" "${tmp_file}"
+  show_textbox "XDR Sensor Full Configuration Verification" "${tmp_file}"
 
   # Clean up temporary file
   rm -f "${tmp_file}"
@@ -5055,7 +5055,7 @@ menu_full_validation() {
 }
 
 #######################################
-# Script Usage Guide
+# Script usage guide
 #######################################
 
 show_usage_help() {
@@ -5071,14 +5071,14 @@ show_usage_help() {
       1) Switch to root with sudo -i
       2) Create directory with mkdir -p /opt/xdr-installer command
       3) Store this script in that directory then execute
-  - Press **space bar / ↓ arrow key** to move to next page in Guide message
+  - Press **spacebar / ↓ arrow key** to move to next page in Guide message
   - Press **q** Enter to exit
 
 
   ────────────────────────────────────────────
   ① 🔰 Case using immediately after Ubuntu install (first install)
   ────────────────────────────────────────────
-  - If you select menu **1 (Automatic execution of all steps)**,  
+  - If you select menu **1 (Auto execute all steps)**,  
     STEP 01 → STEP 02 → STEP 03 → … will be executed automatically in order.
 
   - **After STEP 03 (network), STEP 05 (kernel tuning) completion, server will automatically reboot.**
@@ -5088,7 +5088,7 @@ show_usage_help() {
   ────────────────────────────────────────────
   ② 🔧 If some install/environment is already configured
   ────────────────────────────────────────────
-  - You can configure the following in menu **3 (Environment configuration)**.
+  - You can configure the following in menu **3 (Configuration)**.
       • DRY_RUN (simulation mode) — default value: 1 (for testing)  
       • SENSOR_VERSION (sensor version to install)
       • SENSOR_NET_MODE (bridge or nat)
@@ -5102,12 +5102,12 @@ show_usage_help() {
   ③ 🧩 Case wanting to execute only specific function or step-by-step
   ────────────────────────────────────────────
   - Example: Sensor VM (mds) redeploy, network configuration change, image redownload etc  
-  - In menu **2 (Select specific step only for execution)**, you can execute only desired step standalone.
+  - In menu **2 (Select and run specific step only)**, you can execute only desired step standalone.
 
   ────────────────────────────────────────────
-  ④ 🔍 After all installation completed – configure verify step
+  ④ 🔍 After all installation completed – configuration verification step
   ────────────────────────────────────────────
-  - After all installation is finished, execute menu **4 (All configure details verify)** to  
+  - After all installation is finished, execute menu **4 (Full configuration validation)** to  
     check if the following items are installed correctly and match:
       • KVM / Libvirt status
       • Sensor VM (mds) deployment and execution status
@@ -5115,7 +5115,7 @@ show_usage_help() {
       • LVM storage configure (ubuntu-vg)
 
   - If WARN message appears during verify,  
-    you can do required configuration again individually in menu **2**.
+    you can apply required configuration again individually in menu **2**.
 
   ────────────────────────────────────────────
                   📦 Hardware and Software Requirements
@@ -5132,7 +5132,7 @@ show_usage_help() {
     - disk: 
         • OS and sensor public: Use **ubuntu-vg** volume group
         • Minimum Available space: 100GB or more recommended (minimum 80GB)
-    - NIC configure:
+    - NIC configuration:
         • management network (Host/MGT): 1GbE or more (for SSH access)
         • SPAN network (Data): For receiving mirroring traffic (PCI Passthrough recommended)
 

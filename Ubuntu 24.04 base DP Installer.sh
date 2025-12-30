@@ -404,7 +404,7 @@ run_step() {
                 --yesno "${step_name}\n\nDo you want to execute this step?" 12 70
   then
     # User cancellation is considered "normal flow" (not an error)
-    log "User cancelled execution of STEP ${step_id}."
+    log "User canceled execution of STEP ${step_id}."
     return 0   # Must return 0 here so set -e doesn't trigger in the main case statement
   fi
 
@@ -492,7 +492,7 @@ run_step() {
   else
     log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
     whiptail --title "STEP Failed - ${step_id}" \
-             --msgbox "An error occurred while executing STEP ${step_id} (${step_name}).\n\nPlease check the logs and re-run the STEP if necessary.\nThe script can continue to be used." 14 80
+             --msgbox "An error occurred while executing STEP ${step_id} (${step_name}).\n\nPlease check the logs and re-run the STEP if necessary.\nThe installer can continue to run." 14 80
   fi
 
   # ★ run_step always returns 0 so set -e doesn't trigger here
@@ -557,7 +557,7 @@ apply_pdf_xml_patch() {
     elif [[ -f "${disk_path}" ]]; then
         log "[PATCH] RAW file already exists, skipping conversion: ${disk_path}"
     else
-        log "[ERROR] Cannot find original disk image to convert."
+        log "[ERROR] Could not find original disk image to convert."
         return 1
     fi
 
@@ -742,7 +742,7 @@ step_01_hw_detect() {
                      20 80 10 \
                      "${nic_list[@]}" \
                      3>&1 1>&2 2>&3) || {
-    log "User cancelled mgt NIC selection."
+    log "User canceled mgt NIC selection."
     return 1
   }
 
@@ -760,7 +760,7 @@ step_01_hw_detect() {
                        20 80 10 \
                        "${nic_list[@]}" \
                        3>&1 1>&2 2>&3) || {
-    log "User cancelled cltr0 NIC selection."
+    log "User canceled cltr0 NIC selection."
     return 1
   }
 
@@ -768,7 +768,7 @@ step_01_hw_detect() {
     if ! whiptail --title "Warning" \
                   --yesno "mgt NIC and cltr0 NIC are the same.\nThis configuration is not recommended.\nDo you still want to continue?" 12 70
     then
-      log "User cancelled same NIC usage configuration."
+      log "User canceled same NIC usage configuration."
       return 1
     fi
   fi
@@ -786,7 +786,7 @@ step_01_hw_detect() {
                       22 90 10 \
                       "${nic_list[@]}" \
                       3>&1 1>&2 2>&3) || {
-    log "User cancelled HOST_NIC selection."
+    log "User canceled HOST_NIC selection."
     return 1
   }
 
@@ -860,7 +860,7 @@ step_01_hw_detect() {
                             22 85 10 \
                             "${disk_list[@]}" \
                             3>&1 1>&2 2>&3) || {
-    log "User cancelled disk selection."
+    log "User canceled disk selection."
     return 1
   }
 
@@ -945,7 +945,7 @@ step_02_hwe_kernel() {
 
   if [[ "${hwe_installed}" == "yes" ]]; then
     if ! whiptail --title "STEP 02 - HWE Kernel Already Installed" \
-                  --yesno "linux-generic-hwe-24.04 package is already installed...." 18 80
+                  --yesno "linux-generic-hwe-24.04 package is already installed..." 18 80
     then
       log "User chose to skip STEP 02 entirely based on 'already installed' judgment."
       save_state "02_hwe_kernel"
@@ -959,7 +959,7 @@ step_02_hwe_kernel() {
   if ! whiptail --title "STEP 02 Execution Confirmation" \
                  --yesno "Do you want to proceed with the above tasks?\n\n(Yes: Continue / No: Cancel)" 12 70
   then
-    log "User cancelled STEP 02 execution."
+    log "User canceled STEP 02 execution."
     return 0
   fi
 
@@ -982,7 +982,7 @@ step_02_hwe_kernel() {
   fi
 
   #######################################
-  # 3) Post-installation Status Summary
+  # 3) Post-installation status summary
   #######################################
   local new_kernel hwe_now
   if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -1000,7 +1000,7 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "STEP 02 Execution Result Summary"
+    echo "STEP 02 execution summary"
     echo "----------------------"
     echo "Previous kernel (uname -r): ${cur_kernel}"
     echo "Current kernel (uname -r): ${new_kernel}"
@@ -1161,7 +1161,7 @@ step_03_nic_ifupdown() {
     30) netmask="255.255.255.252" ;;
     *)
       netmask=$(whiptail --title "STEP 03 - Enter Netmask Directly" \
-                         --inputbox "Unknown prefix(/${new_prefix}).\nPlease enter netmask directly.\nExample: 255.255.255.0" \
+                         --inputbox "Unknown prefix: /${new_prefix}.\nPlease enter netmask directly.\nExample: 255.255.255.0" \
                          10 70 "255.255.255.0" \
                          3>&1 1>&2 2>&3) || return 1
       ;;
@@ -1432,9 +1432,9 @@ step_04_kvm_libvirt() {
     echo "1) CPU Virtualization Support (vmx/svm presence)"
     egrep -c '(vmx|svm)' /proc/cpuinfo 2>/dev/null || echo "0"
     echo
-    echo "2) KVM/Libvirt Related Package Installation Status (dpkg -l)"
+    echo "2) KVM/Libvirt related package installation status (dpkg -l)"
     dpkg -l | egrep 'qemu-kvm|libvirt-daemon-system|libvirt-clients|virtinst|bridge-utils|qemu-utils|virt-viewer|genisoimage|net-tools|cpu-checker|ipset|ipcalc-ng' \
-      || echo "(No related package installation information)"
+      || echo "(no related package installation information)"
     echo
     echo "3) libvirtd Service Status (brief)"
     systemctl is-active libvirtd 2>/dev/null || echo "inactive"
@@ -1448,7 +1448,7 @@ step_04_kvm_libvirt() {
   if ! whiptail --title "STEP 04 Execution Confirmation" \
                  --yesno "KVM/Libvirt package installation and default network...Do you want to continue?" 13 80
   then
-    log "User cancelled STEP 04 execution."
+    log "User canceled STEP 04 execution."
     return 0
   fi
 
@@ -1576,7 +1576,7 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 04 Execution Result Summary"
+    echo "STEP 04 execution summary"
     echo "-----------------------"
     echo
     echo "# virsh net-list --all"
@@ -1649,7 +1649,7 @@ EOF
       for r in "${fail_reasons[@]}"; do
         msg+="$r\n"
       done
-      msg+="\n[STEP 04] After re-running KVM / Libvirt installation and default network (virbr0) configuration,\nplease check the logs."
+      msg+="\n[STEP 04] After re-running KVM / Libvirt installation and default network (virbr0) configuration,\nPlease check the logs."
 
       log "[STEP 04] Essential component verification failed → returning rc=1"
       whiptail --title "STEP 04 Verification Failed" --msgbox "${msg}" 20 90
@@ -1711,7 +1711,7 @@ step_05_kernel_tuning() {
   if ! whiptail --title "STEP 05 Execution Confirmation" \
                  --yesno "Do you want to proceed with applying kernel parameters defined in documentation, disabling KSM, disabling Swap, and configuring IOMMU?\n\n(Yes: Continue / No: Cancel)" 15 80
   then
-    log "User cancelled STEP 05 execution."
+    log "User canceled STEP 05 execution."
     return 0
   fi
 
@@ -1761,7 +1761,7 @@ step_05_kernel_tuning() {
       sudo update-grub
     fi
   else
-    log "[WARN] Cannot find ${grub_file} file. Skipping GRUB/IOMMU configuration."
+    log "[WARN] Could not find ${grub_file} file. Skipping GRUB/IOMMU configuration."
   fi
   
   #######################################
@@ -1971,7 +1971,7 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 05 Execution Result Summary"
+    echo "STEP 05 execution summary"
     echo "----------------------"
     echo
     echo "# vm.min_free_kbytes (after application)"
@@ -2100,7 +2100,7 @@ step_06_ntpsec() {
   if ! whiptail --title "STEP 06 Execution Confirmation" \
 	             --yesno "After installing iavf(i40evf) driver on the host,\nNTPsec configuration will proceed.\n\nDo you want to continue?" 13 80
   then
-    log "User cancelled STEP 06 execution."
+    log "User canceled STEP 06 execution."
     return 0
   fi
 
@@ -2217,7 +2217,7 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 06 (SR-IOV + NTPsec) Execution Result Summary"
+    echo "STEP 06 (SR-IOV + NTPsec) execution summary"
     echo "----------------------------------------"
     echo
     echo "# SR-IOV VF driver (iavf/i40evf) module status (lsmod)"
@@ -2322,7 +2322,7 @@ step_07_lvm_storage() {
   if ! whiptail --title "STEP 07 - Warning" \
                  --yesno "All existing partitions/data on the disks shown above (/dev/${DATA_SSD_LIST})\nwill be deleted and used exclusively for LVM.\n\nDo you want to continue?" 15 70
   then
-    log "User cancelled STEP 07 disk initialization."
+    log "User canceled STEP 07 disk initialization."
     return 0
   fi
 
@@ -2498,7 +2498,7 @@ step_07_lvm_storage() {
       log "[STEP 07] /stellar ownership change completed"
     fi
   else
-    log "[WARN] Cannot find 'stellar' user account, skipping chown."
+    log "[WARN] Could not find 'stellar' user account, skipping chown."
   fi
 
   #######################################
@@ -2552,7 +2552,7 @@ step_08_libvirt_hooks() {
   if ! whiptail --title "STEP 08 Execution Confirmation" \
                  --yesno "The /etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu scripts will be\ncompletely created/overwritten based on the document.\n\nDo you want to continue?" 13 80
   then
-    log "User cancelled STEP 08 execution."
+    log "User canceled STEP 08 execution."
     return 0
   fi
 
@@ -2925,7 +2925,7 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 08 Execution Result Summary"
+    echo "STEP 08 execution summary"
     echo "----------------------"
     echo
     echo "# /etc/libvirt/hooks/network (first 30 lines)"
@@ -3265,7 +3265,7 @@ step_09_dp_download() {
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 09 Execution Result Summary"
+    echo "STEP 09 execution summary"
     echo "----------------------"
     if [[ "${use_local_qcow}" -eq 1 ]]; then
         echo "# Image Source: Reuse local file"
@@ -3315,7 +3315,7 @@ Are you sure you want to proceed with redeployment?"
       if ! whiptail --title "${step_name} - ${vm_name} Redeployment Confirmation" \
                     --defaultno \
                     --yesno "${msg}" 18 80; then
-          log "[${step_name}] ${vm_name} redeployment cancelled by user."
+          log "[${step_name}] ${vm_name} redeployment canceled by user."
           return 1
       fi
   else
@@ -3330,7 +3330,7 @@ Are you sure you want to proceed with redeployment?"
     case "${answer}" in
       yes|y|Y) ;;
       *)
-        log "[${step_name}] ${vm_name} redeployment cancelled by user."
+        log "[${step_name}] ${vm_name} redeployment canceled by user."
         return 1
         ;;
     esac
@@ -3660,7 +3660,7 @@ step_10_dl_master_deploy() {
 Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
 
     if ! whiptail --title "STEP 10 - DL Deployment" --yesno "${SUMMARY}" 24 80; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User cancelled DL-master deploy."
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled DL-master deploy."
         return 0
     fi
 
@@ -3683,7 +3683,7 @@ Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
     local RC=$?
 
     if [ ${RC} -ne 0 ]; then
-        whiptail --title "STEP 10 - DL Deployment" --msgbox "virt_deploy_uvp_centos.sh execution ended with error code ${RC}.\n\nCheck status with virsh list, virsh console ${DL_HOSTNAME}, etc." 14 80
+        whiptail --title "STEP 10 - DL Deployment" --msgbox "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nCheck status using virsh list, virsh console ${DL_HOSTNAME}, etc." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master deploy failed with RC=${RC}."
         return ${RC}
     fi
@@ -3695,7 +3695,7 @@ Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] WARNING: virt_deploy script finished, but virsh dominfo ${DL_HOSTNAME} failed."
     fi
 
-    whiptail --title "STEP 10 - DL Deployment Complete" --msgbox "DL-master VM (UEFI) deployment and partition expansion configuration completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck status with installation script output logs and\nvirsh list / virsh console ${DL_HOSTNAME}." 14 80
+    whiptail --title "STEP 10 - DL Deployment Complete" --msgbox "DL-master VM (UEFI) deployment and partition expansion configuration completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck status using installation script output logs and\nvirsh list / virsh console ${DL_HOSTNAME}." 14 80
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -3955,7 +3955,7 @@ step_11_da_master_deploy() {
 Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
 
     if ! whiptail --title "STEP 11 - DA Deployment" --yesno "${SUMMARY}" 24 80; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User cancelled DA-master deploy."
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled DA-master deploy."
         return 0
     fi
 
@@ -3978,7 +3978,7 @@ Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
     local RC=$?
 
     if [ ${RC} -ne 0 ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh execution ended with error code ${RC}.\n\nCheck status with virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
+        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nCheck status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
         return ${RC}
     fi
@@ -3990,7 +3990,7 @@ Do you want to execute virt_deploy_uvp_centos.sh with these settings?"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] WARNING: virt_deploy script finished, but virsh dominfo ${DA_HOSTNAME} failed."
     fi
 
-    whiptail --title "STEP 11 - DA Deployment Complete" --msgbox "DA-master VM (UEFI) deployment and partition expansion configuration completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck status with installation script output logs and\nvirsh list / virsh console ${DA_HOSTNAME}." 14 80
+    whiptail --title "STEP 11 - DA Deployment Complete" --msgbox "DA-master VM (UEFI) deployment and partition expansion configuration completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck status using installation script output logs and\nvirsh list / virsh console ${DA_HOSTNAME}." 14 80
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -4493,7 +4493,7 @@ step_13_install_dp_cli() {
     if ! whiptail --title "STEP 13 Execution Confirmation" \
                   --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar files in current directory)\n\nDo you want to continue?" 15 85
     then
-        log "User cancelled STEP 13 execution."
+        log "User canceled STEP 13 execution."
         return 0
     fi
 
@@ -4515,7 +4515,7 @@ step_13_install_dp_cli() {
 
     if [[ -z "${pkg}" ]]; then
         whiptail --title "STEP 13 - DP CLI Installation" \
-                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample) dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
+                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp_cli package not found in current directory."
         return 1
     fi
@@ -5077,7 +5077,7 @@ menu_full_validation() {
   {
     echo "========================================"
     echo " XDR Installer Overall Configuration Validation"
-    echo " Execution Time: $(date '+%F %T')"
+    echo " Execution time: $(date '+%F %T')"
         echo
         echo " *** Press spacebar or down arrow to see next message." 
         echo " *** Press q to exit this message."
@@ -5146,7 +5146,7 @@ menu_full_validation() {
 
     echo "\$ kvm-ok"
     if command -v kvm-ok >/dev/null 2>&1; then
-      kvm-ok 2>&1 || echo "[WARN] kvm-ok result is not OK."
+      kvm-ok 2>&1 || echo "[WARN] kvm-ok check failed (KVM may not be available)."
     else
       echo "[INFO] kvm-ok command not available (cpu-checker package not installed or not included by default in Ubuntu 24.04)."
     fi
@@ -5475,7 +5475,7 @@ menu_auto_continue_from_state() {
                 --yesno "From current state, the next step is:\n\n${next_step_name}\n\nDo you want to execute sequentially from this step?" 15 70
   then
     # No / Cancel → Cancel auto proceed, return to main menu (not an error)
-    log "User cancelled auto proceed."
+    log "User canceled auto proceed."
     return 0
   fi
 

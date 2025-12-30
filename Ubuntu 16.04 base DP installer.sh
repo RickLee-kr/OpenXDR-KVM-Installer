@@ -981,7 +981,7 @@ step_03_nic_ifupdown() {
     *)
       # Unknown prefix → ask user for netmask directly
       netmask=$(whiptail --title "STEP 03 - Enter netmask manually" \
-                         --inputbox "Unknown prefix (/ ${new_prefix}).\nEnter netmask manually.\nExample: 255.255.255.0" \
+                         --inputbox "Unknown prefix: /${new_prefix}.\nEnter netmask manually.\nExample: 255.255.255.0" \
                          10 70 "255.255.255.0" \
                          3>&1 1>&2 2>&3) || return 1
       ;;
@@ -1911,7 +1911,7 @@ step_06_ntpsec() {
   #######################################
   # 4) Comment restrict default kod ... line
   #######################################
-  log "[STEP 06] Comment restrict default kod ... rule"
+  log "[STEP 06] Commenting out restrict default kod ... rule"
 
   if [[ -f "${NTP_CONF}" ]]; then
     if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -2582,7 +2582,7 @@ EOF
   ########################################
   # 4) Install OOM recovery scripts (last_known_good_pid, check_vm_state)
   ########################################
-  log "[STEP 08] Install OOM recovery scripts (last_known_good_pid, check_vm_state)"
+  log "[STEP 08] Installing OOM recovery scripts (last_known_good_pid, check_vm_state)"
 
   local _DRY="${DRY_RUN:-0}"
 
@@ -3239,7 +3239,7 @@ step_10_dl_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail --title "STEP 10 - DL deploy" --msgbox "Cannot find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
+        whiptail --title "STEP 10 - DL deploy" --msgbox "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
         return 0
     fi
@@ -3465,7 +3465,7 @@ step_11_da_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then run again.\nSkipping this step." 12 80
+        whiptail --title "STEP 11 - DA Deployment" --msgbox "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then re-run.\nSkipping this step." 12 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DP_VERSION not set. Skipping DA-master deploy."
         return 0
     fi
@@ -3648,7 +3648,7 @@ step_11_da_master_deploy() {
 Execute virt_deploy_uvp_centos.sh with the above settings?"
 
     if ! whiptail --title "STEP 11 - DA Deployment" --yesno "${SUMMARY}" 24 80; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User cancelled DA-master deploy."
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled DA-master deploy."
         return 0
     fi
 
@@ -3671,7 +3671,7 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
     local RC=$?
 
     if [ ${RC} -ne 0 ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh execution ended with error code ${RC}.\n\nPlease check the status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
+        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nPlease check the status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
         return ${RC}
     fi
@@ -3683,7 +3683,7 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] WARNING: virt_deploy script finished, but virsh dominfo ${DA_HOSTNAME} failed."
     fi
 
-    whiptail --title "STEP 11 - DA Deployment Complete" --msgbox "DA-master VM deployment procedure completed.\n\nPlease check the installation script output log and\nstatus using virsh list / virsh console ${DA_HOSTNAME}." 14 80
+    whiptail --title "STEP 11 - DA Deployment Complete" --msgbox "DA-master VM deployment completed.\n\nPlease check the installation script output log and\nstatus using virsh list / virsh console ${DA_HOSTNAME}." 14 80
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -4095,7 +4095,7 @@ step_13_install_dp_cli() {
     if ! whiptail --title "STEP 13 Execution Confirmation" \
                   --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar files in current directory)\n\nDo you want to continue?" 15 85
     then
-        log "User cancelled STEP 13 execution."
+        log "User canceled STEP 13 execution."
         return 0
     fi
 
@@ -4117,7 +4117,7 @@ step_13_install_dp_cli() {
 
     if [[ -z "${pkg}" ]]; then
         whiptail --title "STEP 13 - DP CLI Installation" \
-                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample) dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
+                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp_cli package not found in current directory."
         return 1
     fi
@@ -4749,7 +4749,7 @@ menu_full_validation() {
 
     echo "\$ kvm-ok"
     if command -v kvm-ok >/dev/null 2>&1; then
-      kvm-ok 2>&1 || echo "[WARN] kvm-ok result is not OK."
+      kvm-ok 2>&1 || echo "[WARN] kvm-ok check failed (KVM may not be available)."
     else
       echo "[INFO] kvm-ok command not available (cpu-checker package not installed or not included by default in Ubuntu 24.04)."
     fi
@@ -5078,7 +5078,7 @@ menu_auto_continue_from_state() {
                 --yesno "From current state, the next step is:\n\n${next_step_name}\n\nExecute from this step sequentially?" 15 70
   then
     # No / Cancel → cancel auto continue, return to main menu (not an error)
-    log "User cancelled auto continue."
+    log "User canceled auto continue."
     return 0
   fi
 

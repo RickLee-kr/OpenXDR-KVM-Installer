@@ -3437,8 +3437,8 @@ step_07_sensor_download() {
   if lvs "${lv_path_mds}" >/dev/null 2>&1; then lv_exists_mds="yes"; fi
   if lvs "${lv_path_mds2}" >/dev/null 2>&1; then lv_exists_mds2="yes"; fi
 
-  if mountpoint -q /stellar/mds 2>/dev/null; then mounted_mds="yes"; fi
-  if mountpoint -q /stellar/mds2 2>/dev/null; then mounted_mds2="yes"; fi
+  if mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then mounted_mds="yes"; fi
+  if mountpoint -q /var/lib/libvirt/images/mds2 2>/dev/null; then mounted_mds2="yes"; fi
 
   {
     echo "Current Sensor LV status"
@@ -3447,8 +3447,8 @@ step_07_sensor_download() {
     echo "LV path(mds2): ${lv_path_mds2}"
     echo "LV exists (mds) : ${lv_exists_mds}"
     echo "LV exists (mds2): ${lv_exists_mds2}"
-    echo "Mounted (mds)  : ${mounted_mds} (/stellar/mds)"
-    echo "Mounted (mds2) : ${mounted_mds2} (/stellar/mds2)"
+    echo "Mounted (mds)  : ${mounted_mds} (/var/lib/libvirt/images/mds)"
+    echo "Mounted (mds2) : ${mounted_mds2} (/var/lib/libvirt/images/mds2)"
     echo
     echo "User configuration:"
     echo "  - LV location: ${LV_LOCATION}"
@@ -3460,8 +3460,8 @@ step_07_sensor_download() {
     echo "     - ${lv_path_mds}"
     echo "     - ${lv_path_mds2}"
     echo "  2) Create ext4 filesystem and mount"
-    echo "     - /stellar/mds"
-    echo "     - /stellar/mds2"
+    echo "     - /var/lib/libvirt/images/mds"
+    echo "     - /var/lib/libvirt/images/mds2"
     echo "  3) Register auto mount in /etc/fstab (2 entries)"
 
     echo "  4) Download sensor image and deployment script"
@@ -3514,26 +3514,53 @@ step_07_sensor_download() {
       run_cmd "sudo mkfs.ext4 -F /dev/${lv_path_mds2}"
     fi
 
-    # mount
-    run_cmd "sudo mkdir -p /stellar/mds /stellar/mds2"
-    if ! mountpoint -q /stellar/mds 2>/dev/null; then
-      run_cmd "sudo mount /dev/${lv_path_mds} /stellar/mds"
+    # Safety check: Ensure mountpoints are not already mounted by different devices
+    local mount_mds="/var/lib/libvirt/images/mds"
+    local mount_mds2="/var/lib/libvirt/images/mds2"
+    
+    if mountpoint -q "${mount_mds}" 2>/dev/null; then
+      local mounted_dev
+      mounted_dev=$(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || echo "")
+      if [[ -n "${mounted_dev}" && "${mounted_dev}" != "/dev/${lv_path_mds}" ]]; then
+        log "[ERROR] ${mount_mds} is already mounted by ${mounted_dev}, expected /dev/${lv_path_mds}"
+        whiptail --title "STEP 07 - Mount Conflict" \
+                 --msgbox "Mount point ${mount_mds} is already mounted by a different device (${mounted_dev}).\n\nPlease unmount it first or use a different mount point." 12 80
+        return 1
+      fi
     fi
-    if ! mountpoint -q /stellar/mds2 2>/dev/null; then
-      run_cmd "sudo mount /dev/${lv_path_mds2} /stellar/mds2"
+    
+    if mountpoint -q "${mount_mds2}" 2>/dev/null; then
+      local mounted_dev2
+      mounted_dev2=$(findmnt -n -o SOURCE "${mount_mds2}" 2>/dev/null || echo "")
+      if [[ -n "${mounted_dev2}" && "${mounted_dev2}" != "/dev/${lv_path_mds2}" ]]; then
+        log "[ERROR] ${mount_mds2} is already mounted by ${mounted_dev2}, expected /dev/${lv_path_mds2}"
+        whiptail --title "STEP 07 - Mount Conflict" \
+                 --msgbox "Mount point ${mount_mds2} is already mounted by a different device (${mounted_dev2}).\n\nPlease unmount it first or use a different mount point." 12 80
+        return 1
+      fi
+    fi
+
+    # mount
+    run_cmd "sudo mkdir -p ${mount_mds} ${mount_mds2}"
+    if ! mountpoint -q "${mount_mds}" 2>/dev/null; then
+      run_cmd "sudo mount /dev/${lv_path_mds} ${mount_mds}"
+    fi
+    if ! mountpoint -q "${mount_mds2}" 2>/dev/null; then
+      run_cmd "sudo mount /dev/${lv_path_mds2} ${mount_mds2}"
     fi
 
     # fstab
-    append_fstab_if_missing "/dev/${lv_path_mds}  /stellar/mds  ext4 defaults,noatime 0 2"  "/stellar/mds"
-    append_fstab_if_missing "/dev/${lv_path_mds2} /stellar/mds2 ext4 defaults,noatime 0 2"  "/stellar/mds2"
+    append_fstab_if_missing "/dev/${lv_path_mds}  ${mount_mds}  ext4 defaults,noatime 0 2"  "${mount_mds}"
+    append_fstab_if_missing "/dev/${lv_path_mds2} ${mount_mds2} ext4 defaults,noatime 0 2"  "${mount_mds2}"
 
     run_cmd "sudo systemctl daemon-reload"
     run_cmd "sudo mount -a"
 
-    # /stellar ownership
-    log "[STEP 07] Change /stellar ownership to stellar:stellar"
+    # Ownership: Only change ownership of mount points, not entire /var/lib/libvirt/images
+    log "[STEP 07] Change mount point ownership to stellar:stellar"
     if id stellar >/dev/null 2>&1; then
-      run_cmd "sudo chown -R stellar:stellar /stellar"
+      run_cmd "sudo chown -R stellar:stellar ${mount_mds}"
+      run_cmd "sudo chown -R stellar:stellar ${mount_mds2}"
     else
       log "[WARN] 'stellar' user account not found, skipping chown."
     fi
@@ -3675,8 +3702,13 @@ step_07_sensor_download() {
   #######################################
   # 8) Configure ownership
   #######################################
-  log "[STEP 07] Configure /stellar ownership (stellar:stellar)"
-  run_cmd "sudo chown -R stellar:stellar /stellar"
+  log "[STEP 07] Configure mount point ownership (stellar:stellar)"
+  if id stellar >/dev/null 2>&1; then
+    run_cmd "sudo chown -R stellar:stellar /var/lib/libvirt/images/mds"
+    run_cmd "sudo chown -R stellar:stellar /var/lib/libvirt/images/mds2"
+  else
+    log "[WARN] 'stellar' user account not found, skipping chown."
+  fi
 
   #######################################
   # 9) Verify result
@@ -3714,12 +3746,12 @@ step_07_sensor_download() {
     fi
 
     # Re-check mount (2 entries)
-    if mountpoint -q /stellar/mds; then
+    if mountpoint -q /var/lib/libvirt/images/mds; then
       final_mount_mds="OK"
     else
       final_mount_mds="FAIL"
     fi
-    if mountpoint -q /stellar/mds2; then
+    if mountpoint -q /var/lib/libvirt/images/mds2; then
       final_mount_mds2="OK"
     else
       final_mount_mds2="FAIL"
@@ -3738,8 +3770,8 @@ step_07_sensor_download() {
     echo "------------------"
     echo "LV(mds)  ${lv_path_mds}  : ${final_lv_mds}"
     echo "LV(mds2) ${lv_path_mds2} : ${final_lv_mds2}"
-    echo "Mount (mds)  /stellar/mds  : ${final_mount_mds}"
-    echo "Mount (mds2) /stellar/mds2 : ${final_mount_mds2}"
+    echo "Mount (mds)  /var/lib/libvirt/images/mds  : ${final_mount_mds}"
+    echo "Mount (mds2) /var/lib/libvirt/images/mds2 : ${final_mount_mds2}"
     echo "Sensor image: ${final_image}"
     echo
     echo "Download location: ${SENSOR_IMAGE_DIR}"
@@ -4116,7 +4148,7 @@ step_09_sensor_passthrough() {
     # common path
     ###########################################################################
     local SRC_BASE="/var/lib/libvirt/images"
-    local STELLAR_BASE="/stellar"   # mds=/stellar/mds, mds2=/stellar/mds2
+    local IMAGES_BASE="/var/lib/libvirt/images"   # mds=/var/lib/libvirt/images/mds, mds2=/var/lib/libvirt/images/mds2
 
     ###########################################################################
     # Process each Sensor VM in SENSOR_VMS array
@@ -4127,11 +4159,11 @@ step_09_sensor_passthrough() {
         #######################################################################
         # 0. Determine per VM mount point + check mount
         #######################################################################
-        local DST_BASE=""   # /stellar/mds or /stellar/mds2
+        local DST_BASE=""   # /var/lib/libvirt/images/mds or /var/lib/libvirt/images/mds2
         if [[ "${SENSOR_VM}" == "mds" ]]; then
-            DST_BASE="${STELLAR_BASE}/mds"
+            DST_BASE="${IMAGES_BASE}/mds"
         else
-            DST_BASE="${STELLAR_BASE}/mds2"
+            DST_BASE="${IMAGES_BASE}/mds2"
         fi
 
         if [[ "${_DRY}" -eq 1 ]]; then
@@ -4154,19 +4186,18 @@ step_09_sensor_passthrough() {
         fi
 
         #######################################################################
-        # [NEW] 1.5. Move sensor image directory + patch VM XML path (Per VM)
-        #  - Move to per VM mount (/stellar/mds, /stellar/mds2)
-        #  - Remove symlink: Replace XML <source file='...'> path to new location then virsh define
+        # [MODIFIED] 1.5. Verify sensor image directory location (Per VM)
+        #  - Since mountpoints are now /var/lib/libvirt/images/mds*, 
+        #    VM images should already be in the correct location
+        #  - No move operation needed, just verify paths
         #######################################################################
-        local SRC_DIR="${SRC_BASE}/${SENSOR_VM}"   # /var/lib/libvirt/images/mds
-        local DST_DIR="${DST_BASE}/${SENSOR_VM}"   # /stellar/mds/mds  (also: organize per VM subdirectory with VM name)
-        local OLD_PREFIX="${SRC_BASE}/${SENSOR_VM}"
-        local NEW_PREFIX="${DST_BASE}/${SENSOR_VM}"  # /stellar/mds/mds
+        local VM_IMAGE_DIR="${DST_BASE}/${SENSOR_VM}"   # /var/lib/libvirt/images/mds/mds
+        local VM_IMAGE_DIR_ALT="${SRC_BASE}/${SENSOR_VM}"   # /var/lib/libvirt/images/mds (alternative check)
 
         if [[ "${_DRY}" -eq 1 ]]; then
-            log "[DRY-RUN] (${SENSOR_VM}) stop if running, move ${SRC_DIR} -> ${DST_DIR}, patch XML '${OLD_PREFIX}' -> '${NEW_PREFIX}', virsh define"
+            log "[DRY-RUN] (${SENSOR_VM}) verify image directory location at ${VM_IMAGE_DIR} or ${VM_IMAGE_DIR_ALT}"
         else
-            # Safely stop if VM is running
+            # Safely stop if VM is running (for PCI passthrough configuration)
             if virsh list --name | grep -q "^${SENSOR_VM}$"; then
                 log "[STEP 09] ${SENSOR_VM}: Running → shutdown"
                 virsh shutdown "${SENSOR_VM}" >/dev/null 2>&1 || true
@@ -4183,50 +4214,20 @@ step_09_sensor_passthrough() {
                 done
             fi
 
+            # Ensure mount point directory exists
             sudo mkdir -p "${DST_BASE}"
 
-            # 1) Move directory (mv)
-            if [[ -d "${DST_DIR}" ]]; then
-                log "[STEP 09] ${SENSOR_VM}: ${DST_DIR} already exists → skip move (prevent conflict)"
+            # Verify image directory location
+            # Since mountpoints are now directly under /var/lib/libvirt/images/mds*,
+            # the image directory should be at ${DST_BASE}/${SENSOR_VM} or ${SRC_BASE}/${SENSOR_VM}
+            if [[ ! -d "${VM_IMAGE_DIR}" && ! -d "${VM_IMAGE_DIR_ALT}" ]]; then
+                log "[STEP 09] ${SENSOR_VM}: WARN: Image directory not found at ${VM_IMAGE_DIR} or ${VM_IMAGE_DIR_ALT}"
+                log "[STEP 09] ${SENSOR_VM}: This may be normal if STEP 08 has not been executed yet"
             else
-                if [[ -d "${SRC_DIR}" ]]; then
-                    log "[STEP 09] ${SENSOR_VM}: mv ${SRC_DIR} -> ${DST_DIR}"
-                    sudo mv "${SRC_DIR}" "${DST_DIR}"
-                else
-                    log "[STEP 09] ${SENSOR_VM}: WARN: ${SRC_DIR} directory not found. (Already moved or STEP 08 not executed)"
-                fi
+                log "[STEP 09] ${SENSOR_VM}: Image directory verified"
             fi
 
-            # 2) VM XML patch: Replace OLD_PREFIX -> NEW_PREFIX then define
-            local TMP_XML="/tmp/${SENSOR_VM}.xml"
-            local TMP_XML_NEW="/tmp/${SENSOR_VM}.xml.new"
-
-            log "[STEP 09] ${SENSOR_VM}: VM XML export: ${TMP_XML}"
-            virsh dumpxml "${SENSOR_VM}" > "${TMP_XML}" 2>/dev/null || {
-                log "[STEP 09] ${SENSOR_VM}: ERROR: virsh dumpxml failed"
-                continue
-            }
-
-            # Skip define if replacement target not found (already patched or using other path)
-            if ! grep -q "${OLD_PREFIX//\//\\/}" "${TMP_XML}"; then
-                log "[STEP 09] ${SENSOR_VM}: WARN: XML path '${OLD_PREFIX}' not found → skip XML patch/define"
-            else
-                log "[STEP 09] ${SENSOR_VM}: VM XML patch: '${OLD_PREFIX}' -> '${NEW_PREFIX}'"
-                sed "s|${OLD_PREFIX}|${NEW_PREFIX}|g" "${TMP_XML}" > "${TMP_XML_NEW}"
-
-                if ! grep -q "${NEW_PREFIX//\//\\/}" "${TMP_XML_NEW}"; then
-                    log "[STEP 09] ${SENSOR_VM}: ERROR: XML patch verification failed (NEW path not reflected) → skip define"
-                    continue
-                fi
-
-                log "[STEP 09] ${SENSOR_VM}: Apply virsh define"
-                virsh define "${TMP_XML_NEW}" >/dev/null 2>&1 || {
-                    log "[STEP 09] ${SENSOR_VM}: ERROR: virsh define failed"
-                    continue
-                }
-            fi
-
-            # 3) Check if source files referenced by XML actually exist
+            # Check if source files referenced by XML actually exist
             log "[STEP 09] ${SENSOR_VM}: Check XML source file existence"
             local missing=0
             while read -r f; do
@@ -4417,7 +4418,7 @@ step_10_install_dp_cli() {
     fi
 
     if ! whiptail --title "STEP 10 Execution Confirmation" \
-                  --yesno "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar file in current directory)\n\nDo you want to continue?" 15 85
+                  --yesno "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
         log "User canceled STEP 10 execution."
         return 0
@@ -4432,25 +4433,78 @@ step_10_install_dp_cli() {
         chmod 644 "${ERRLOG}" || true
     fi
 
-    # 1) Search for local dp_cli package
+    # 1) Download dp_cli from GitHub
+    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
+    local TEMP_DIR="/tmp/dp_cli_download"
+    local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"
+    local EXTRACT_DIR="${TEMP_DIR}/Stellar-appliance-cli-main"
     local pkg=""
-    pkg="$(ls -1 ./dp_cli-*.tar.gz 2>/dev/null | sort -V | tail -n 1 || true)"
-    if [[ -z "${pkg}" ]]; then
-        pkg="$(ls -1 ./dp_cli-*.tar 2>/dev/null | sort -V | tail -n 1 || true)"
-    fi
 
-    if [[ -z "${pkg}" ]]; then
-        whiptail --title "STEP 10 - DP CLI install" \
-                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and execute STEP 10 again." 14 90
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp_cli package not found in current directory."
-        return 1
-    fi
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Will download dp_cli from: ${DOWNLOAD_URL}"
+        log "[DRY-RUN] Will extract to: ${EXTRACT_DIR}"
+        pkg="${EXTRACT_DIR}"
+    else
+        # Clean up any existing download
+        rm -rf "${TEMP_DIR}" || true
+        mkdir -p "${TEMP_DIR}" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to create temp directory: ${TEMP_DIR}" | tee -a "${ERRLOG}"
+            return 1
+        }
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] dp_cli package file detected: ${pkg}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Downloading dp_cli from GitHub: ${GITHUB_REPO}"
+        echo "=== Downloading from GitHub (this may take a moment) ==="
+        
+        # Download using wget or curl
+        if command -v wget >/dev/null 2>&1; then
+            if ! wget --progress=bar:force -O "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        elif command -v curl >/dev/null 2>&1; then
+            if ! curl -L -o "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Neither wget nor curl is available. Please install one of them." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        echo "=== Extracting downloaded file ==="
+        # Extract zip file
+        if command -v unzip >/dev/null 2>&1; then
+            if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: unzip is not available. Please install unzip package." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        # Check if setup.py exists in extracted directory
+        if [[ ! -f "${EXTRACT_DIR}/setup.py" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: setup.py not found in downloaded package" | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        pkg="${EXTRACT_DIR}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Successfully downloaded and extracted dp_cli from GitHub"
+    fi
 
     # 2) required packages
     run_cmd "apt-get update -y"
-    run_cmd "apt-get install -y python3-pip python3-venv"
+    run_cmd "apt-get install -y python3-pip python3-venv wget curl unzip"
 
     # 3) Create/initialize venv then install dp-cli
     if [[ "${_DRY}" -eq 1 ]]; then
@@ -4473,9 +4527,11 @@ step_10_install_dp_cli() {
             return 1
         }
 
-        "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall "${pkg}" >>"${ERRLOG}" 2>&1 || {
+        # Install from downloaded directory
+        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli Installation failed(venv)" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
             return 1
         }
 
@@ -4596,6 +4652,12 @@ EOF
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: error log path => ${ERRLOG}"
         tail -n 40 "${ERRLOG}" 2>/dev/null || true
+    fi
+
+    # Clean up temporary download directory
+    if [[ "${_DRY}" -eq 0 && -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Cleaning up temporary download directory: ${TEMP_DIR}"
+        rm -rf "${TEMP_DIR}" || true
     fi
 
     if type mark_step_done >/dev/null 2>&1; then
@@ -4989,8 +5051,11 @@ menu_full_validation() {
     lvs 2>&1 || echo "[WARN] LVM information query failed"
     echo
 
-    echo "\$ df -h /stellar/sensor"
-    df -h /stellar/sensor 2>&1 || echo "[INFO] /stellar/sensor mount point not found."
+    echo "\$ df -h /var/lib/libvirt/images/mds"
+    df -h /var/lib/libvirt/images/mds 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds mount point not found."
+    echo
+    echo "\$ df -h /var/lib/libvirt/images/mds2"
+    df -h /var/lib/libvirt/images/mds2 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds2 mount point not found."
     echo
 
     echo "\$ ls -la /var/lib/libvirt/images/"

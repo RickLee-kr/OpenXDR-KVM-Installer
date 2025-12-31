@@ -13,7 +13,7 @@ set -euo pipefail
 
 # Select appropriate directory based on execution environment
 if [[ "${EUID}" -eq 0 ]]; then
-  BASE_DIR="/opt/xdr-installer"  # Use /opt when running as root
+  BASE_DIR="/root/xdr-installer"  # Use /root when running as root
 else
   BASE_DIR="${HOME}/xdr-installer"  # Use home directory when running as regular user
 fi
@@ -3142,7 +3142,8 @@ step_07_sensor_download() {
     lv_exists="yes"
   fi
 
-  if mountpoint -q /stellar/sensor 2>/dev/null; then
+  local mount_point="/var/lib/libvirt/images/mds"
+  if mountpoint -q "${mount_point}" 2>/dev/null; then
     mounted="yes"
   fi
 
@@ -3151,7 +3152,7 @@ step_07_sensor_download() {
     echo "-------------------"
     echo "LV Path: ${lv_path}"
     echo "lv_sensor_root LV Exists: ${lv_exists}"
-    echo "/stellar/sensor mount: ${mounted}"
+    echo "${mount_point} mount: ${mounted}"
     echo
     echo "User Configuration:"
     echo "  - LV Location: ${LV_LOCATION}"
@@ -3159,12 +3160,12 @@ step_07_sensor_download() {
     echo
     echo " Next steps to be executed:"
     echo "  1) LV(lv_sensor_root) Creation (${LV_SIZE_GB}GB)"
-    echo "  2) ext4 FileSystem Creation and /stellar/sensor mount"
+    echo "  2) ext4 FileSystem Creation and ${mount_point} mount"
     echo "  3) /etc/fstab Auto mount "
     echo "  4) Sensor image and deployment script download"
     echo "     - virt_deploy_modular_ds.sh"
     echo "     - aella-modular-ds-${SENSOR_VERSION:-6.2.0}.qcow2"
-    echo "  5) stellar:stellar  Configuration"
+    echo "  5) Ownership configuration for libvirt/qemu"
   } > "${tmp_status}"
 
   show_textbox "STEP 07 - Sensor LV and Download unit" "${tmp_status}"
@@ -3173,7 +3174,7 @@ step_07_sensor_download() {
   local skip_lv_creation="no"
   if [[ "${lv_exists}" == "yes" && "${mounted}" == "yes" ]]; then
     if whiptail --title "STEP 07 - LV Already Configured" \
-                --yesno "lv_sensor_root and /stellar/sensor are already configured.\nPath: ${lv_path}\n\nSkip LV creation/mount and only download qcow2 if not already downloaded?" 12 80
+                --yesno "lv_sensor_root and ${mount_point} are already configured.\nPath: ${lv_path}\n\nSkip LV creation/mount and only download qcow2 if not already downloaded?" 12 80
     then
       log "LV already exists, skipping LV creation/mount and only downloading if not already downloaded."
       skip_lv_creation="yes"
@@ -3216,45 +3217,57 @@ step_07_sensor_download() {
     fi
 
     #######################################
-    # 2) mount in Creation and mount
+    # 2) mount point creation and mount
     #######################################
-    log "[STEP 07] Creating /stellar/sensor directory and mounting"
-    run_cmd "sudo mkdir -p /stellar/sensor"
+    log "[STEP 07] Creating ${mount_point} directory and mounting"
+    run_cmd "sudo mkdir -p ${mount_point}"
+    
+    # Safety check: ensure mount point is not already mounted by different device
+    local mounted_device=""
+    if mountpoint -q "${mount_point}" 2>/dev/null; then
+      mounted_device=$(findmnt -n -o SOURCE "${mount_point}" 2>/dev/null || echo "")
+      if [[ -n "${mounted_device}" && "${mounted_device}" != "/dev/${lv_path}" ]]; then
+        log "[ERROR] ${mount_point} is already mounted by ${mounted_device}, expected /dev/${lv_path}"
+        whiptail --title "STEP 07 - Mount Error" \
+                 --msgbox "${mount_point} is already mounted by a different device (${mounted_device}).\n\nPlease unmount it first or use a different mount point." 12 80
+        return 1
+      fi
+    fi
     
     if [[ "${mounted}" == "no" ]]; then
-      log "[STEP 07] LV mount: /dev/${lv_path} -> /stellar/sensor"
-      run_cmd "sudo mount /dev/${lv_path} /stellar/sensor"
+      log "[STEP 07] LV mount: /dev/${lv_path} -> ${mount_point}"
+      run_cmd "sudo mount /dev/${lv_path} ${mount_point}"
     else
-      log "[STEP 07] /stellar/sensor is already mounted -> skipping mount"
+      log "[STEP 07] ${mount_point} is already mounted -> skipping mount"
     fi
 
     #######################################
-    # 3) fstab  and mount Check (OpenXDR )
+    # 3) fstab registration and mount check
     #######################################
     log "[STEP 07] Adding auto mount entry to /etc/fstab"
-    local SENSOR_FSTAB_LINE="/dev/${lv_path} /stellar/sensor ext4 defaults,noatime 0 2"
-    append_fstab_if_missing "${SENSOR_FSTAB_LINE}" "/stellar/sensor"
+    local SENSOR_FSTAB_LINE="/dev/${lv_path} ${mount_point} ext4 defaults,noatime 0 2"
+    append_fstab_if_missing "${SENSOR_FSTAB_LINE}" "${mount_point}"
     
-    # Execute mount -a to apply fstab (OpenXDR Method)
+    # Execute mount -a to apply fstab
     log "[STEP 07] Executing systemctl daemon-reload and mount -a"
     run_cmd "sudo systemctl daemon-reload"
     run_cmd "sudo mount -a"
     
     # Mount status check
-    if mountpoint -q /stellar/sensor 2>/dev/null; then
-      log "[STEP 07] /stellar/sensor mount successful"
+    if mountpoint -q "${mount_point}" 2>/dev/null; then
+      log "[STEP 07] ${mount_point} mount successful"
     else
-      log "[WARN] /stellar/sensor mount failed - mount may be required"
-      run_cmd "sudo mount /dev/${lv_path} /stellar/sensor"
+      log "[WARN] ${mount_point} mount failed - mount may be required"
+      run_cmd "sudo mount /dev/${lv_path} ${mount_point}"
     fi
     
     #######################################
-    # 4) /stellar  change (OpenXDR )
+    # 4) Ownership configuration (libvirt/qemu)
     #######################################
-    log "[STEP 07] Changing /stellar ownership to stellar:stellar"
+    log "[STEP 07] Configuring ownership for ${mount_point} (libvirt/qemu)"
     if id stellar >/dev/null 2>&1; then
-      run_cmd "sudo chown -R stellar:stellar /stellar"
-      log "[STEP 07] /stellar ownership change completed"
+      run_cmd "sudo chown -R stellar:stellar ${mount_point}"
+      log "[STEP 07] ${mount_point} ownership change completed"
     else
       log "[WARN] User 'stellar' does not exist. Cannot change ownership."
     fi
@@ -3388,10 +3401,14 @@ step_07_sensor_download() {
   fi
 
   #######################################
-  # 8)  Configuration
+  # 8) Ownership configuration (if not already done)
   #######################################
-  log "[STEP 07] Configuring /stellar ownership (stellar:stellar)"
-  run_cmd "sudo chown -R stellar:stellar /stellar"
+  log "[STEP 07] Verifying ownership for ${mount_point}"
+  if id stellar >/dev/null 2>&1; then
+    run_cmd "sudo chown -R stellar:stellar ${mount_point}"
+  else
+    log "[WARN] User 'stellar' does not exist. Skipping ownership change."
+  fi
 
   #######################################
   # 9) Result Check
@@ -3413,7 +3430,7 @@ step_07_sensor_download() {
     fi
 
     # Re-checking mount
-    if mountpoint -q /stellar/sensor; then
+    if mountpoint -q "${mount_point}"; then
       final_mount="OK"
     else
       final_mount="FAIL"
@@ -3431,7 +3448,7 @@ step_07_sensor_download() {
     echo "STEP 07 execution summary"
     echo "------------------"
     echo "lv_sensor_root LV: ${final_lv}"
-    echo "/stellar/sensor mount: ${final_mount}"
+    echo "${mount_point} mount: ${final_mount}"
     echo "Sensor image status: ${final_image}"
     echo
     echo "Download Location: ${SENSOR_IMAGE_DIR}"
@@ -4086,103 +4103,40 @@ step_09_sensor_passthrough() {
     fi
 
     ###########################################################################
-    # [NEW] 1.5. Move sensor images from /var/lib/libvirt/images to /stellar/sensor and update VM XML paths 
-    #  - symlink  remove: VM XML <disk><source file='...'> Path /stellar/sensor  change
-    #  - Existing /var/lib/libvirt/images  Deploymentdone Files  mv
+    # 1.5. Verify sensor VM storage mount (no migration needed)
+    #  - VM images are already created directly under /var/lib/libvirt/images/mds
+    #  - Mount point verification only (no file movement required)
     ###########################################################################
-    local SRC_BASE="/var/lib/libvirt/images"
-    local SRC_DIR="${SRC_BASE}/${SENSOR_VM}"          # /var/lib/libvirt/images/mds
-    local DST_BASE="/stellar/sensor"
-    local DST_DIR="${DST_BASE}/${SENSOR_VM}"          # /stellar/sensor/mds
-
-    # Check/update VM disk/ISO paths in XML
-    local OLD_PREFIX="${SRC_BASE}/${SENSOR_VM}"
-    local NEW_PREFIX="${DST_BASE}/${SENSOR_VM}"
-
+    local VM_STORAGE_BASE="/var/lib/libvirt/images/mds"
+    
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] (MOUNTCHK) mountpoint -q ${DST_BASE}"
-        log "[DRY-RUN] (STOP) shutdown/destroy ${SENSOR_VM} if running"
-        log "[DRY-RUN] (MOVE) mv ${SRC_DIR} -> ${DST_DIR}"
-        log "[DRY-RUN] (XML) virsh dumpxml ${SENSOR_VM} > /tmp/${SENSOR_VM}.xml ; replace '${OLD_PREFIX}' -> '${NEW_PREFIX}' ; virsh define"
+        log "[DRY-RUN] (MOUNTCHK) mountpoint -q ${VM_STORAGE_BASE}"
+        log "[DRY-RUN] (VERIFY) VM XML paths should reference ${VM_STORAGE_BASE}"
     else
-        # Check /stellar/sensor mount
-        if ! mountpoint -q "${DST_BASE}" 2>/dev/null; then
-            whiptail --title "STEP 09 - Mount Error" --msgbox "${DST_BASE} is not mounted.\n\nPlease complete STEP 07 (/stellar/sensor mount) first." 12 70
-            log "[STEP 09] ERROR: ${DST_BASE} not mounted -> STEP Abort"
+        # Verify mount point exists and is mounted
+        if ! mountpoint -q "${VM_STORAGE_BASE}" 2>/dev/null; then
+            whiptail --title "STEP 09 - Mount Error" --msgbox "${VM_STORAGE_BASE} is not mounted.\n\nPlease complete STEP 07 (sensor LV mount) first." 12 70
+            log "[STEP 09] ERROR: ${VM_STORAGE_BASE} not mounted -> STEP Abort"
             return 1
         fi
 
-        # Shutdown VM if running
-        if virsh list --name | grep -q "^${SENSOR_VM}$"; then
-            log "[STEP 09] ${SENSOR_VM} is running -> initiating shutdown"
-            virsh shutdown "${SENSOR_VM}" >/dev/null 2>&1 || true
-
-            local t=0
-            while virsh list --name | grep -q "^${SENSOR_VM}$"; do
-                sleep 2
-                t=$((t+2))
-                if [[ $t -ge 120 ]]; then
-                    log "[WARN] shutdown timeout -> destroy"
-                    virsh destroy "${SENSOR_VM}" >/dev/null 2>&1 || true
-                    break
-                fi
-            done
-        fi
-
-        sudo mkdir -p "${DST_BASE}"
-
-        # 1) Move files from source to destination
-        if [[ -d "${DST_DIR}" ]]; then
-            log "[STEP 09] ${DST_DIR} already exists -> skipping move operation"
-        else
-            if [[ -d "${SRC_DIR}" ]]; then
-                log "[STEP 09] mv ${SRC_DIR} -> ${DST_DIR}"
-                sudo mv "${SRC_DIR}" "${DST_DIR}"
-            else
-                log "[STEP 09] WARN: ${SRC_DIR} does not exist. (STEP 08 may not have completed)"
+        # Verify VM XML paths reference the correct location
+        log "[STEP 09] Verifying VM XML storage paths"
+        local xml_path_check=0
+        while read -r f; do
+            [[ -z "${f}" ]] && continue
+            if [[ "${f}" =~ ^${VM_STORAGE_BASE} ]]; then
+                xml_path_check=$((xml_path_check+1))
             fi
-        fi
+        done < <(virsh dumpxml "${SENSOR_VM}" | awk -F"'" '/<source file=/{print $2}')
 
-        # 2) Update VM XML: Replace OLD_PREFIX with NEW_PREFIX in paths, then redefine
-        local TMP_XML="/tmp/${SENSOR_VM}.xml"
-        local TMP_XML_NEW="/tmp/${SENSOR_VM}.xml.new"
-
-        log "[STEP 09] VM XML export: ${TMP_XML}"
-        virsh dumpxml "${SENSOR_VM}" > "${TMP_XML}" 2>/dev/null || {
-            log "[STEP 09] ERROR: virsh dumpxml Failed"
-            return 1
-        }
-
-        # Check if old path exists in XML (skip define if not found)
-        if ! grep -q "${OLD_PREFIX//\//\\/}" "${TMP_XML}"; then
-            log "[STEP 09] WARN: XML '${OLD_PREFIX}' path does not exist. (Already done or using different path)"
-            # Continue without redefining (already done or using different path)
+        if [[ "${xml_path_check}" -eq 0 ]]; then
+            log "[STEP 09] INFO: VM XML paths may not reference ${VM_STORAGE_BASE} (may be using different path)"
         else
-            log "[STEP 09] VM XML patch: '${OLD_PREFIX}' -> '${NEW_PREFIX}'"
-            sed "s|${OLD_PREFIX}|${NEW_PREFIX}|g" "${TMP_XML}" > "${TMP_XML_NEW}"
-
-            # Verify that new path exists in modified XML
-            if ! grep -q "${NEW_PREFIX//\//\\/}" "${TMP_XML_NEW}"; then
-                log "[STEP 09] ERROR: XML  Verification Failed(NEW Path not) -> define Abort"
-                return 1
-            fi
-
-            log "[STEP 09] virsh define Apply"
-            virsh define "${TMP_XML_NEW}" >/dev/null 2>&1 || {
-                log "[STEP 09] ERROR: virsh define Failed"
-                return 1
-            }
+            log "[STEP 09] Verified: VM XML references ${xml_path_check} file(s) under ${VM_STORAGE_BASE}"
         fi
 
-        # 3) Verify that files/ISOs exist at new path
-        #    (Required to prevent VM start failure due to missing files)
-        log "[STEP 09] NEW Path Exists Check: ${DST_DIR}"
-        if [[ ! -d "${DST_DIR}" ]]; then
-            log "[STEP 09] ERROR: ${DST_DIR} does not exist. Mount failed or path error."
-            return 1
-        fi
-
-        # Check if XML source files exist 
+        # Verify that files referenced in XML actually exist
         log "[STEP 09] Checking XML source file existence"
         local missing=0
         while read -r f; do
@@ -4332,7 +4286,7 @@ step_10_install_dp_cli() {
     fi
 
     if ! whiptail --title "STEP 10 Execution Check" \
-                  --yesno "Install DP Appliance CLI package (dp_cli) and apply to stellar user.\n\n(Will use dp_cli-*.tar.gz or dp_cli-*.tar file from current directory)\n\nDo you want to continue?" 15 85
+                  --yesno "Install DP Appliance CLI package (dp_cli) and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
         log "User canceled STEP 10 execution."
         return 0
@@ -4347,25 +4301,78 @@ step_10_install_dp_cli() {
         chmod 644 "${ERRLOG}" || true
     fi
 
-    # 1) Find dp_cli package file 
+    # 1) Download dp_cli from GitHub
+    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
+    local TEMP_DIR="/tmp/dp_cli_download"
+    local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"
+    local EXTRACT_DIR="${TEMP_DIR}/Stellar-appliance-cli-main"
     local pkg=""
-    pkg="$(ls -1 ./dp_cli-*.tar.gz 2>/dev/null | sort -V | tail -n 1 || true)"
-    if [[ -z "${pkg}" ]]; then
-        pkg="$(ls -1 ./dp_cli-*.tar 2>/dev/null | sort -V | tail -n 1 || true)"
-    fi
 
-    if [[ -z "${pkg}" ]]; then
-        whiptail --title "STEP 10 - DP CLI Installation" \
-                 --msgbox "dp_cli-*.tar.gz or dp_cli-*.tar file does not exist in current directory.\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease place the file in current directory and run STEP 10 again." 14 90
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp_cli package not found in current directory."
-        return 1
-    fi
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Will download dp_cli from: ${DOWNLOAD_URL}"
+        log "[DRY-RUN] Will extract to: ${EXTRACT_DIR}"
+        pkg="${EXTRACT_DIR}"
+    else
+        # Clean up any existing download
+        rm -rf "${TEMP_DIR}" || true
+        mkdir -p "${TEMP_DIR}" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to create temp directory: ${TEMP_DIR}" | tee -a "${ERRLOG}"
+            return 1
+        }
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Found dp_cli package file: ${pkg}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Downloading dp_cli from GitHub: ${GITHUB_REPO}"
+        echo "=== Downloading from GitHub (this may take a moment) ==="
+        
+        # Download using wget or curl
+        if command -v wget >/dev/null 2>&1; then
+            if ! wget --progress=bar:force -O "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        elif command -v curl >/dev/null 2>&1; then
+            if ! curl -L -o "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Neither wget nor curl is available. Please install one of them." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        echo "=== Extracting downloaded file ==="
+        # Extract zip file
+        if command -v unzip >/dev/null 2>&1; then
+            if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: unzip is not available. Please install unzip package." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        # Check if setup.py exists in extracted directory
+        if [[ ! -f "${EXTRACT_DIR}/setup.py" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: setup.py not found in downloaded package" | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        pkg="${EXTRACT_DIR}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Successfully downloaded and extracted dp_cli from GitHub"
+    fi
 
     # 2) required packages
     run_cmd "apt-get update -y"
-    run_cmd "apt-get install -y python3-pip python3-venv"
+    run_cmd "apt-get install -y python3-pip python3-venv wget curl unzip"
 
     # 3) venv Creation/ after dp-cli Installation
     if [[ "${_DRY}" -eq 1 ]]; then
@@ -4388,9 +4395,11 @@ step_10_install_dp_cli() {
             return 1
         }
 
-        "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall "${pkg}" >>"${ERRLOG}" 2>&1 || {
+        # Install from downloaded directory
+        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli Installation Failed(venv)" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
             return 1
         }
 
@@ -4511,6 +4520,12 @@ EOF
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: error log path => ${ERRLOG}"
         tail -n 40 "${ERRLOG}" 2>/dev/null || true
+    fi
+
+    # Clean up temporary download directory
+    if [[ "${_DRY}" -eq 0 && -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Cleaning up temporary download directory: ${TEMP_DIR}"
+        rm -rf "${TEMP_DIR}" || true
     fi
 
     if type mark_step_done >/dev/null 2>&1; then
@@ -4639,21 +4654,42 @@ menu_config() {
   while true; do
     load_config
 
+    # Determine ACPS Password display text
+    local acps_password_display
+    if [[ -n "${ACPS_PASSWORD:-}" ]]; then
+      acps_password_display="(Configured)"
+    else
+      acps_password_display="(Not configured)"
+    fi
+
     local choice
+    # Disable set -e temporarily to handle whiptail cancel gracefully
+    set +e
     choice=$(whiptail --title "XDR Installer - Configuration" \
                       --menu "Please select configuration to change:" \
-                      22 90 10 \
+                      22 90 9 \
                       "1" "DRY_RUN Mode: ${DRY_RUN} (1=simulation, 0=actual execution)" \
                       "2" "Sensor version: ${SENSOR_VERSION}" \
-                      "3" "ACPS Username: ${ACPS_USERNAME}" \
-                      "4" "ACPS Password: (Configured)" \
+                      "3" "ACPS Username: ${ACPS_USERNAME:-<not configured>}" \
+                      "4" "ACPS Password: ${acps_password_display}" \
                       "5" "ACPS URL: ${ACPS_BASE_URL}" \
                       "6" "Auto Reboot: ${ENABLE_AUTO_REBOOT} (1=active, 0=inactive)" \
                       "7" "SPAN attachment mode: ${SPAN_ATTACH_MODE} (pci/bridge)" \
                       "8" "Sensor Network Mode: ${SENSOR_NET_MODE} (bridge/nat)" \
-                      "9" "View current configuration" \
-                      "10" "Go back" \
-                      3>&1 1>&2 2>&3) || break
+                      "9" "Go back" \
+                      3>&1 1>&2 2>&3)
+    local menu_rc=$?
+    set -e
+
+    # User cancelled main menu - return to previous menu
+    if [[ ${menu_rc} -ne 0 ]]; then
+      return 0
+    fi
+
+    # Handle empty choice (should not happen, but safety check)
+    if [[ -z "${choice}" ]]; then
+      continue
+    fi
 
     case "${choice}" in
       1)
@@ -4668,44 +4704,56 @@ menu_config() {
         ;;
       2)
         local new_version
+        set +e
         new_version=$(whiptail --title "Sensor Version Configuration" \
                                --inputbox "Enter sensor version:" \
                                8 60 "${SENSOR_VERSION}" \
                                3>&1 1>&2 2>&3)
-        if [[ -n "${new_version}" ]]; then
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_version}" ]]; then
           save_config_var "SENSOR_VERSION" "${new_version}"
           whiptail --title "Configuration Changed" --msgbox "Sensor version has been set to ${new_version}." 8 60
         fi
         ;;
       3)
         local new_username
+        set +e
         new_username=$(whiptail --title "ACPS Username Configuration" \
                                 --inputbox "Enter ACPS username:" \
-                                8 60 "${ACPS_USERNAME}" \
-                                3>&1 1>&2 2>&3)
-        if [[ -n "${new_username}" ]]; then
+                                8 60 "${ACPS_USERNAME:-}" \
+                               3>&1 1>&2 2>&3)
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_username}" ]]; then
           save_config_var "ACPS_USERNAME" "${new_username}"
           whiptail --title "Configuration Changed" --msgbox "ACPS username has been changed." 8 60
         fi
         ;;
       4)
         local new_password
+        set +e
         new_password=$(whiptail --title "ACPS Password Configuration" \
                                 --passwordbox "Enter ACPS password:" \
                                 8 60 \
                                 3>&1 1>&2 2>&3)
-        if [[ -n "${new_password}" ]]; then
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_password}" ]]; then
           save_config_var "ACPS_PASSWORD" "${new_password}"
           whiptail --title "Configuration Changed" --msgbox "ACPS password has been changed." 8 60
         fi
         ;;
       5)
         local new_url
+        set +e
         new_url=$(whiptail --title "ACPS URL Configuration" \
                            --inputbox "Enter ACPS URL:" \
                            8 80 "${ACPS_BASE_URL}" \
                            3>&1 1>&2 2>&3)
-        if [[ -n "${new_url}" ]]; then
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_url}" ]]; then
           save_config_var "ACPS_BASE_URL" "${new_url}"
           whiptail --title "Configuration Changed" --msgbox "ACPS URL has been changed." 8 60
         fi
@@ -4722,60 +4770,37 @@ menu_config() {
         ;;
       7)
         local new_mode
+        set +e
         new_mode=$(whiptail --title "SPAN Attachment Mode Selection" \
                              --menu "Select SPAN NIC connection method to sensor VM:" \
                              12 70 2 \
                              "pci"    "PCI passthrough (PF direct, SR-IOV not used)" \
                              "bridge" "L2 bridge virtio NIC" \
                              3>&1 1>&2 2>&3)
-        if [[ -n "${new_mode}" ]]; then
+        local menu_rc=$?
+        set -e
+        if [[ ${menu_rc} -eq 0 && -n "${new_mode}" ]]; then
           save_config_var "SPAN_ATTACH_MODE" "${new_mode}"
           whiptail --title "Configuration Changed" --msgbox "SPAN attachment mode has been set to ${new_mode}." 8 60
         fi
         ;;
       8)
         local new_net_mode
+        set +e
         new_net_mode=$(whiptail --title "Sensor Network Mode Configuration" \
                              --menu "Please select Sensor Network Mode:" \
                              15 70 2 \
                              "bridge" "Bridge Mode: L2 bridge Based (default)" \
                              "nat" "NAT Mode: virbr0 NAT Network Based" \
                              3>&1 1>&2 2>&3)
-        if [[ -n "${new_net_mode}" ]]; then
+        local menu_rc=$?
+        set -e
+        if [[ ${menu_rc} -eq 0 && -n "${new_net_mode}" ]]; then
           save_config_var "SENSOR_NET_MODE" "${new_net_mode}"
           whiptail --title "Configuration Changed" --msgbox "Sensor Network Mode has been set to ${new_net_mode}.\n\nTo apply this change, please re-run STEP 01." 12 70
         fi
         ;;
       9)
-        local config_summary
-        config_summary=$(cat <<EOF
-Current XDR Installer Configuration
-=======================
-
-Default Configuration:
-- DRY_RUN: ${DRY_RUN}
-- Sensor version: ${SENSOR_VERSION}
-- Auto Reboot: ${ENABLE_AUTO_REBOOT}
-- Sensor Network Mode: ${SENSOR_NET_MODE}
-- SPAN connection Mode: ${SPAN_ATTACH_MODE}
-
-ACPS Configuration:
-- User: ${ACPS_USERNAME}
-- URL: ${ACPS_BASE_URL}
-
-Hardware Configuration:
-- HOST NIC: ${HOST_NIC:-<not configured>}
-- DATA NIC: ${DATA_NIC:-<not configured>}
-- SPAN NICs: ${SPAN_NICS:-<not configured>}
-- Sensor vCPU: ${SENSOR_VCPUS:-<not configured>}
-- Sensor Memory: ${SENSOR_MEMORY_MB:-<not configured>}MB
-
-Configuration File: ${CONFIG_FILE}
-EOF
-)
-        show_paged "Current Configuration" <(echo "${config_summary}")
-        ;;
-      10)
         break
         ;;
     esac
@@ -4809,19 +4834,54 @@ menu_select_step_and_run() {
 
       menu_items+=("${i}" "${step_name} [${status}]")
     done
-    menu_items+=("back" "")
+    menu_items+=("back" "Return to main menu")
+
+    # Calculate menu height dynamically
+    # whiptail --menu format: height width menu-height
+    # menu-height should be number of menu items (NUM_STEPS + 1 for back)
+    local menu_item_count=$((NUM_STEPS + 1))
+    # menu_height: total dialog height, menu_item_count: scrollable menu items
+    local menu_height=22
+    local menu_width=100
+    # Limit menu_item_count to reasonable value (whiptail can handle scrolling)
+    [[ ${menu_item_count} -gt 20 ]] && menu_item_count=20
 
     local choice
+    # Disable set -e temporarily to handle whiptail errors gracefully
+    set +e
     choice=$(whiptail --title "XDR Installer - step Selection" \
                       --menu "Please select step to execute:" \
-                      20 100 12 \
+                      ${menu_height} ${menu_width} ${menu_item_count} \
                       "${menu_items[@]}" \
-                      3>&1 1>&2 2>&3) || break
+                      3>&1 1>&2 2>&3)
+    local whiptail_rc=$?
+    set -e
+
+    # Check if whiptail was cancelled or failed
+    if [[ ${whiptail_rc} -ne 0 ]]; then
+      # User cancelled or ESC pressed - return to main menu
+      return 0
+    fi
+
+    # Handle empty choice (should not happen, but safety check)
+    if [[ -z "${choice}" ]]; then
+      return 0
+    fi
 
     if [[ "${choice}" == "back" ]]; then
       break
     elif [[ "${choice}" =~ ^[0-9]+$ && ${choice} -ge 0 && ${choice} -lt ${NUM_STEPS} ]]; then
+      # Disable set -e temporarily to handle run_step errors gracefully
+      set +e
       run_step "${choice}"
+      local step_rc=$?
+      set -e
+      # run_step always returns 0, but check anyway for safety
+      if [[ ${step_rc} -ne 0 ]]; then
+        log "WARNING: run_step returned non-zero exit code: ${step_rc}"
+      fi
+    else
+      log "WARNING: Invalid choice selected: ${choice}"
     fi
   done
 }
@@ -5013,8 +5073,8 @@ menu_full_validation() {
     lvs 2>&1 || echo "[WARN] LVM information query failed"
     echo
 
-    echo "\$ df -h /stellar/sensor"
-    df -h /stellar/sensor 2>&1 || echo "[INFO] /stellar/sensor mount point does not exist."
+    echo "\$ df -h /var/lib/libvirt/images/mds"
+    df -h /var/lib/libvirt/images/mds 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds mount point does not exist."
     echo
 
     echo "\$ ls -la /var/lib/libvirt/images/"
@@ -5093,7 +5153,7 @@ show_usage_help() {
   - This installer requires *root* privileges.
     Please start in the following order:
       1) Switch to root using sudo -i
-      2) Create directory with: mkdir -p /opt/xdr-installer
+      2) Create directory with: mkdir -p /root/xdr-installer
       3) Save this script to that directory and execute
   - Use **Space / ↓** to move to next page
   - Press **q** to quit

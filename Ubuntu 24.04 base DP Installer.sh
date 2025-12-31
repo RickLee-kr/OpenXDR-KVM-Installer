@@ -4491,7 +4491,7 @@ step_13_install_dp_cli() {
     fi
 
     if ! whiptail --title "STEP 13 Execution Confirmation" \
-                  --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Use dp_cli-*.tar.gz / dp_cli-*.tar files in current directory)\n\nDo you want to continue?" 15 85
+                  --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
         log "User canceled STEP 13 execution."
         return 0
@@ -4506,25 +4506,78 @@ step_13_install_dp_cli() {
         chmod 644 "${ERRLOG}" || true
     fi
 
-    # 1) Search for local dp_cli package
+    # 1) Download dp_cli from GitHub
+    local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
+    local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
+    local TEMP_DIR="/tmp/dp_cli_download"
+    local ZIP_FILE="${TEMP_DIR}/Stellar-appliance-cli-main.zip"
+    local EXTRACT_DIR="${TEMP_DIR}/Stellar-appliance-cli-main"
     local pkg=""
-    pkg="$(ls -1 ./dp_cli-*.tar.gz 2>/dev/null | sort -V | tail -n 1 || true)"
-    if [[ -z "${pkg}" ]]; then
-        pkg="$(ls -1 ./dp_cli-*.tar 2>/dev/null | sort -V | tail -n 1 || true)"
-    fi
 
-    if [[ -z "${pkg}" ]]; then
-        whiptail --title "STEP 13 - DP CLI Installation" \
-                 --msgbox "No dp_cli-*.tar.gz or dp_cli-*.tar file found in current directory (.).\n\nExample: dp_cli-0.0.2.dev8402.tar.gz\n\nPlease prepare the file and re-run STEP 13." 14 90
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp_cli package not found in current directory."
-        return 1
-    fi
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] Will download dp_cli from: ${DOWNLOAD_URL}"
+        log "[DRY-RUN] Will extract to: ${EXTRACT_DIR}"
+        pkg="${EXTRACT_DIR}"
+    else
+        # Clean up any existing download
+        rm -rf "${TEMP_DIR}" || true
+        mkdir -p "${TEMP_DIR}" || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to create temp directory: ${TEMP_DIR}" | tee -a "${ERRLOG}"
+            return 1
+        }
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] dp_cli package file detected: ${pkg}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Downloading dp_cli from GitHub: ${GITHUB_REPO}"
+        echo "=== Downloading from GitHub (this may take a moment) ==="
+        
+        # Download using wget or curl
+        if command -v wget >/dev/null 2>&1; then
+            if ! wget --progress=bar:force -O "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        elif command -v curl >/dev/null 2>&1; then
+            if ! curl -L -o "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Neither wget nor curl is available. Please install one of them." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        echo "=== Extracting downloaded file ==="
+        # Extract zip file
+        if command -v unzip >/dev/null 2>&1; then
+            if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+                rm -rf "${TEMP_DIR}" || true
+                return 1
+            fi
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: unzip is not available. Please install unzip package." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        # Check if setup.py exists in extracted directory
+        if [[ ! -f "${EXTRACT_DIR}/setup.py" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: setup.py not found in downloaded package" | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
+            return 1
+        fi
+
+        pkg="${EXTRACT_DIR}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Successfully downloaded and extracted dp_cli from GitHub"
+    fi
 
     # 2) required packages
     run_cmd "apt-get update -y"
-    run_cmd "apt-get install -y python3-pip python3-venv"
+    run_cmd "apt-get install -y python3-pip python3-venv wget curl unzip"
 
     # 3) Create/initialize venv then install dp-cli
     if [[ "${_DRY}" -eq 1 ]]; then
@@ -4547,9 +4600,11 @@ step_13_install_dp_cli() {
             return 1
         }
 
-        "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall "${pkg}" >>"${ERRLOG}" 2>&1 || {
+        # Install from downloaded directory
+        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli installation failed (venv)" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            rm -rf "${TEMP_DIR}" || true
             return 1
         }
 
@@ -4670,6 +4725,12 @@ EOF
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: error log path => ${ERRLOG}"
         tail -n 40 "${ERRLOG}" 2>/dev/null || true
+    fi
+
+    # Clean up temporary download directory
+    if [[ "${_DRY}" -eq 0 && -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Cleaning up temporary download directory: ${TEMP_DIR}"
+        rm -rf "${TEMP_DIR}" || true
     fi
 
     if type mark_step_done >/dev/null 2>&1; then

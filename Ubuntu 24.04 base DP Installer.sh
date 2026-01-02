@@ -436,7 +436,7 @@ load_config() {
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
   : "${DP_VERSION:=6.2.1}"
   : "${ACPS_USERNAME:=}"
-  : "${ACPS_BASE_URL:=https://apsdev.stellarcyber.aihttps://acps.stellarcyber.ai}"
+  : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
   : "${ACPS_PASSWORD:=}"
 
   # Auto-reboot related default values
@@ -6408,7 +6408,7 @@ main_menu() {
     # Additional check: if choice is empty, also continue
     if [[ -z "${choice}" ]]; then
       continue
-    }
+    fi
           
 
 

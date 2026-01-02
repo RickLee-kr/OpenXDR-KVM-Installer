@@ -59,23 +59,262 @@ STEP_IDS=(
 
 # STEP display names (shown in UI)
 STEP_NAMES=(
-  "01. Detect and select hardware / NIC / disks"
-  "02. Install HWE kernel"
-  "03. Rename NICs / switch to ifupdown and configure networking"
-  "04. Install and configure KVM / Libvirt"
-  "05. Tune kernel parameters / KSM / swap"
-  "06. Configure SR-IOV drivers (iavf/i40evf) + NTPsec"
-  "07. LVM storage (DL/DA root + data)"
-  "08. libvirt hooks and OOM recovery scripts"
-  "09. Download DP image and deployment scripts"
-  "10. Deploy DL-master VM"
-  "11. Deploy DA-master VM"
-  "12. SR-IOV / CPU Affinity / PCI Passthrough"
-  "13. Install DP Appliance CLI package"
+  "Detect and select hardware / NIC / disks"
+  "Install HWE kernel"
+  "Rename NICs / switch to ifupdown and configure networking"
+  "Install and configure KVM / Libvirt"
+  "Tune kernel parameters / KSM / swap"
+  "Configure SR-IOV drivers (iavf/i40evf) + NTPsec"
+  "LVM storage (DL/DA root + data)"
+  "libvirt hooks and OOM recovery scripts"
+  "Download DP image and deployment scripts"
+  "Deploy DL-master VM"
+  "Deploy DA-master VM"
+  "SR-IOV / CPU Affinity / PCI Passthrough"
+  "Install DP Appliance CLI package"
 )
 
 NUM_STEPS=${#STEP_IDS[@]}
 
+
+# Calculate whiptail menu dimensions dynamically
+calc_menu_size() {
+  local item_count="$1"  # Number of menu items
+  local min_width="${2:-80}"  # Minimum width (default 80)
+  local min_height="${3:-10}"  # Minimum menu height (default 10)
+  
+  local HEIGHT WIDTH MENU_HEIGHT
+  
+  # Get terminal size
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+    WIDTH=$(tput cols)
+  else
+    HEIGHT=25
+    WIDTH=100
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  [ -z "${WIDTH}" ] && WIDTH=100
+  
+  # Calculate dialog height (leave space for title, message, buttons)
+  # Title: ~1 line, Message: ~2-3 lines, Buttons: ~2 lines, Padding: ~2 lines
+  local dialog_height=$((HEIGHT - 8))
+  [ "${dialog_height}" -lt 15 ] && dialog_height=15
+  
+  # Calculate menu height (number of items + some padding)
+  MENU_HEIGHT=$((item_count + 2))
+  [ "${MENU_HEIGHT}" -lt "${min_height}" ] && MENU_HEIGHT="${min_height}"
+  # Don't exceed dialog height minus message/button space
+  local max_menu_height=$((dialog_height - 6))
+  [ "${MENU_HEIGHT}" -gt "${max_menu_height}" ] && MENU_HEIGHT="${max_menu_height}"
+  
+  # Calculate dialog width (use most of terminal width, but respect minimum)
+  local dialog_width=$((WIDTH - 10))
+  [ "${dialog_width}" -lt "${min_width}" ] && dialog_width="${min_width}"
+  # Don't exceed terminal width too much
+  [ "${dialog_width}" -gt 120 ] && dialog_width=120
+  
+  echo "${dialog_height} ${dialog_width} ${MENU_HEIGHT}"
+}
+
+# Calculate whiptail dialog dimensions for simple dialogs (msgbox, yesno, inputbox, etc.)
+calc_dialog_size() {
+  local min_height="${1:-10}"  # Minimum height
+  local min_width="${2:-70}"   # Minimum width
+  
+  local HEIGHT WIDTH
+  
+  # Get terminal size
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+    WIDTH=$(tput cols)
+  else
+    HEIGHT=25
+    WIDTH=100
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  [ -z "${WIDTH}" ] && WIDTH=100
+  
+  # Calculate dialog height - use more of terminal height for better centering
+  # Reserve minimal space for title/buttons to allow message to be more centered
+  local dialog_height=$((HEIGHT - 2))
+  [ "${dialog_height}" -lt "${min_height}" ] && dialog_height="${min_height}"
+  # Don't limit max height too much - allow larger dialogs for better centering
+  [ "${dialog_height}" -gt 35 ] && dialog_height=35  # Increased max reasonable height
+  
+  # Calculate dialog width (use most of terminal width, but respect minimum)
+  local dialog_width=$((WIDTH - 6))
+  [ "${dialog_width}" -lt "${min_width}" ] && dialog_width="${min_width}"
+  [ "${dialog_width}" -gt 100 ] && dialog_width=100  # Max reasonable width
+  
+  echo "${dialog_height} ${dialog_width}"
+}
+
+# Center-align message text by adding empty lines
+center_message() {
+  local msg="$1"
+  echo "\n\n${msg}\n"
+}
+
+# Center-align menu by calculating proper spacing based on terminal height
+center_menu_message() {
+  local msg="$1"
+  local menu_height="$2"  # Height of the menu dialog
+  
+  local HEIGHT
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+  else
+    HEIGHT=25
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  
+  # Calculate how many empty lines to add at top to center the menu
+  # whiptail menu structure:
+  # - Title: 1 line
+  # - Message area: variable (our msg)
+  # - Menu list: menu_list_height lines
+  # - Buttons: 2 lines
+  # - Border: 2 lines (top + bottom)
+  # Total dialog height = menu_height (which includes all of the above)
+  
+  # We want to center the entire dialog box, not just the message
+  # Calculate top padding: (terminal_height - dialog_height) / 2
+  # But leave some margin (about 2-3 lines)
+  local margin=3
+  local available_height=$((HEIGHT - margin * 2))
+  
+  # Calculate top padding to center the dialog
+  local top_padding=0
+  if [[ "${available_height}" -gt "${menu_height}" ]]; then
+    top_padding=$(( (available_height - menu_height) / 2 ))
+    # Ensure we have at least some padding, but not too much
+    [[ "${top_padding}" -lt 2 ]] && top_padding=2
+    [[ "${top_padding}" -gt 15 ]] && top_padding=15
+  else
+    # If menu is larger than available space, use minimal padding
+    top_padding=2
+  fi
+  
+  # Build padding string with newlines
+  local padding=""
+  local i
+  for ((i=0; i<top_padding; i++)); do
+    padding+="\n"
+  done
+  
+  echo "${padding}${msg}"
+}
+
+# Wrapper function for whiptail msgbox with dynamic sizing, centering, and ESC handling
+whiptail_msgbox() {
+  local title="$1"
+  local message="$2"
+  local min_height="${3:-10}"
+  local min_width="${4:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog (ESC key won't exit script - just returns)
+  whiptail --title "${title}" --msgbox "${centered_msg}" "${dialog_height}" "${dialog_width}" || true
+}
+
+# Wrapper function for whiptail yesno with dynamic sizing, centering, and ESC handling
+whiptail_yesno() {
+  local title="$1"
+  local message="$2"
+  local min_height="${3:-10}"
+  local min_width="${4:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and return exit code (ESC returns 1, but we handle it gracefully)
+  whiptail --title "${title}" --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+  local rc=$?
+  # Return 0 for ESC (don't exit script), 0 for Yes, 1 for No
+  return ${rc}
+}
+
+# Wrapper function for whiptail inputbox with dynamic sizing, centering, and ESC handling
+whiptail_inputbox() {
+  local title="$1"
+  local message="$2"
+  local default_value="${3:-}"
+  local min_height="${4:-10}"
+  local min_width="${5:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and capture output
+  local result
+  result=$(whiptail --title "${title}" --inputbox "${centered_msg}" "${dialog_height}" "${dialog_width}" "${default_value}" 3>&1 1>&2 2>&3)
+  local rc=$?
+  # Return empty string for ESC, actual value otherwise
+  if [[ ${rc} -ne 0 ]]; then
+    echo ""
+    return 1
+  fi
+  echo "${result}"
+  return 0
+}
+
+# Wrapper function for whiptail passwordbox with dynamic sizing, centering, and ESC handling
+whiptail_passwordbox() {
+  local title="$1"
+  local message="$2"
+  local default_value="${3:-}"
+  local min_height="${4:-10}"
+  local min_width="${5:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and capture output
+  local result
+  result=$(whiptail --title "${title}" --passwordbox "${centered_msg}" "${dialog_height}" "${dialog_width}" "${default_value}" 3>&1 1>&2 2>&3)
+  local rc=$?
+  # Return empty string for ESC, actual value otherwise
+  if [[ ${rc} -ne 0 ]]; then
+    echo ""
+    return 1
+  fi
+  echo "${result}"
+  return 0
+}
 
 # Shared whiptail textbox helper (scrollable)
 show_textbox() {
@@ -97,6 +336,7 @@ show_textbox() {
   [ "${WIDTH}" -lt 60 ] && WIDTH=60
 
   if ! whiptail --title "${title}" \
+                --scrolltext \
                 --textbox "${file}" $((HEIGHT-4)) $((WIDTH-4)); then
     # Ignore cancel (ESC) and simply return
     :
@@ -224,7 +464,16 @@ load_config() {
   # Ensure NIC / disk selections are always defined
   : "${MGT_NIC:=}"
   : "${CLTR0_NIC:=}"
+  : "${HOST_NIC:=}"
   : "${DATA_SSD_LIST:=}"
+
+  # VM configuration defaults (can be overridden from config file)
+  : "${DL_VCPUS:=42}"
+  : "${DL_MEMORY_GB:=136}"
+  : "${DL_DISK_GB:=500}"
+  : "${DA_VCPUS:=46}"
+  : "${DA_MEMORY_GB:=80}"
+  : "${DA_DISK_GB:=500}"
 }
 
 
@@ -240,10 +489,19 @@ save_config() {
   esc_acps_url=${ACPS_BASE_URL//\"/\\\"}
 
   # Also escape NIC / disk values
-  local esc_mgt_nic esc_cltr0_nic esc_data_ssd
+  local esc_mgt_nic esc_cltr0_nic esc_host_nic esc_data_ssd
   esc_mgt_nic=${MGT_NIC//\"/\\\"}
   esc_cltr0_nic=${CLTR0_NIC//\"/\\\"}
+  esc_host_nic=${HOST_NIC//\"/\\\"}
   esc_data_ssd=${DATA_SSD_LIST//\"/\\\"}
+
+  # VM configuration values (set defaults if not already set)
+  : "${DL_VCPUS:=42}"
+  : "${DL_MEMORY_GB:=136}"
+  : "${DL_DISK_GB:=500}"
+  : "${DA_VCPUS:=46}"
+  : "${DA_MEMORY_GB:=80}"
+  : "${DA_DISK_GB:=500}"
 
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer configuration (auto-generated)
@@ -258,7 +516,16 @@ AUTO_REBOOT_AFTER_STEP_ID="${AUTO_REBOOT_AFTER_STEP_ID}"
 # NIC / disk selected in STEP 01
 MGT_NIC="${esc_mgt_nic}"
 CLTR0_NIC="${esc_cltr0_nic}"
+HOST_NIC="${esc_host_nic}"
 DATA_SSD_LIST="${esc_data_ssd}"
+
+# VM configuration (set in STEP 10/11)
+DL_VCPUS=${DL_VCPUS}
+DL_MEMORY_GB=${DL_MEMORY_GB}
+DL_DISK_GB=${DL_DISK_GB}
+DA_VCPUS=${DA_VCPUS}
+DA_MEMORY_GB=${DA_MEMORY_GB}
+DA_DISK_GB=${DA_DISK_GB}
 EOF
 }
 
@@ -281,6 +548,7 @@ save_config_var() {
     # Add additional keys here
     MGT_NIC)        MGT_NIC="${value}" ;;
     CLTR0_NIC)      CLTR0_NIC="${value}" ;;
+    HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_SSD_LIST)  DATA_SSD_LIST="${value}" ;;
     *)
       # Ignore unknown keys for now (extend here if needed)
@@ -363,8 +631,16 @@ run_step() {
   local step_name="${STEP_NAMES[$idx]}"
 
   # Confirm whether to run this STEP
+  # Calculate dialog size dynamically and center message
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 12 70)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "${step_name}\n\nRun this step now?")
+  
   if ! whiptail --title "XDR Installer - ${step_id}" \
-                --yesno "${step_name}\n\nRun this step now?" 12 70
+                --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
   then
     # Treat cancel as normal flow (not an error)
     log "User canceled running STEP ${step_id}."
@@ -435,8 +711,7 @@ run_step() {
         if [[ "${step_id}" == "${reboot_step}" ]]; then
           log "AUTO_REBOOT_AFTER_STEP_ID=${AUTO_REBOOT_AFTER_STEP_ID} contains current STEP=${step_id} → performing auto reboot."
 
-          whiptail --title "Auto reboot" \
-                   --msgbox "STEP ${step_id} (${step_name}) completed successfully.\n\nThe system will reboot automatically." 12 70
+          whiptail_msgbox "Auto reboot" "STEP ${step_id} (${step_name}) completed successfully.\n\nThe system will reboot automatically." 12 70
 
           if [[ "${DRY_RUN}" -eq 1 ]]; then
             log "[DRY-RUN] Auto reboot is not executed."
@@ -454,8 +729,7 @@ run_step() {
     fi
   else
     log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
-    whiptail --title "STEP failed - ${step_id}" \
-             --msgbox "An error occurred while running STEP ${step_id} (${step_name}).\n\nCheck logs and rerun the STEP if needed.\nThe installer can continue to run." 14 80
+    whiptail_msgbox "STEP failed - ${step_id}" "An error occurred while running STEP ${step_id} (${step_name}).\n\nCheck logs and rerun the STEP if needed.\nThe installer can continue to run." 14 80
   fi
 
   # Always return 0 so set -e is not triggered here
@@ -508,20 +782,21 @@ step_01_hw_detect() {
   # Set defaults to avoid set -u issues (empty when undefined)
   : "${MGT_NIC:=}"
   : "${CLTR0_NIC:=}"
+  : "${HOST_NIC:=}"
   : "${DATA_SSD_LIST:=}"
 
   ########################
   # 0) Reuse existing selections?
   ########################
-  if [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
-    if whiptail --title "STEP 01 - Reuse previous selections" \
-                --yesno "The following values are already set:\n\n- MGT_NIC: ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)" 18 80
+  if [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
+    if whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_NIC: ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC: ${HOST_NIC}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
     then
       log "User chose to reuse existing STEP 01 selections (skip STEP 01)."
 
       # Ensure config is updated even when reusing
       save_config_var "MGT_NIC"       "${MGT_NIC}"
       save_config_var "CLTR0_NIC"     "${CLTR0_NIC}"
+      save_config_var "HOST_NIC"      "${HOST_NIC}"
       save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
 
       # Reuse counts as success with no further work → return 0
@@ -539,8 +814,7 @@ step_01_hw_detect() {
   nics="$(list_nic_candidates || true)"
 
   if [[ -z "${nics}" ]]; then
-    whiptail --title "STEP 01 - NIC detection failed" \
-             --msgbox "No usable NICs found.\n\nCheck ip link output and adjust the script." 12 70
+    whiptail_msgbox "STEP 01 - NIC detection failed" "No usable NICs found.\n\nCheck ip link output and adjust the script." 12 70
     log "No NIC candidates. Check ip link output."
     return 1
   fi
@@ -582,9 +856,20 @@ step_01_hw_detect() {
   # 2) Select mgt NIC
   ########################
   local mgt_nic
+  # Calculate menu size dynamically based on terminal size and number of NICs
+  local menu_dims
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  local msg_content="Choose the management (mgt) NIC.\nCurrent: ${MGT_NIC:-<none>}\n"
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
   mgt_nic=$(whiptail --title "STEP 01 - Select mgt NIC" \
-                     --menu "Choose the management (mgt) NIC.\nCurrent: ${MGT_NIC:-<none>}" \
-                     20 80 10 \
+                     --menu "${centered_msg}" \
+                     "${menu_height}" "${menu_width}" "${menu_list_height}" \
                      "${nic_list[@]}" \
                      3>&1 1>&2 2>&3) || {
     log "User canceled mgt NIC selection."
@@ -600,9 +885,18 @@ step_01_hw_detect() {
   ########################
   # Warn if cltr0 NIC matches mgt NIC
   local cltr0_nic
+  # Calculate menu size dynamically (reuse same calculation as mgt NIC)
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  local msg_content="Select NIC for cluster/SR-IOV (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${CLTR0_NIC:-<none>}\n"
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
   cltr0_nic=$(whiptail --title "STEP 01 - Select cltr0 NIC" \
-                       --menu "Select NIC for cluster/SR-IOV (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${CLTR0_NIC:-<none>}" \
-                       20 80 10 \
+                       --menu "${centered_msg}" \
+                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
                        "${nic_list[@]}" \
                        3>&1 1>&2 2>&3) || {
     log "User canceled cltr0 NIC selection."
@@ -610,8 +904,7 @@ step_01_hw_detect() {
   }
 
   if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
-    if ! whiptail --title "Warning" \
-                  --yesno "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?" 12 70
+    if ! whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?"
     then
       log "User canceled configuration with identical NICs."
       return 1    # step_01 may return 1; run_step handles rc
@@ -623,6 +916,38 @@ step_01_hw_detect() {
   CLTR0_NIC="${cltr0_nic}"
   save_config_var "CLTR0_NIC" "${CLTR0_NIC}"   ### Change 3
 
+  ########################
+  # 3-1) Select HOST access NIC (for direct KVM host access only)
+  ########################
+  local host_nic
+  # Calculate menu size dynamically (reuse same calculation as mgt/cltr0 NIC)
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message
+  local msg_content="Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_NIC:-<none>}\n"
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
+  host_nic=$(whiptail --title "STEP 01 - Select Host Access NIC" \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "${nic_list[@]}" \
+                      3>&1 1>&2 2>&3) || {
+    log "User canceled HOST_NIC selection."
+    return 1
+  }
+
+  # Prevent duplicates (same NIC as mgt/cltr0 is not allowed)
+  if [[ "${host_nic}" == "${MGT_NIC}" || "${host_nic}" == "${CLTR0_NIC}" ]]; then
+    whiptail_msgbox "Error" "HOST_NIC cannot be the same as MGT_NIC or CLTR0_NIC.\n\n- MGT_NIC : ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 12 80
+    log "HOST_NIC duplicate selection: ${host_nic}"
+    return 1
+  fi
+
+  log "Selected HOST_NIC: ${host_nic}"
+  HOST_NIC="${host_nic}"
+  save_config_var "HOST_NIC" "${HOST_NIC}"
 
   ########################
   # 4) Select SSDs for data
@@ -638,8 +963,7 @@ step_01_hw_detect() {
   all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
 
   if [[ -z "${all_disks}" ]]; then
-    whiptail --title "STEP 01 - Disk detection failed" \
-             --msgbox "No physical disks found.\nCheck lsblk output." 12 70
+    whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
     return 1
   fi
 
@@ -669,8 +993,7 @@ step_01_hw_detect() {
 
   # If no data disk candidates (e.g., only one OS disk)
   if [[ ${#disk_list[@]} -eq 0 ]]; then
-    whiptail --title "Warning" \
-             --msgbox "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
+    whiptail_msgbox "Warning" "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
     return 1
   fi
 
@@ -681,10 +1004,19 @@ step_01_hw_detect() {
   msg_guide+="==================================================\n\n"
   msg_guide+="Select data disks from the list below:"
 
+  # Calculate menu size dynamically for disk selection
+  local disk_count=$(( ${#disk_list[@]} / 3 ))  # Each disk has 3 elements (name, desc, flag)
+  menu_dims=$(calc_menu_size "${disk_count}" 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+  # Center-align the menu message based on terminal height
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_guide}\n" "${menu_height}")
+
   local selected_disks
   selected_disks=$(whiptail --title "STEP 01 - Select data disks" \
-                             --checklist "${msg_guide}" \
-                             22 85 10 \
+                             --checklist "${centered_msg}" \
+                             "${menu_height}" "${menu_width}" "${menu_list_height}" \
                              "${disk_list[@]}" \
                              3>&1 1>&2 2>&3) || {
     log "User canceled disk selection."
@@ -695,8 +1027,7 @@ step_01_hw_detect() {
   selected_disks=$(echo "${selected_disks}" | tr -d '"')
 
   if [[ -z "${selected_disks}" ]]; then
-    whiptail --title "Warning" \
-             --msgbox "No disks selected.\nCannot proceed with LVM configuration." 10 70
+    whiptail_msgbox "Warning" "No disks selected.\nCannot proceed with LVM configuration." 10 70
     log "No data disk selected."
     return 1
   fi
@@ -711,18 +1042,32 @@ step_01_hw_detect() {
   ########################
   local summary
   summary=$(cat <<EOF
-[STEP 01 Summary]
+═══════════════════════════════════════════════════════════
+  STEP 01: Hardware Detection and Selection - Complete
+═══════════════════════════════════════════════════════════
 
-- mgt NIC     : ${MGT_NIC}
-- cltr0 NIC   : ${CLTR0_NIC}
-- data disks  : ${DATA_SSD_LIST}
+✅ SELECTED HARDWARE:
+  • Management NIC (mgt):     ${MGT_NIC}
+  • Cluster NIC (cltr0):      ${CLTR0_NIC}
+  • Host access NIC:          ${HOST_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
+  • Data disks (LVM):         ${DATA_SSD_LIST}
 
-Config file: ${CONFIG_FILE}
+📁 CONFIGURATION:
+  • Config file: ${CONFIG_FILE}
+  • Settings saved successfully
+
+💡 IMPORTANT NOTES:
+  • These selections will be used in subsequent steps
+  • STEP 03 will configure network using mgt NIC
+  • STEP 07 will configure LVM using selected data disks
+  • To change selections, re-run STEP 01
+
+📝 NEXT STEPS:
+  • Proceed to STEP 02 (HWE Kernel Installation)
 EOF
 )
 
-  whiptail --title "STEP 01 complete" \
-           --msgbox "${summary}" 18 80
+  whiptail_msgbox "STEP 01 complete" "${summary}"
 
   ### Optional: save once more for safety
   if type save_config >/dev/null 2>&1; then
@@ -752,26 +1097,46 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "Current kernel version (uname -r): ${cur_kernel}"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 02: HWE (Hardware Enablement) Kernel Installation"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "${pkg_name} install status: ${hwe_installed}"
+    echo "📋 CURRENT STATUS:"
+    echo "  • Current kernel version: ${cur_kernel}"
+    echo "  • HWE kernel package (${pkg_name}): ${hwe_installed}"
     echo
-    echo "This STEP will perform:"
-    echo "  1) apt update"
-    echo "  2) apt full-upgrade -y"
-    echo "  3) install ${pkg_name} (skip if already installed)"
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Update package lists (apt update)"
+    echo "  2. Upgrade all packages (apt full-upgrade -y)"
+    echo "  3. Install HWE kernel package (${pkg_name})"
+    echo "     └─ Will be skipped if already installed"
     echo
-    echo "The new HWE kernel takes effect on the next host reboot."
-    echo "This script is configured to reboot once automatically"
-    echo "after STEP 05 (kernel tuning) completes."
+    echo "⚠️  IMPORTANT NOTES:"
+    echo "  • Even after installing the new HWE kernel, it will NOT take effect"
+    echo "    until the system is rebooted"
+    echo "  • The current kernel (${cur_kernel}) will remain active until reboot"
+    echo "  • Automatic reboot will occur after STEP 03 completes"
+    echo "  • There will be a second reboot after STEP 05 completes"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } > "${tmp_status}"
 
 
   # After computing cur_kernel/hwe_installed, show summary textbox
 
   if [[ "${hwe_installed}" == "yes" ]]; then
+    # Calculate dialog size dynamically and center message
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 18 80)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    local centered_msg
+    centered_msg=$(center_message "linux-generic-hwe-24.04 is already installed. Skip STEP 02?")
+    
     if ! whiptail --title "STEP 02 - HWE kernel already installed" \
-                  --yesno "linux-generic-hwe-24.04 is already installed. Skip STEP 02?" 18 80
+                  --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
     then
       log "User skipped STEP 02 because HWE kernel is already installed."
       save_state "02_hwe_kernel"
@@ -782,8 +1147,7 @@ step_02_hwe_kernel() {
 
   show_textbox "STEP 02 - HWE kernel overview" "${tmp_status}"
 
-  if ! whiptail --title "STEP 02 - confirmation" \
-                 --yesno "Proceed with these actions?\n\n(Yes: continue / No: cancel)" 12 70
+  if ! whiptail_yesno "STEP 02 - confirmation" "Proceed with these actions?\n\n(Yes: continue / No: cancel)"
   then
     log "User canceled STEP 02 execution."
     return 0
@@ -826,18 +1190,41 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "STEP 02 execution summary"
-    echo "----------------------"
-    echo "Previous kernel (uname -r): ${cur_kernel}"
-    echo "Current kernel (uname -r): ${new_kernel}"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 02: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "${pkg_name} installed (current): ${hwe_now}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 KERNEL STATUS:"
+    echo "  • Previous kernel: ${cur_kernel}"
+    echo "  • Current kernel:  ${new_kernel}"
+    echo "  • HWE package status: ${hwe_now}"
     echo
-    echo "※ The new HWE kernel applies on the next host reboot."
-    echo "   (uname -r output now may be unchanged before reboot.)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "ℹ️  In real execution mode, the HWE kernel would be installed"
+      echo "   and activated after the next reboot."
+    else
+      if [[ "${hwe_now}" == "yes" ]]; then
+        echo "✅ HWE kernel package is now installed"
+      else
+        echo "⚠️  HWE kernel package installation status: ${hwe_now}"
+      fi
+    fi
     echo
-    echo "※ This script performs a single automatic reboot after"
-    echo "   STEP 05 (kernel tuning) depending on AUTO_REBOOT_AFTER_STEP_ID."
+    echo "📝 NEXT STEPS:"
+    echo "  • The new HWE kernel is installed but NOT yet active"
+    echo "  • Current kernel (${new_kernel}) remains active until reboot"
+    echo "  • The new HWE kernel will become active after the first reboot"
+    echo "  • Automatic reboot will occur after STEP 03 completes"
+    echo "    (if AUTO_REBOOT_AFTER_STEP_ID includes '03_nic_ifupdown')"
+    echo "  • A second reboot will occur after STEP 05 completes"
+    echo "    (if AUTO_REBOOT_AFTER_STEP_ID includes '05_kernel_tuning')"
+    echo
+    echo "💡 TIP: You can verify the new kernel after reboot with:"
+    echo "   uname -r"
   } > "${tmp_status}"
 
 
@@ -856,10 +1243,9 @@ step_03_nic_ifupdown() {
   load_config
 
   # Use :- to guard against unset vars under set -u
-  if [[ -z "${MGT_NIC:-}" || -z "${CLTR0_NIC:-}" ]]; then
-    whiptail --title "STEP 03 - NIC not set" \
-             --msgbox "MGT_NIC or CLTR0_NIC is not configured.\n\nSelect NICs in STEP 01 first." 12 70
-    log "MGT_NIC or CLTR0_NIC missing; skipping STEP 03."
+  if [[ -z "${MGT_NIC:-}" || -z "${CLTR0_NIC:-}" || -z "${HOST_NIC:-}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC not set" "MGT_NIC, CLTR0_NIC, or HOST_NIC is not configured.\n\nSelect NICs in STEP 01 first." 12 70
+    log "MGT_NIC, CLTR0_NIC, or HOST_NIC missing; skipping STEP 03."
     return 0   # Skip only this STEP; installer continues
   fi
 
@@ -867,14 +1253,14 @@ step_03_nic_ifupdown() {
   #######################################
   # 0) Check current NIC/PCI info
   #######################################
-  local mgt_pci cltr0_pci
+  local mgt_pci cltr0_pci host_pci
   mgt_pci=$(readlink -f "/sys/class/net/${MGT_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
   cltr0_pci=$(readlink -f "/sys/class/net/${CLTR0_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
+  host_pci=$(readlink -f "/sys/class/net/${HOST_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
 
-  if [[ -z "${mgt_pci}" || -z "${cltr0_pci}" ]]; then
-    whiptail --title "STEP 03 - PCI info error" \
-             --msgbox "Cannot fetch PCI bus info for selected NICs.\n\nCheck /sys/class/net/${MGT_NIC}/device or /sys/class/net/${CLTR0_NIC}/device." 12 70
-    log "MGT_NIC=${MGT_NIC}(${mgt_pci}), CLTR0_NIC=${CLTR0_NIC}(${cltr0_pci}) → insufficient PCI info."
+  if [[ -z "${mgt_pci}" || -z "${cltr0_pci}" || -z "${host_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - PCI info error" "Cannot fetch PCI bus info for selected NICs.\n\nCheck /sys/class/net/${MGT_NIC}/device, /sys/class/net/${CLTR0_NIC}/device, or /sys/class/net/${HOST_NIC}/device." 12 70
+    log "MGT_NIC=${MGT_NIC}(${mgt_pci}), CLTR0_NIC=${CLTR0_NIC}(${cltr0_pci}), HOST_NIC=${HOST_NIC}(${host_pci}) → insufficient PCI info."
     return 1
   fi
 
@@ -887,6 +1273,9 @@ step_03_nic_ifupdown() {
     echo
     echo "CLTR0_NIC : ${CLTR0_NIC}"
     echo "  -> PCI  : ${cltr0_pci}"
+    echo
+    echo "HOST_NIC  : ${HOST_NIC}"
+    echo "  -> PCI  : ${host_pci}"
   } > "${tmp_pci}"
 
   show_textbox "STEP 03 - NIC/PCI review" "${tmp_pci}"
@@ -897,25 +1286,29 @@ step_03_nic_ifupdown() {
   local maybe_done=0
   local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
   local iface_file="/etc/network/interfaces"
+  local host_cfg="/etc/network/interfaces.d/02-hostmgmt.cfg"
 
   if [[ -f "${udev_file}" ]] && \
      grep -q "KERNELS==\"${mgt_pci}\".*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null && \
-     grep -q "KERNELS==\"${cltr0_pci}\".*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null; then
+     grep -q "KERNELS==\"${cltr0_pci}\".*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null && \
+     grep -q "KERNELS==\"${host_pci}\".*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null; then
     if [[ -f "${iface_file}" ]] && \
        grep -q "^auto mgt" "${iface_file}" 2>/dev/null && \
-       grep -q "iface mgt inet static" "${iface_file}" 2>/dev/null; then
+       grep -q "iface mgt inet static" "${iface_file}" 2>/dev/null && \
+       [[ -f "${host_cfg}" ]] && \
+       grep -q "^auto hostmgmt" "${host_cfg}" 2>/dev/null && \
+       grep -q "address 192\.168\.0\.100" "${host_cfg}" 2>/dev/null; then
       maybe_done=1
     fi
   fi
 
   if [[ "${maybe_done}" -eq 1 ]]; then
-    if whiptail --title "STEP 03 - Looks already configured" \
-                --yesno "udev rules and /etc/network/interfaces suggest config exists.\nSkip this STEP?" 18 80
+    if whiptail_yesno "STEP 03 - Already Configured" "Looking at udev rules and /etc/network/interfaces, hostmgmt settings, it appears to be already configured.\n\nDo you want to skip this STEP?" 18 80
     then
-      log "User skipped STEP 03 because it seems already configured."
+      log "User chose to skip STEP 03 entirely based on 'already configured' judgment."
       return 0
     fi
-    log "User chose to rerun STEP 03 anyway."
+    log "User chose to force re-execution of STEP 03."
   fi
 
 
@@ -940,31 +1333,31 @@ step_03_nic_ifupdown() {
 
   # IP address
   local new_ip
-  new_ip=$(whiptail --title "STEP 03 - mgt IP setup" \
-                    --inputbox "Enter IP address for mgt interface.\nExample: 10.4.0.210" \
-                    10 60 "${cur_ip}" \
-                    3>&1 1>&2 2>&3) || return 0
+  new_ip=$(whiptail_inputbox "STEP 03 - mgt IP setup" "Enter IP address for mgt interface.\nExample: 10.4.0.210" "${cur_ip}" 10 60)
+  if [[ $? -ne 0 ]] || [[ -z "${new_ip}" ]]; then
+    return 0
+  fi
 
   # Prefix
   local new_prefix
-  new_prefix=$(whiptail --title "STEP 03 - mgt Prefix" \
-                        --inputbox "Enter subnet prefix length (/ value).\nExample: 24" \
-                        10 60 "${cur_prefix}" \
-                        3>&1 1>&2 2>&3) || return 0
+  new_prefix=$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${cur_prefix}" 10 60)
+  if [[ $? -ne 0 ]] || [[ -z "${new_prefix}" ]]; then
+    return 0
+  fi
 
   # Gateway
   local new_gw
-  new_gw=$(whiptail --title "STEP 03 - gateway" \
-                    --inputbox "Enter default gateway IP.\nExample: 10.4.0.254" \
-                    10 60 "${cur_gw}" \
-                    3>&1 1>&2 2>&3) || return 0
+  new_gw=$(whiptail_inputbox "STEP 03 - gateway" "Enter default gateway IP.\nExample: 10.4.0.254" "${cur_gw}" 10 60)
+  if [[ $? -ne 0 ]] || [[ -z "${new_gw}" ]]; then
+    return 0
+  fi
 
   # DNS
   local new_dns
-  new_dns=$(whiptail --title "STEP 03 - DNS" \
-                     --inputbox "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" \
-                     10 70 "${cur_dns}" \
-                     3>&1 1>&2 2>&3) || return 0
+  new_dns=$(whiptail_inputbox "STEP 03 - DNS" "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" "${cur_dns}" 10 70)
+  if [[ $? -ne 0 ]] || [[ -z "${new_dns}" ]]; then
+    return 0
+  fi
 
   # Simple prefix → netmask conversion (common cases)
   local netmask
@@ -980,10 +1373,10 @@ step_03_nic_ifupdown() {
     30) netmask="255.255.255.252" ;;
     *)
       # Unknown prefix → ask user for netmask directly
-      netmask=$(whiptail --title "STEP 03 - Enter netmask manually" \
-                         --inputbox "Unknown prefix: /${new_prefix}.\nEnter netmask manually.\nExample: 255.255.255.0" \
-                         10 70 "255.255.255.0" \
-                         3>&1 1>&2 2>&3) || return 1
+      netmask=$(whiptail_inputbox "STEP 03 - Enter netmask manually" "Unknown prefix: /${new_prefix}.\nEnter netmask manually.\nExample: 255.255.255.0" "255.255.255.0" 10 70)
+      if [[ $? -ne 0 ]] || [[ -z "${netmask}" ]]; then
+        return 1
+      fi
       ;;
   esac
 
@@ -1002,12 +1395,15 @@ step_03_nic_ifupdown() {
 
   local udev_content
   udev_content=$(cat <<EOF
-# Management & Cluster Interface custom names (auto-generated)
+# Management & Cluster & HostMgmt Interface custom names (auto-generated)
 # MGT_NIC=${MGT_NIC}, PCI=${mgt_pci}
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${mgt_pci}", NAME:="mgt"
 
-# Cluster Interface PCI-bus ${cltr0_pci}, create 2 SR-IOV VFs
+# Cluster Interface PCI-bus ${cltr0_pci}, Create 2 SR-IOV VFs
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${cltr0_pci}", NAME:="cltr0", ATTR{device/sriov_numvfs}="2"
+
+# Host direct management interface (no gateway) PCI-bus ${host_pci}
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${host_pci}", NAME:="hostmgmt"
 EOF
 )
 
@@ -1059,17 +1455,46 @@ EOF
   fi
 
   #######################################
-  # 4) Create /etc/network/interfaces.d/00-cltr0.cfg
+  # 3-1) Create /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt, no gateway, fixed IP)
   #######################################
-  log "[STEP 03] Create /etc/network/interfaces.d/00-cltr0.cfg"
+  log "[STEP 03] Creating /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt: 192.168.0.100/24, no gateway)"
 
   local iface_dir="/etc/network/interfaces.d"
-  local cltr0_cfg="${iface_dir}/00-cltr0.cfg"
-  local cltr0_bak="${cltr0_cfg}.$(date +%Y%m%d-%H%M%S).bak"
+  local host_cfg="${iface_dir}/02-hostmgmt.cfg"
+  local host_bak="${host_cfg}.$(date +%Y%m%d-%H%M%S).bak"
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     mkdir -p "${iface_dir}"
   fi
+
+  if [[ -f "${host_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
+    cp -a "${host_cfg}" "${host_bak}"
+    log "Backed up existing ${host_cfg}: ${host_bak}"
+  fi
+
+  local host_content
+  host_content=$(cat <<EOF
+# Host direct management interface (no gateway)
+auto hostmgmt
+iface hostmgmt inet static
+    address 192.168.0.100
+    netmask 255.255.255.0
+EOF
+)
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will write the following content to ${host_cfg}:\n${host_content}"
+  else
+    printf "%s\n" "${host_content}" > "${host_cfg}"
+  fi
+
+  #######################################
+  # 4) Create /etc/network/interfaces.d/00-cltr0.cfg
+  #######################################
+  log "[STEP 03] Create /etc/network/interfaces.d/00-cltr0.cfg"
+
+  local cltr0_cfg="${iface_dir}/00-cltr0.cfg"
+  local cltr0_bak="${cltr0_cfg}.$(date +%Y%m%d-%H%M%S).bak"
 
   if [[ -f "${cltr0_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
     cp -a "${cltr0_cfg}" "${cltr0_bak}"
@@ -1122,13 +1547,9 @@ EOF
 
   # Move netplan config files
   if compgen -G "/etc/netplan/*.yaml" > /dev/null; then
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] sudo mkdir -p /etc/netplan/disabled"
-      log "[DRY-RUN] sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/"
-    else
-      sudo mkdir -p /etc/netplan/disabled
-      sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/
-    fi
+    log "[STEP 03] Moving netplan config files to /etc/netplan/disabled"
+    run_cmd "sudo mkdir -p /etc/netplan/disabled"
+    run_cmd "sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/"
   else
     log "No netplan yaml files to move (may already be relocated)."
   fi
@@ -1155,35 +1576,56 @@ EOF
   #######################################
   local summary
   summary=$(cat <<EOF
-[STEP 03 Summary]
+═══════════════════════════════════════════════════════════
+  STEP 03: Network Configuration - Complete
+═══════════════════════════════════════════════════════════
 
-- udev rule file      : /etc/udev/rules.d/99-custom-ifnames.rules
-  * mgt   -> PCI ${mgt_pci}
-  * cltr0 -> PCI ${cltr0_pci}, sriov_numvfs=2
+✅ CONFIGURATION COMPLETED:
+  • udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
+    - mgt NIC → PCI ${mgt_pci} → renamed to "mgt"
+    - cltr0 NIC → PCI ${cltr0_pci} → renamed to "cltr0" (SR-IOV VFs=2)
+    - hostmgmt NIC → PCI ${host_pci} → renamed to "hostmgmt"
 
-- /etc/network/interfaces
-  * mgt IP      : ${new_ip}/${new_prefix} (netmask ${netmask})
-  * gateway     : ${new_gw}
-  * dns         : ${new_dns}
+  • Network interfaces: /etc/network/interfaces
+    - mgt IP:      ${new_ip}/${new_prefix} (netmask ${netmask})
+    - Gateway:     ${new_gw}
+    - DNS:         ${new_dns}
 
-- /etc/network/interfaces.d/00-cltr0.cfg
-  * cltr0 → manual mode
+  • hostmgmt interface: /etc/network/interfaces.d/02-hostmgmt.cfg
+    - hostmgmt IP: 192.168.0.100/24 (no gateway)
 
-- /etc/iproute2/rt_tables
-  * Add 1 rt_mgt if missing
+  • cltr0 interface: /etc/network/interfaces.d/00-cltr0.cfg
+    - Mode: manual (for SR-IOV passthrough)
 
-- netplan disabled, switched to ifupdown + networking service
+  • Routing table: /etc/iproute2/rt_tables
+    - Added: 1 rt_mgt
 
-※ Network services may fail if restarted immediately.
-  This script is set to auto-reboot twice: after STEP 03
-  (NIC/ifupdown switch) and after STEP 05 (kernel tuning).
-  When DRY_RUN=0 and each STEP succeeds, auto reboot runs.
+  • Network stack: netplan → ifupdown
+    - netplan disabled
+    - ifupdown enabled
+
+⚠️  IMPORTANT NOTES:
+  • Network configuration changes require reboot to take effect
+  • Network services may fail if restarted immediately
+  • Automatic reboot will occur after this step completes
+    (if AUTO_REBOOT_AFTER_STEP_ID includes '03_nic_ifupdown')
+  • A second reboot will occur after STEP 05 completes
+    (if AUTO_REBOOT_AFTER_STEP_ID includes '05_kernel_tuning')
+
+🔧 TROUBLESHOOTING:
+  • If network fails after reboot:
+    1. Check /etc/network/interfaces syntax
+    2. Verify NIC PCI addresses match hardware
+    3. Check udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
+    4. Review logs: ${LOG_FILE}
+
+📝 NEXT STEPS:
+  • System will reboot automatically after this step (if configured)
+  • After reboot, proceed to STEP 04 (KVM/Libvirt Installation)
 EOF
 )
 
-
-    whiptail --title "STEP 03 complete" \
-             --msgbox "${summary}" 25 80
+  whiptail_msgbox "STEP 03 complete" "${summary}"
 
     # Reboot handled in common logic (AUTO_REBOOT_AFTER_STEP_ID)
     log "[STEP 03] NIC ifupdown switch and network configuration finished."
@@ -1204,27 +1646,76 @@ step_04_kvm_libvirt() {
   # 0) Summarize current KVM/Libvirt status
   #######################################
   {
-    echo "Current KVM/Libvirt status"
-    echo "--------------------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 04: KVM and Libvirt Installation"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "1) CPU virtualization support (vmx/svm presence)"
-    egrep -c '(vmx|svm)' /proc/cpuinfo 2>/dev/null || echo "0"
+    echo "📋 CURRENT STATUS:"
     echo
-    echo "2) KVM/Libvirt package installation status (dpkg -l)"
-    dpkg -l | egrep 'qemu-kvm|libvirt-daemon-system|libvirt-clients|virtinst|bridge-utils|qemu-utils|virt-viewer|genisoimage|net-tools|cpu-checker|ipset|ipcalc-ng' \
-      || echo "(no related package info)"
+    echo "1️⃣  CPU Virtualization Support:"
+    local logical_cpus
+    logical_cpus=$(nproc 2>/dev/null || echo "0")
+    if [[ "${logical_cpus}" -gt 0 ]]; then
+      # Check for virtualization flags
+      if grep -qE '(vmx|svm)' /proc/cpuinfo 2>/dev/null; then
+        echo "  ✅ Virtualization support detected"
+        echo "  📊 System has ${logical_cpus} logical CPUs (vCPUs)"
+        echo "     (Hyper-threading enabled: physical cores × 2)"
+      else
+        echo "  ⚠️  No virtualization flags found (check BIOS settings)"
+        echo "  📊 System has ${logical_cpus} logical CPUs (vCPUs)"
+      fi
+    else
+      echo "  ⚠️  Unable to determine CPU count"
+    fi
     echo
-    echo "3) libvirtd service state (brief)"
-    systemctl is-active libvirtd 2>/dev/null || echo "inactive"
+    echo "2️⃣  KVM/Libvirt Package Status:"
+    local pkg_status
+    pkg_status=$(dpkg -l | egrep 'qemu-kvm|libvirt-daemon-system|libvirt-clients|virtinst|bridge-utils|qemu-utils|virt-viewer|genisoimage|net-tools|cpu-checker|ipset|ipcalc-ng' 2>/dev/null || echo "(no packages found)")
+    if [[ "${pkg_status}" == *"(no packages found)"* ]]; then
+      echo "  ⚠️  No KVM/Libvirt packages installed"
+    else
+      echo "  📦 Installed packages:"
+      echo "${pkg_status}" | sed 's/^/    /'
+    fi
     echo
-    echo "4) virsh net-list --all"
-    virsh net-list --all 2>/dev/null || echo "(no libvirt network info)"
+    echo "3️⃣  libvirtd Service Status:"
+    local libvirtd_status
+    libvirtd_status=$(systemctl is-active libvirtd 2>/dev/null)
+    if [[ -z "${libvirtd_status}" ]] || [[ "${libvirtd_status}" != "active" ]]; then
+      libvirtd_status="inactive"
+    fi
+    if [[ "${libvirtd_status}" == "active" ]]; then
+      echo "  ✅ libvirtd is active"
+    else
+      echo "  ⚠️  libvirtd service is inactive"
+    fi
+    echo
+    echo "4️⃣  Libvirt Networks:"
+    virsh net-list --all 2>/dev/null || echo "  ⚠️  No libvirt networks found (libvirt may not be installed)"
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Install KVM and required packages"
+    echo "  2. Enable and start libvirtd service"
+    echo "  3. Configure default libvirt network (virbr0)"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } >> "${tmp_info}"
 
   show_textbox "STEP 04 - Current KVM/Libvirt status" "${tmp_info}"
 
+  # Calculate dialog size dynamically and center message
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 13 80)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "Proceed with KVM/Libvirt package install and default network configuration?")
+  
   if ! whiptail --title "STEP 04 - confirmation" \
-                 --yesno "Proceed with KVM/Libvirt package install and default network configuration?" 13 80
+                 --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
   then
     log "User canceled STEP 04 execution."
     return 0
@@ -1246,6 +1737,49 @@ qemu-utils virt-viewer genisoimage net-tools cpu-checker ipset make gcc ipcalc-n
 
   run_cmd "sudo systemctl enable --now libvirtd"
   run_cmd "sudo systemctl enable --now virtlogd"
+
+  # Wait for services to become active (with retry logic)
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    log "[STEP 04] Waiting for libvirtd service to become active..."
+    local max_wait=15  # Maximum wait time in seconds
+    local wait_interval=1  # Check every 1 second
+    local waited=0
+    local libvirtd_active=0
+    local virtlogd_active=0
+
+    # Wait for libvirtd
+    while [[ ${waited} -lt ${max_wait} ]]; do
+      if systemctl is-active --quiet libvirtd 2>/dev/null; then
+        libvirtd_active=1
+        log "[STEP 04] libvirtd service is now active (waited ${waited} seconds)"
+        break
+      fi
+      sleep "${wait_interval}"
+      ((waited += wait_interval))
+    done
+
+    if [[ ${libvirtd_active} -eq 0 ]]; then
+      log "[WARN] libvirtd service did not become active within ${max_wait} seconds"
+    fi
+
+    # Wait for virtlogd (reset wait counter)
+    waited=0
+    while [[ ${waited} -lt ${max_wait} ]]; do
+      if systemctl is-active --quiet virtlogd 2>/dev/null; then
+        virtlogd_active=1
+        log "[STEP 04] virtlogd service is now active (waited ${waited} seconds)"
+        break
+      fi
+      sleep "${wait_interval}"
+      ((waited += wait_interval))
+    done
+
+    if [[ ${virtlogd_active} -eq 0 ]]; then
+      log "[WARN] virtlogd service did not become active within ${max_wait} seconds"
+    fi
+  else
+    log "[DRY-RUN] Would wait for libvirtd/virtlogd services to become active"
+  fi
 
   # Verification commands – no real execution in DRY_RUN
   log "[STEP 04] KVM settings check commands (lsmod, kvm-ok, systemctl status libvirtd)"
@@ -1337,21 +1871,57 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 04 execution summary"
-    echo "-----------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 04: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# virsh net-list --all"
-    virsh net-list --all 2>/dev/null || echo "(no libvirt network info)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 INSTALLATION STATUS:"
     echo
-    echo "# Key parts of ${default_net_xml_final} (IP/DHCP)"
-    if [[ -f "${default_net_xml_final}" ]]; then
-      grep -E "<network>|<name>|<forward|<bridge|<ip|<dhcp" "${default_net_xml_final}" || cat "${default_net_xml_final}"
+    echo "1️⃣  Libvirt Networks:"
+    local net_list
+    net_list=$(virsh net-list --all 2>/dev/null || echo "  ⚠️  Unable to list networks")
+    if [[ "${net_list}" != *"Unable to list"* ]]; then
+      echo "${net_list}" | sed 's/^/  /'
     else
-      echo "${default_net_xml_final} does not exist."
+      echo "  ${net_list}"
     fi
     echo
-    echo "※ /etc/libvirt/hooks/network and /etc/libvirt/hooks/qemu"
-    echo "   assume virbr0 (default network: 192.168.122.0/24, no DHCP)."
+    echo "2️⃣  Default Network Configuration:"
+    if [[ -f "${default_net_xml_final}" ]]; then
+      echo "  ✅ Network XML file exists: ${default_net_xml_final}"
+      echo "  📋 Key configuration:"
+      grep -E "<network>|<name>|<forward|<bridge|<ip|<dhcp" "${default_net_xml_final}" 2>/dev/null | sed 's/^/    /' || echo "    (unable to parse)"
+    else
+      echo "  ⚠️  Network XML file not found: ${default_net_xml_final}"
+    fi
+    echo
+    echo "3️⃣  Service Status:"
+    local libvirtd_status
+    libvirtd_status=$(systemctl is-active libvirtd 2>/dev/null)
+    if [[ -z "${libvirtd_status}" ]] || [[ "${libvirtd_status}" != "active" ]]; then
+      libvirtd_status="inactive"
+    fi
+    if [[ "${libvirtd_status}" == "active" ]]; then
+      echo "  ✅ libvirtd service is active"
+    else
+      echo "  ⚠️  libvirtd service is inactive"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • Default network (virbr0) is configured with:"
+    echo "    - IP range: 192.168.122.0/24"
+    echo "    - DHCP: Disabled (as required by hooks)"
+    echo "  • /etc/libvirt/hooks/network and qemu scripts"
+    echo "    assume virbr0 network configuration"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 05 (Kernel Tuning) - 1 step later"
+    echo "  • After STEP 05 completes, system will reboot automatically"
+    echo "  • After reboot, proceed to STEP 06 (SR-IOV + NTPsec)"
   } > "${tmp_info}"
 
   show_textbox "STEP 04 - Summary" "${tmp_info}"
@@ -1380,13 +1950,46 @@ EOF
       fail_reasons+=(" - kvm kernel module is not loaded.")
     fi
 
-    # 3) libvirtd / virtlogd service state
-    if ! systemctl is-active --quiet libvirtd 2>/dev/null; then
-      fail_reasons+=(" - libvirtd service is not active.")
+    # 3) libvirtd / virtlogd service state (with retry logic)
+    local libvirtd_check=0
+    local virtlogd_check=0
+    local retry_count=0
+    local max_retries=3
+    local retry_delay=2
+
+    # Retry check for libvirtd (service may need a moment to fully start)
+    while [[ ${retry_count} -lt ${max_retries} ]]; do
+      if systemctl is-active --quiet libvirtd 2>/dev/null; then
+        libvirtd_check=1
+        break
+      fi
+      if [[ ${retry_count} -lt $((max_retries - 1)) ]]; then
+        log "[STEP 04] libvirtd not yet active, waiting ${retry_delay} seconds before retry ($((retry_count + 1))/${max_retries})..."
+        sleep "${retry_delay}"
+      fi
+      ((retry_count++))
+    done
+
+    if [[ ${libvirtd_check} -eq 0 ]]; then
+      fail_reasons+=(" - libvirtd service is not active (checked ${max_retries} times with ${retry_delay}s intervals).")
     fi
 
-    if ! systemctl is-active --quiet virtlogd 2>/dev/null; then
-      fail_reasons+=(" - virtlogd service is not active.")
+    # Retry check for virtlogd
+    retry_count=0
+    while [[ ${retry_count} -lt ${max_retries} ]]; do
+      if systemctl is-active --quiet virtlogd 2>/dev/null; then
+        virtlogd_check=1
+        break
+      fi
+      if [[ ${retry_count} -lt $((max_retries - 1)) ]]; then
+        log "[STEP 04] virtlogd not yet active, waiting ${retry_delay} seconds before retry ($((retry_count + 1))/${max_retries})..."
+        sleep "${retry_delay}"
+      fi
+      ((retry_count++))
+    done
+
+    if [[ ${virtlogd_check} -eq 0 ]]; then
+      fail_reasons+=(" - virtlogd service is not active (checked ${max_retries} times with ${retry_delay}s intervals).")
     fi
 
     # 4) default network (virbr0) configuration state
@@ -1413,7 +2016,7 @@ EOF
       msg+="\n[STEP 04] Rerun KVM / Libvirt installation and default network (virbr0) setup, then check logs."
 
       log "[STEP 04] Prerequisite validation failed → returning rc=1"
-      whiptail --title "STEP 04 validation failed" --msgbox "${msg}" 20 90
+      whiptail_msgbox "STEP 04 validation failed" "${msg}"
       return 1
     fi
   fi
@@ -1445,32 +2048,82 @@ step_05_kernel_tuning() {
     echo "# vm.min_free_kbytes"
     sysctl vm.min_free_kbytes 2>/dev/null || echo "Failed to read vm.min_free_kbytes"
     echo
-    echo "# IPv4 forwarding status"
-    sysctl net.ipv4.ip_forward 2>/dev/null || echo "Failed to read net.ipv4.ip_forward"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 05: Kernel Tuning and System Configuration"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# ARP-related settings (may already be set)"
-    sysctl net.ipv4.conf.all.arp_filter 2>/dev/null || true
-    sysctl net.ipv4.conf.default.arp_filter 2>/dev/null || true
-    sysctl net.ipv4.conf.all.arp_announce 2>/dev/null || true
-    sysctl net.ipv4.conf.default.arp_announce 2>/dev/null || true
-    sysctl net.ipv4.conf.all.arp_ignore 2>/dev/null || true
-    sysctl net.ipv4.conf.all.ignore_routes_with_linkdown 2>/dev/null || true
+    echo "📋 CURRENT STATUS:"
     echo
-    echo "# KSM status (0 = disabled, 1 = enabled)"
+    echo "1️⃣  Kernel Parameters:"
+    local ip_forward
+    ip_forward=$(sysctl net.ipv4.ip_forward 2>/dev/null || echo "Failed to read")
+    echo "  • net.ipv4.ip_forward: ${ip_forward}"
+    local arp_filter
+    arp_filter=$(sysctl net.ipv4.conf.all.arp_filter 2>/dev/null || echo "not set")
+    echo "  • net.ipv4.conf.all.arp_filter: ${arp_filter}"
+    local ignore_routes
+    ignore_routes=$(sysctl net.ipv4.conf.all.ignore_routes_with_linkdown 2>/dev/null || echo "not set")
+    echo "  • net.ipv4.conf.all.ignore_routes_with_linkdown: ${ignore_routes}"
+    echo
+    echo "2️⃣  KSM (Kernel Same-page Merging) Status:"
     if [[ -f /sys/kernel/mm/ksm/run ]]; then
-      cat /sys/kernel/mm/ksm/run
+      local ksm_state
+      ksm_state=$(cat /sys/kernel/mm/ksm/run)
+      if [[ "${ksm_state}" == "0" ]]; then
+        echo "  ✅ KSM is currently disabled (0)"
+      else
+        echo "  ⚠️  KSM is currently enabled (${ksm_state})"
+      fi
     else
-      echo "/sys/kernel/mm/ksm/run not found."
+      echo "  ⚠️  KSM control file not found"
     fi
     echo
-    echo "# Current swap status"
-    swapon --show || echo "(no active swap)"
+    echo "3️⃣  Swap Status:"
+    local swap_info
+    swap_info=$(swapon --show 2>/dev/null || echo "No active swap")
+    if [[ "${swap_info}" == *"No active"* ]]; then
+      echo "  ✅ ${swap_info}"
+    else
+      echo "  📋 Active swap devices:"
+      echo "${swap_info}" | sed 's/^/    /'
+    fi
+    echo
+    echo "4️⃣  GRUB Configuration:"
+    if grep -q 'intel_iommu=on' /etc/default/grub 2>/dev/null && grep -q 'iommu=pt' /etc/default/grub 2>/dev/null; then
+      echo "  ✅ IOMMU parameters already configured in GRUB"
+    else
+      echo "  ⚠️  IOMMU parameters not found in GRUB"
+    fi
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Configure kernel parameters (vm.min_free_kbytes, ARP settings)"
+    echo "  2. Disable KSM (Kernel Same-page Merging)"
+    echo "  3. Disable swap (swapoff -a, comment /swap.img in /etc/fstab)"
+    echo "  4. Add IOMMU parameters to GRUB (intel_iommu=on iommu=pt)"
+    echo "  5. Update GRUB configuration (update-grub)"
+    echo
+    echo "⚠️  IMPORTANT NOTES:"
+    echo "  • GRUB changes require reboot to take effect"
+    echo "  • This script will automatically reboot immediately after this step"
+    echo "  • Swap will be disabled (all active swap will be turned off)"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } >> "${tmp_info}"
 
   show_textbox "STEP 05 - Current kernel/Swap status" "${tmp_info}"
 
+  # Calculate dialog size dynamically and center message
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 15 80)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "Apply kernel params, disable KSM, disable Swap, and configure IOMMU per docs?\n\n(Yes: continue / No: cancel)")
+  
   if ! whiptail --title "STEP 05 - confirmation" \
-                 --yesno "Apply kernel params, disable KSM, disable Swap, and configure IOMMU per docs?\n\n(Yes: continue / No: cancel)" 15 80
+                 --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
   then
     log "User canceled STEP 05."
     return 0
@@ -1515,12 +2168,8 @@ step_05_kernel_tuning() {
     fi
 
     # Run update-grub
-    if [[ "${_DRY}" -eq 1 ]]; then
-      log "[DRY-RUN] sudo update-grub"
-    else
-      log "[STEP 05] Running update-grub"
-      sudo update-grub
-    fi
+    log "[STEP 05] Running update-grub"
+    run_cmd "sudo update-grub"
   else
     log "[WARN] ${grub_file} not found. Skipping GRUB/IOMMU configuration."
   fi
@@ -1664,8 +2313,7 @@ EOF
   local do_swapoff=0
   local do_zeroize=0
 
-  if whiptail --title "STEP 05 - disable Swap" \
-              --yesno "Disable Swap per docs and comment /swap.img in /etc/fstab.\n\nProceed now?" 13 80
+  if whiptail_yesno "STEP 05 - disable Swap" "Disable Swap per docs and comment /swap.img in /etc/fstab.\n\nProceed now?"
   then
     do_swapoff=1
   else
@@ -1706,8 +2354,7 @@ EOF
 
     # 3-3) Optional zeroize /swap.img
     if [[ -f /swap.img ]]; then
-      if whiptail --title "STEP 05 - swap.img Zeroize" \
-                  --yesno "/swap.img exists.\nDocs recommend zeroize with dd + truncate (takes time).\n\nProceed now?" 15 80
+      if whiptail_yesno "STEP 05 - swap.img Zeroize" "/swap.img exists.\nDocs recommend zeroize with dd + truncate (takes time).\n\nProceed now?"
       then
         do_zeroize=1
       else
@@ -1732,29 +2379,71 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 05 execution summary"
-    echo "----------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 05: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# vm.min_free_kbytes (after apply)"
-    sysctl vm.min_free_kbytes 2>/dev/null || echo "Failed to read vm.min_free_kbytes"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 KERNEL PARAMETERS:"
     echo
-    echo "# ARP / ignore_routes_with_linkdown settings (after apply)"
-    sysctl net.ipv4.conf.all.arp_filter 2>/dev/null || true
-    sysctl net.ipv4.conf.default.arp_filter 2>/dev/null || true
-    sysctl net.ipv4.conf.all.arp_announce 2>/dev/null || true
-    sysctl net.ipv4.conf.default.arp_announce 2>/dev/null || true
-    sysctl net.ipv4.conf.all.arp_ignore 2>/dev/null || true
-    sysctl net.ipv4.conf.all.ignore_routes_with_linkdown 2>/dev/null || true
-    echo
-    echo "# KSM state (/sys/kernel/mm/ksm/run)"
-    if [[ -f /sys/kernel/mm/ksm/run ]]; then
-      cat /sys/kernel/mm/ksm/run
+    echo "1️⃣  Memory Management (vm.min_free_kbytes):"
+    local min_free
+    min_free=$(sysctl vm.min_free_kbytes 2>/dev/null || echo "Failed to read")
+    if [[ "${min_free}" != *"Failed"* ]]; then
+      echo "  ✅ ${min_free}"
     else
-      echo "/sys/kernel/mm/ksm/run not found."
+      echo "  ⚠️  ${min_free}"
     fi
     echo
-    echo "# Current Swap status (swapon --show)"
-    swapon --show || echo "(no active swap)"
+    echo "2️⃣  Network ARP Settings:"
+    echo "  • arp_filter (all):     $(sysctl net.ipv4.conf.all.arp_filter 2>/dev/null | awk '{print $3}')"
+    echo "  • arp_filter (default):  $(sysctl net.ipv4.conf.default.arp_filter 2>/dev/null | awk '{print $3}')"
+    echo "  • arp_announce (all):    $(sysctl net.ipv4.conf.all.arp_announce 2>/dev/null | awk '{print $3}')"
+    echo "  • arp_announce (default): $(sysctl net.ipv4.conf.default.arp_announce 2>/dev/null | awk '{print $3}')"
+    echo "  • arp_ignore (all):      $(sysctl net.ipv4.conf.all.arp_ignore 2>/dev/null | awk '{print $3}')"
+    echo "  • ignore_routes_with_linkdown: $(sysctl net.ipv4.conf.all.ignore_routes_with_linkdown 2>/dev/null | awk '{print $3}')"
+    echo
+    echo "3️⃣  KSM (Kernel Same-page Merging) Status:"
+    if [[ -f /sys/kernel/mm/ksm/run ]]; then
+      local ksm_state
+      ksm_state=$(cat /sys/kernel/mm/ksm/run)
+      if [[ "${ksm_state}" == "0" ]]; then
+        echo "  ✅ KSM is disabled (0)"
+      else
+        echo "  ⚠️  KSM is enabled (${ksm_state})"
+      fi
+    else
+      echo "  ⚠️  KSM control file not found"
+    fi
+    echo
+    echo "4️⃣  Swap Status:"
+    local swap_info
+    swap_info=$(swapon --show 2>/dev/null || echo "No active swap")
+    if [[ "${swap_info}" == *"No active"* ]]; then
+      echo "  ✅ ${swap_info}"
+    else
+      echo "  📋 Active swap devices:"
+      echo "${swap_info}" | sed 's/^/    /'
+    fi
+    echo
+    echo "5️⃣  GRUB Configuration:"
+    if grep -q 'intel_iommu=on' /etc/default/grub 2>/dev/null && grep -q 'iommu=pt' /etc/default/grub 2>/dev/null; then
+      echo "  ✅ IOMMU parameters (intel_iommu=on iommu=pt) configured"
+    else
+      echo "  ⚠️  IOMMU parameters not found in GRUB"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • GRUB changes require reboot to take effect"
+    echo "  • Automatic reboot will occur immediately after this step"
+    echo "    (if AUTO_REBOOT_AFTER_STEP_ID includes '05_kernel_tuning')"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • System will reboot automatically immediately after this step (if configured)"
+    echo "  • After reboot, proceed to STEP 06 (SR-IOV + NTPsec)"
   } >> "${tmp_info}"
 
   show_textbox "STEP 05 - Summary" "${tmp_info}"
@@ -1779,51 +2468,59 @@ step_06_ntpsec() {
 
   local iavf_url="https://github.com/intel/ethernet-linux-iavf/releases/download/v4.13.16/iavf-4.13.16.tar.gz"
 
-  echo "=== Installing packages needed to build iavf driver (apt-get) ==="
-  sudo apt-get update -y
-  sudo apt-get install -y build-essential linux-headers-$(uname -r) curl
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would install packages needed to build iavf driver"
+    log "[DRY-RUN] Would download iavf driver from: ${iavf_url}"
+    log "[DRY-RUN] Would build and install iavf driver"
+  else
+    echo "=== Installing packages needed to build iavf driver (apt-get) ==="
+    run_cmd "sudo apt-get update -y"
+    run_cmd "sudo apt-get install -y build-essential linux-headers-$(uname -r) curl"
 
-  echo
-  echo "=== Downloading iavf driver archive (curl progress below) ==="
-  (
-    cd /tmp || exit 1
-    curl -L -o iavf-4.13.16.tar.gz "${iavf_url}"
-  )
-  local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    log "[ERROR] Failed to download iavf driver (rc=${rc})"
-    whiptail --title "STEP 06 - iavf download failed" \
-             --msgbox "Failed to download iavf driver (${iavf_url}).\n\nCheck network or GitHub access and retry." 12 80
-    return 1
-  fi
-  echo "=== iavf driver download complete ==="
-  log "[STEP 06] iavf driver download complete"
+    echo
+    echo "=== Downloading iavf driver archive (curl progress below) ==="
+    (
+      cd /tmp || exit 1
+      curl -L -o iavf-4.13.16.tar.gz "${iavf_url}"
+    )
+    local rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "[ERROR] Failed to download iavf driver (rc=${rc})"
+      whiptail_msgbox "STEP 06 - iavf download failed" "Failed to download iavf driver (${iavf_url}).\n\nCheck network or GitHub access and retry." 12 80
+      return 1
+    fi
+    echo "=== iavf driver download complete ==="
+    log "[STEP 06] iavf driver download complete"
 
-  echo
-  echo "=== Building / installing iavf driver (may take time) ==="
-  (
-    cd /tmp || exit 1
-    tar xzf iavf-4.13.16.tar.gz
-    cd iavf-4.13.16/src || exit 1
-    make
-    sudo make install
-    sudo depmod -a
-  )
-  rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    log "[ERROR] Failed to build/install iavf driver (rc=${rc})"
-    whiptail --title "STEP 06 - iavf build/install failed" \
-             --msgbox "Failed to build or install iavf driver.\n\nCheck /var/log/xdr-installer.log." 12 80
-    return 1
+    echo
+    echo "=== Building / installing iavf driver (may take time) ==="
+    (
+      cd /tmp || exit 1
+      tar xzf iavf-4.13.16.tar.gz
+      cd iavf-4.13.16/src || exit 1
+      make
+      sudo make install
+      sudo depmod -a
+    )
+    rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "[ERROR] Failed to build/install iavf driver (rc=${rc})"
+      whiptail_msgbox "STEP 06 - iavf build/install failed" "Failed to build or install iavf driver.\n\nCheck /var/log/xdr-installer.log." 12 80
+      return 1
+    fi
+    echo "=== iavf driver build / install complete ==="
+    log "[STEP 06] iavf driver build / install complete"
   fi
-  echo "=== iavf driver build / install complete ==="
-  log "[STEP 06] iavf driver build / install complete"
 
   #######################################
   # 1) Verify/apply SR-IOV VF driver (iavf/i40evf)
   #######################################
   log "[STEP 06] Attempting to load iavf/i40evf modules"
-  sudo modprobe iavf 2>/dev/null || sudo modprobe i40evf 2>/dev/null || true
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would load iavf/i40evf modules"
+  else
+    run_cmd "sudo modprobe iavf 2>/dev/null || sudo modprobe i40evf 2>/dev/null || true"
+  fi
 
   {
     echo "--------------------------------------"
@@ -1850,7 +2547,13 @@ step_06_ntpsec() {
     dpkg -l ntpsec 2>/dev/null || echo "No ntpsec package info"
     echo
     echo "# ntpsec service state (systemctl is-active ntpsec)"
-    systemctl is-active ntpsec 2>/dev/null || echo "inactive"
+    local ntpsec_check
+    ntpsec_check=$(systemctl is-active ntpsec 2>/dev/null)
+    if [[ -z "${ntpsec_check}" ]] || [[ "${ntpsec_check}" != "active" ]]; then
+      echo "inactive"
+    else
+      echo "${ntpsec_check}"
+    fi
     echo
     echo "# ntpq -p (if available)"
     ntpq -p 2>/dev/null || echo "ntpq -p failed or ntpsec not installed"
@@ -1858,8 +2561,7 @@ step_06_ntpsec() {
 
   show_textbox "STEP 06 - SR-IOV driver install / NTP status" "${tmp_info}"
 
-  if ! whiptail --title "STEP 06 - confirmation" \
-	             --yesno "After installing iavf(i40evf), configure NTPsec on the host.\n\nProceed?" 13 80
+  if ! whiptail_yesno "STEP 06 - confirmation" "After installing iavf(i40evf), configure NTPsec on the host.\n\nProceed?"
   then
     log "User canceled STEP 06."
     return 0
@@ -1978,24 +2680,75 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 06 (SR-IOV + NTPsec) execution summary"
-    echo "----------------------------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 06: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# SR-IOV VF driver (iavf/i40evf) module state (lsmod)"
-    lsmod | grep -E '^(iavf|i40evf)\b' || echo "No loaded iavf/i40evf modules."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "ℹ️  In real execution mode, the following would be performed:"
+      echo "   • SR-IOV driver (iavf/i40evf) installation"
+      echo "   • NTPsec package installation and configuration"
+      echo
+    fi
+    echo "📊 SR-IOV DRIVER STATUS:"
     echo
-    echo "# XDR_NTPSEC_CONFIG section in ${NTP_CONF}"
-    if [[ -f "${NTP_CONF}" ]]; then
-      grep -n -A5 -B2 "${TAG_BEGIN}" "${NTP_CONF}" || sed -n '1,120p' "${NTP_CONF}"
+    local sriov_modules
+    sriov_modules=$(lsmod | grep -E '^(iavf|i40evf)\b' 2>/dev/null || echo "No loaded modules")
+    if [[ "${sriov_modules}" == *"No loaded"* ]]; then
+      echo "  ⚠️  ${sriov_modules}"
+      echo "     (Driver may need to be loaded manually or after reboot)"
     else
-      echo "${NTP_CONF} does not exist."
+      echo "  ✅ Loaded SR-IOV driver modules:"
+      echo "${sriov_modules}" | sed 's/^/    /'
     fi
     echo
-    echo "# systemctl is-active ntpsec"
-    systemctl is-active ntpsec 2>/dev/null || echo "inactive"
+    echo "📊 NTPsec CONFIGURATION STATUS:"
     echo
-    echo "# ntpq -p"
-    ntpq -p 2>/dev/null || echo "ntpq -p failed or awaiting sync"
+    echo "1️⃣  NTPsec Configuration File:"
+    if [[ -f "${NTP_CONF}" ]]; then
+      echo "  ✅ Configuration file exists: ${NTP_CONF}"
+      echo "  📋 XDR_NTPSEC_CONFIG section:"
+      local ntp_config
+      ntp_config=$(grep -n -A5 -B2 "${TAG_BEGIN}" "${NTP_CONF}" 2>/dev/null || echo "    (XDR_NTPSEC_CONFIG section not found)")
+      echo "${ntp_config}" | sed 's/^/    /'
+    else
+      echo "  ⚠️  Configuration file not found: ${NTP_CONF}"
+      echo "     (NTPsec may not be installed)"
+    fi
+    echo
+    echo "2️⃣  NTPsec Service Status:"
+    local ntpsec_status
+    # Capture output and suppress stderr
+    ntpsec_status=$(systemctl is-active ntpsec 2>/dev/null || echo "")
+    # systemctl is-active returns "active", "inactive", "activating", "deactivating", "failed", or empty
+    # If empty or not "active", consider it inactive
+    if [[ -z "${ntpsec_status}" ]] || [[ "${ntpsec_status}" != "active" ]]; then
+      echo "  ⚠️  ntpsec service is inactive"
+    else
+      echo "  ✅ ntpsec service is active"
+    fi
+    echo
+    echo "3️⃣  NTP Synchronization Status:"
+    local ntpq_output
+    ntpq_output=$(ntpq -p 2>/dev/null || echo "Unable to query NTP servers")
+    if [[ "${ntpq_output}" == *"Unable"* ]]; then
+      echo "  ⚠️  ${ntpq_output}"
+      echo "     (NTPsec may not be running or not yet synchronized)"
+    else
+      echo "  📋 NTP peer status:"
+      echo "${ntpq_output}" | sed 's/^/    /'
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • SR-IOV driver modules should be loaded after the previous reboot (STEP 05)"
+    echo "  • If modules are not loaded, a manual reboot may be needed"
+    echo "  • NTPsec synchronization may take a few minutes"
+    echo "  • Verify NTP sync with: ntpq -p"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 07 (LVM Storage Configuration)"
   } >> "${tmp_info}"
 
   show_textbox "STEP 06 - SR-IOV(iavf/i40evf) + NTPsec summary" "${tmp_info}"
@@ -2031,8 +2784,7 @@ step_07_lvm_storage() {
   local ES_LV="lv_dl"
 
   if [[ -z "${DATA_SSD_LIST}" ]]; then
-    whiptail --title "STEP 07 - data disks not set" \
-             --msgbox "DATA_SSD_LIST is empty.\n\nSelect data disks in STEP 01 first." 12 70
+    whiptail_msgbox "STEP 07 - data disks not set" "DATA_SSD_LIST is empty.\n\nSelect data disks in STEP 01 first." 12 70
     log "DATA_SSD_LIST empty; cannot proceed with STEP 07."
     return 1
   fi
@@ -2053,8 +2805,7 @@ step_07_lvm_storage() {
   fi
 
   if [[ "${already_lvm}" -eq 1 ]]; then
-    if whiptail --title "STEP 07 - appears already configured" \
-                --yesno "vg_dl / lv_dl and ${UBUNTU_VG}/${DL_ROOT_LV}, ${UBUNTU_VG}/${DA_ROOT_LV}\nplus /stellar/dl and /stellar/da mounts already exist.\n\nThis STEP recreates disk partitions and should not normally be rerun.\n\nSkip this STEP?" 18 80
+    if whiptail_yesno "STEP 07 - appears already configured" "vg_dl / lv_dl and ${UBUNTU_VG}/${DL_ROOT_LV}, ${UBUNTU_VG}/${DA_ROOT_LV}\nplus /stellar/dl and /stellar/da mounts already exist.\n\nThis STEP recreates disk partitions and should not normally be rerun.\n\nSkip this STEP?"
     then
       log "User skipped STEP 07 because it appears already configured."
       return 0
@@ -2078,10 +2829,62 @@ step_07_lvm_storage() {
     } >> "${tmp_info}" 2>&1
   done
 
-  show_textbox "STEP 07 - Confirm disks" "${tmp_info}"
+  {
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 07: LVM Storage Configuration - Pre-Execution"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    echo "⚠️  DESTRUCTIVE OPERATION WARNING:"
+    echo "  • All existing partitions and data on the following disks"
+    echo "    will be PERMANENTLY DELETED:"
+    for d in ${DATA_SSD_LIST}; do
+      echo "    - /dev/${d}"
+    done
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Remove all existing LVM structures (PV/VG/LV)"
+    echo "  2. Wipe all filesystem signatures"
+    echo "  3. Create GPT partition table"
+    echo "  4. Create single partition on each disk"
+    echo "  5. Create Physical Volumes (PV)"
+    echo "  6. Create Volume Groups (VG):"
+    echo "     - vg_dl (for ES data storage)"
+    echo "     - ${UBUNTU_VG} (for DL/DA root volumes)"
+    echo "  7. Create Logical Volumes (LV):"
+    echo "     - lv_dl (ES data)"
+    echo "     - ${DL_ROOT_LV} (DL root, 545GB)"
+    echo "     - ${DA_ROOT_LV} (DA root, 545GB)"
+    echo "  8. Format volumes with ext4"
+    echo "  9. Mount volumes at /stellar/dl and /stellar/da"
+    echo "  10. Add entries to /etc/fstab"
+    echo "  11. Set ownership to stellar:stellar"
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • This operation is IRREVERSIBLE"
+    echo "  • All data on selected disks will be lost"
+    echo "  • Ensure you have backups if needed"
+    echo "  • OS disk is automatically excluded from selection"
+    echo
+    echo "🔧 TROUBLESHOOTING (if issues occur):"
+    echo "  • If disk operations fail:"
+    echo "    1. Check disk status: lsblk"
+    echo "    2. Verify disk is not in use: lsof /dev/${DATA_SSD_LIST}"
+    echo "    3. Check for mounted filesystems: mount | grep /dev/"
+    echo "  • If LVM operations fail:"
+    echo "    1. Check existing LVM: sudo pvs, sudo vgs, sudo lvs"
+    echo "    2. Remove manually if needed: sudo vgremove, sudo pvremove"
+    echo "  • If mount fails:"
+    echo "    1. Check filesystem: sudo fsck /dev/..."
+    echo "    2. Verify mount points exist: ls -ld /stellar/dl /stellar/da"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
+  } > "${tmp_info}"
 
-  if ! whiptail --title "STEP 07 - WARNING" \
-                 --yesno "All existing partitions/data on /dev/${DATA_SSD_LIST}\nwill be deleted and used exclusively for LVM.\n\nContinue?" 15 70
+  show_textbox "STEP 07 - Pre-execution warning and actions" "${tmp_info}"
+
+  if ! whiptail_yesno "STEP 07 - WARNING" "All existing partitions/data on /dev/${DATA_SSD_LIST}\nwill be deleted and used exclusively for LVM.\n\nThis operation is IRREVERSIBLE.\n\nContinue?"
   then
     log "User canceled STEP 07 disk initialization."
     return 0
@@ -2231,17 +3034,60 @@ step_07_lvm_storage() {
 
   local tmp_df="/tmp/xdr_step07_df.txt"
   {
-    echo "=== df -h | egrep '/stellar/(dl|da)' ==="
-    df -h | egrep '/stellar/(dl|da)' || echo "No /stellar/dl or /stellar/da mount info."
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 07: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-
-    echo "=== lvs ==="
-    lvs
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 STORAGE STATUS:"
     echo
-
-    # Verify like doc example after LV creation
-    echo "=== lsblk (view all disks/partitions/Logical Volumes) ==="
-    lsblk
+    echo "1️⃣  Mount Points:"
+    local mount_info
+    mount_info=$(df -h | egrep '/stellar/(dl|da)' 2>/dev/null || echo "  ⚠️  No /stellar/dl or /stellar/da mount info found")
+    if [[ "${mount_info}" != *"No /stellar"* ]]; then
+      echo "${mount_info}" | sed 's/^/  /'
+    else
+      echo "  ${mount_info}"
+    fi
+    echo
+    echo "2️⃣  Logical Volumes:"
+    echo "  📋 Current LVM structure:"
+    lvs 2>/dev/null | sed 's/^/    /' || echo "    ⚠️  Unable to list logical volumes"
+    echo
+    echo "3️⃣  Disk Layout (lsblk):"
+    echo "  📋 Complete disk/partition/volume view:"
+    lsblk 2>/dev/null | sed 's/^/    /' || echo "    ⚠️  Unable to list block devices"
+    echo
+    echo "4️⃣  Directory Ownership:"
+    if [[ -d /stellar ]]; then
+      if id stellar >/dev/null 2>&1; then
+        local stellar_owner
+        stellar_owner=$(stat -c '%U:%G' /stellar 2>/dev/null || echo "unknown")
+        if [[ "${stellar_owner}" == "stellar:stellar" ]]; then
+          echo "  ✅ /stellar ownership: ${stellar_owner}"
+        else
+          echo "  ⚠️  /stellar ownership: ${stellar_owner} (expected: stellar:stellar)"
+          echo "  💡 This will be corrected during STEP 07 execution"
+        fi
+      else
+        echo "  ⚠️  'stellar' user not found"
+        echo "  💡 The 'stellar' user will be created during VM deployment (STEP 10/11)"
+      fi
+    else
+      echo "  ℹ️  /stellar directory does not exist yet"
+      echo "  💡 This will be created during STEP 07 execution"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • LVM volumes are created and mounted at /stellar/dl and /stellar/da"
+    echo "  • These mount points will be used for VM storage"
+    echo "  • Ensure all volumes are properly mounted before proceeding"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 08 (Libvirt Hooks Configuration)"
   } > "${tmp_df}" 2>&1
   
   
@@ -2310,8 +3156,7 @@ step_08_libvirt_hooks() {
 
   show_textbox "STEP 08 - Current hooks state" "${tmp_info}"
 
-  if ! whiptail --title "STEP 08 - confirmation" \
-                 --yesno "Create/overwrite /etc/libvirt/hooks/network and qemu scripts per docs.\n\nProceed?" 13 80
+  if ! whiptail_yesno "STEP 08 - confirmation" "Create/overwrite /etc/libvirt/hooks/network and qemu scripts per docs.\n\nProceed?"
   then
     log "User canceled STEP 08."
     return 0
@@ -2322,11 +3167,7 @@ step_08_libvirt_hooks() {
   # 1) Create /etc/libvirt/hooks directory
   #######################################
   log "[STEP 08] Create /etc/libvirt/hooks directory if missing"
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] sudo mkdir -p /etc/libvirt/hooks"
-  else
-    sudo mkdir -p /etc/libvirt/hooks
-  fi
+  run_cmd "sudo mkdir -p /etc/libvirt/hooks"
 
   #######################################
   # 2) Create /etc/libvirt/hooks/network (per docs)
@@ -2337,12 +3178,9 @@ step_08_libvirt_hooks() {
   log "[STEP 08] Create/update ${HOOK_NET}"
 
   if [[ -f "${HOOK_NET}" ]]; then
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      sudo cp -a "${HOOK_NET}" "${HOOK_NET_BAK}"
-      log "Backed up existing ${HOOK_NET} to ${HOOK_NET_BAK}."
-    else
-      log "[DRY-RUN] Would back up existing ${HOOK_NET} to ${HOOK_NET_BAK}"
-    fi
+    log "[STEP 08] Backing up existing ${HOOK_NET}"
+    run_cmd "sudo cp -a ${HOOK_NET} ${HOOK_NET_BAK}"
+    log "Backed up existing ${HOOK_NET} to ${HOOK_NET_BAK}."
   fi
 
   local net_hook_content
@@ -2370,10 +3208,11 @@ fi
 EOF
 )
 
+  log "[STEP 08] Writing network hook script to ${HOOK_NET}"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Would write the following to ${HOOK_NET}:\n${net_hook_content}"
   else
-    printf "%s\n" "${net_hook_content}" | sudo tee "${HOOK_NET}" >/dev/null
+    printf "%s\n" "${net_hook_content}" | run_cmd "sudo tee ${HOOK_NET} >/dev/null"
   fi
 
   run_cmd "sudo chmod +x ${HOOK_NET}"
@@ -2387,12 +3226,9 @@ EOF
   log "[STEP 08] Create/update ${HOOK_QEMU} (full NAT + OOM restart script)"
 
   if [[ -f "${HOOK_QEMU}" ]]; then
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      sudo cp -a "${HOOK_QEMU}" "${HOOK_QEMU_BAK}"
-      log "Backed up existing ${HOOK_QEMU} to ${HOOK_QEMU_BAK}."
-    else
-      log "[DRY-RUN] Would back up existing ${HOOK_QEMU} to ${HOOK_QEMU_BAK}"
-    fi
+    log "[STEP 08] Backing up existing ${HOOK_QEMU}"
+    run_cmd "sudo cp -a ${HOOK_QEMU} ${HOOK_QEMU_BAK}"
+    log "Backed up existing ${HOOK_QEMU} to ${HOOK_QEMU_BAK}."
   fi
 
   local qemu_hook_content
@@ -2570,10 +3406,11 @@ fi
 EOF
 )
 
+  log "[STEP 08] Writing qemu hook script to ${HOOK_QEMU}"
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Would write the following to ${HOOK_QEMU}:\n${qemu_hook_content}"
   else
-    printf "%s\n" "${qemu_hook_content}" | sudo tee "${HOOK_QEMU}" >/dev/null
+    printf "%s\n" "${qemu_hook_content}" | run_cmd "sudo tee ${HOOK_QEMU} >/dev/null"
   fi
 
   run_cmd "sudo chmod +x ${HOOK_QEMU}"
@@ -2587,10 +3424,12 @@ EOF
   local _DRY="${DRY_RUN:-0}"
 
   # 1) Create /usr/bin/last_known_good_pid (per docs)
+  log "[STEP 08] Creating /usr/bin/last_known_good_pid script"
   if [[ "${_DRY}" -eq 1 ]]; then
     log "[DRY-RUN] Would create /usr/bin/last_known_good_pid script"
   else
-    sudo tee /usr/bin/last_known_good_pid >/dev/null <<'EOF'
+    local last_known_good_pid_content
+    last_known_good_pid_content=$(cat <<'EOF'
 #!/bin/bash
 VM_NAME=$1
 RUN_DIR=/var/run/libvirt/qemu
@@ -2607,15 +3446,19 @@ done
 
 exit 1
 EOF
-    sudo chmod +x /usr/bin/last_known_good_pid
+)
+    printf "%s\n" "${last_known_good_pid_content}" | run_cmd "sudo tee /usr/bin/last_known_good_pid >/dev/null"
+    run_cmd "sudo chmod +x /usr/bin/last_known_good_pid"
   fi
 
 
   # 2) Create /usr/bin/check_vm_state (per docs)
+  log "[STEP 08] Creating /usr/bin/check_vm_state script"
   if [[ "${_DRY}" -eq 1 ]]; then
     log "[DRY-RUN] Would create /usr/bin/check_vm_state script"
   else
-    sudo tee /usr/bin/check_vm_state >/dev/null <<'EOF'
+    local check_vm_state_content
+    check_vm_state_content=$(cat <<'EOF'
 #!/bin/bash
 VM_LIST=(dl-master da-master)
 RUN_DIR=/var/run/libvirt/qemu
@@ -2636,7 +3479,9 @@ done
 
 exit 0
 EOF
-    sudo chmod +x /usr/bin/check_vm_state
+)
+    printf "%s\n" "${check_vm_state_content}" | run_cmd "sudo tee /usr/bin/check_vm_state >/dev/null"
+    run_cmd "sudo chmod +x /usr/bin/check_vm_state"
   fi
 
 
@@ -2669,7 +3514,7 @@ EOF
     fi
 
     # Apply updated crontab
-    sudo crontab "${tmp_cron}"
+    run_cmd "sudo crontab ${tmp_cron}"
     rm -f "${tmp_cron}"
 
     if [[ "${added_flag}" = "1" ]]; then
@@ -2686,22 +3531,61 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 08 execution summary"
-    echo "----------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 08: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# /etc/libvirt/hooks/network (first 30 lines)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 LIBVIRT HOOKS STATUS:"
+    echo
+    echo "1️⃣  Network Hook Script:"
     if [[ -f /etc/libvirt/hooks/network ]]; then
-      sed -n '1,30p' /etc/libvirt/hooks/network
+      echo "  ✅ File exists: /etc/libvirt/hooks/network"
+      echo "  📋 First 30 lines:"
+      sed -n '1,30p' /etc/libvirt/hooks/network | sed 's/^/    /'
     else
-      echo "/etc/libvirt/hooks/network not found."
+      echo "  ⚠️  File not found: /etc/libvirt/hooks/network"
     fi
     echo
-    echo "# /etc/libvirt/hooks/qemu (first 40 lines)"
+    echo "2️⃣  QEMU Hook Script:"
     if [[ -f /etc/libvirt/hooks/qemu ]]; then
-      sed -n '1,40p' /etc/libvirt/hooks/qemu
+      echo "  ✅ File exists: /etc/libvirt/hooks/qemu"
+      echo "  📋 First 40 lines:"
+      sed -n '1,40p' /etc/libvirt/hooks/qemu | sed 's/^/    /'
     else
-      echo "/etc/libvirt/hooks/qemu not found."
+      echo "  ⚠️  File not found: /etc/libvirt/hooks/qemu"
     fi
+    echo
+    echo "3️⃣  OOM Recovery Scripts:"
+    if [[ -f /usr/bin/last_known_good_pid ]]; then
+      echo "  ✅ last_known_good_pid script installed"
+    else
+      echo "  ⚠️  last_known_good_pid script not found"
+    fi
+    if [[ -f /usr/bin/check_vm_state ]]; then
+      echo "  ✅ check_vm_state script installed"
+    else
+      echo "  ⚠️  check_vm_state script not found"
+    fi
+    echo
+    echo "4️⃣  Cron Job Status:"
+    if sudo crontab -l 2>/dev/null | grep -q "check_vm_state"; then
+      echo "  ✅ check_vm_state cron job is configured"
+    else
+      echo "  ⚠️  check_vm_state cron job not found"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • Hooks will be triggered automatically when VMs start/stop"
+    echo "  • Network hook manages routing for virbr0 network"
+    echo "  • QEMU hook manages iptables NAT rules for VM access"
+    echo "  • OOM recovery scripts monitor and restart VMs if needed"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 09 (DP Download)"
   } >> "${tmp_info}"
 
   show_textbox "STEP 08 - Summary" "${tmp_info}"
@@ -2732,8 +3616,7 @@ step_09_dp_download() {
   if [[ -n "${missing}" ]]; then
     local msg="The following items are missing in config:${missing}\n\nSet them in Settings, then rerun."
     log "[STEP 09] Missing config values: ${missing}"
-    whiptail --title "STEP 09 - Missing config" \
-             --msgbox "${msg}" 15 70
+    whiptail_msgbox "STEP 09 - Missing config" "${msg}" 15 70
     log "[STEP 09] Skipping STEP 09 due to missing config."
     return 0
   fi
@@ -2798,7 +3681,8 @@ step_09_dp_download() {
     msg+="[Yes] Use this file (copy to DL image dir; skip/replace download)\n"
     msg+="[No] Keep existing download process"
 
-    if whiptail --title "STEP 09 - reuse local qcow2" --yesno "${msg}" 18 80; then
+    # Calculate dialog size dynamically and center message
+    if whiptail_yesno "STEP 09 - reuse local qcow2" "${msg}"; then
       use_local_qcow=1
       log "[STEP 09] User chose to use local qcow2 file (${local_qcow})."
 
@@ -2817,6 +3701,89 @@ step_09_dp_download() {
   fi
 
 
+
+  #######################################
+  # 3-A) Clean up old version files (if different version exists)
+  #######################################
+  log "[STEP 09] Checking for old version files to remove..."
+  log "[STEP 09] Current version: ${ver}, Current qcow2: ${qcow2}, Current sha1: ${sha1}"
+  
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will check and remove old version files from ${dl_img_dir}"
+  else
+    # Find all qcow2 files and remove those that don't match current version
+    log "[STEP 09] Scanning for old version qcow2 files in ${dl_img_dir}..."
+    local file
+    while IFS= read -r -d '' file; do
+      local basename_file
+      basename_file=$(basename "${file}")
+      if [[ "${basename_file}" != "${qcow2}" ]]; then
+        log "[STEP 09] Removing old qcow2: ${file}"
+        sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+      else
+        log "[STEP 09] Keeping current version qcow2: ${basename_file}"
+      fi
+    done < <(find "${dl_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2" -print0 2>/dev/null || true)
+    
+    # Find all sha1 files and remove those that don't match current version
+    log "[STEP 09] Scanning for old version sha1 files in ${dl_img_dir}..."
+    while IFS= read -r -d '' file; do
+      local basename_file
+      basename_file=$(basename "${file}")
+      if [[ "${basename_file}" != "${sha1}" ]]; then
+        log "[STEP 09] Removing old sha1: ${file}"
+        sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+      else
+        log "[STEP 09] Keeping current version sha1: ${basename_file}"
+      fi
+    done < <(find "${dl_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2.sha1" -print0 2>/dev/null || true)
+    
+    # Remove old virt_deploy_uvp_centos.sh if it exists (will be replaced with new version)
+    if [[ -f "${dl_img_dir}/${dp_script}" ]]; then
+      log "[STEP 09] Removing existing ${dp_script} (will be replaced with new version)"
+      sudo rm -f "${dl_img_dir}/${dp_script}" || log "[WARN] Failed to remove ${dl_img_dir}/${dp_script}"
+    fi
+    
+    # Also clean up DA image directory
+    local da_img_dir="/stellar/da/images"
+    if [[ -d "${da_img_dir}" ]]; then
+      log "[STEP 09] Cleaning up old version files in ${da_img_dir}..."
+      
+      local current_da_qcow2="aella-dataprocessor-${ver}.qcow2"
+      local current_da_sha1="aella-dataprocessor-${ver}.qcow2.sha1"
+      
+      # Remove old DA qcow2 files
+      while IFS= read -r -d '' file; do
+        local basename_file
+        basename_file=$(basename "${file}")
+        if [[ "${basename_file}" != "${current_da_qcow2}" ]]; then
+          log "[STEP 09] Removing old DA qcow2: ${file}"
+          sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+        else
+          log "[STEP 09] Keeping current version DA qcow2: ${basename_file}"
+        fi
+      done < <(find "${da_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2" -print0 2>/dev/null || true)
+      
+      # Remove old DA sha1 files
+      while IFS= read -r -d '' file; do
+        local basename_file
+        basename_file=$(basename "${file}")
+        if [[ "${basename_file}" != "${current_da_sha1}" ]]; then
+          log "[STEP 09] Removing old DA sha1: ${file}"
+          sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+        else
+          log "[STEP 09] Keeping current version DA sha1: ${basename_file}"
+        fi
+      done < <(find "${da_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2.sha1" -print0 2>/dev/null || true)
+      
+      if [[ -f "${da_img_dir}/${dp_script}" ]]; then
+        log "[STEP 09] Removing existing DA ${dp_script} (will be replaced with new version)"
+        sudo rm -f "${da_img_dir}/${dp_script}" || log "[WARN] Failed to remove ${da_img_dir}/${dp_script}"
+      fi
+    fi
+    
+    log "[STEP 09] Old version files cleanup completed"
+  fi
 
   #######################################
   # 3-B) Check existing files (download only missing)
@@ -2933,16 +3900,40 @@ step_09_dp_download() {
 
     # 4-2) sha1 verification (only if qcow2 + sha1 exist)
     if [[ -f "${dl_img_dir}/${sha1}" ]]; then
-      log "[STEP 09] Running sha1sum -c ${sha1}"
+      log "[STEP 09] Running sha1sum verification for ${qcow2}"
 
       (
         cd "${dl_img_dir}" || exit 2
 
-        if ! sha1sum -c "${sha1}"; then
-          log "[WARN] sha1sum failed or format error."
+        # Check if sha1 file has proper format (checksum + filename)
+        local sha1_content
+        sha1_content=$(cat "${sha1}" 2>/dev/null | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+        
+        # If sha1 file contains only checksum (no filename), create proper format
+        if [[ "${sha1_content}" =~ ^[0-9a-f]{40}$ ]]; then
+          # Only checksum found, add filename
+          log "[STEP 09] sha1 file contains only checksum, adding filename for proper format"
+          echo "${sha1_content}  ${qcow2}" > "${sha1}.tmp"
+          mv "${sha1}.tmp" "${sha1}"
+        elif [[ "${sha1_content}" =~ ^[0-9a-f]{40}[[:space:]]+ ]]; then
+          # Already has checksum + filename format, but may need filename update
+          local existing_checksum
+          existing_checksum=$(echo "${sha1_content}" | awk '{print $1}')
+          if [[ -n "${existing_checksum}" ]]; then
+            # Update filename if it doesn't match
+            if ! echo "${sha1_content}" | grep -q "${qcow2}"; then
+              log "[STEP 09] Updating sha1 file to include correct filename"
+              echo "${existing_checksum}  ${qcow2}" > "${sha1}.tmp"
+              mv "${sha1}.tmp" "${sha1}"
+            fi
+          fi
+        fi
 
-          if whiptail --title "STEP 09 - sha1 verification failed" \
-                      --yesno "sha1 verification failed.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 09" 14 80
+        # Now verify with sha1sum -c
+        if ! sha1sum -c "${sha1}"; then
+          log "[WARN] sha1sum verification failed."
+
+          if whiptail_yesno "STEP 09 - sha1 verification failed" "sha1 verification failed.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 09"
           then
             log "[STEP 09] User chose to continue despite sha1 failure."
             exit 0   # allowed → subshell succeeds
@@ -3035,16 +4026,53 @@ step_09_dp_download() {
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 09 execution summary"
-    echo "----------------------"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 09: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "# Download directory: ${dl_img_dir}"
-    ls -lh "${dl_img_dir}" 2>/dev/null || echo "(directory missing or inaccessible)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual downloads were made"
+      echo
+    fi
+    echo "📊 DOWNLOAD STATUS:"
     echo
-    echo "# Config values used"
-    echo "  - DP_VERSION   = ${ver}"
-    echo "  - ACPS_USERNAME= ${acps_user}"
-    echo "  - ACPS_BASE_URL= ${acps_url}"
+    echo "1️⃣  Download Directory:"
+    echo "  📁 ${dl_img_dir}"
+    local dir_list
+    dir_list=$(ls -lh "${dl_img_dir}" 2>/dev/null || echo "  ⚠️  Directory missing or inaccessible")
+    if [[ "${dir_list}" != *"missing"* ]]; then
+      echo "  📋 Files in directory:"
+      echo "${dir_list}" | sed 's/^/    /'
+    else
+      echo "  ${dir_list}"
+    fi
+    echo
+    echo "2️⃣  Configuration Values Used:"
+    echo "  • DP_VERSION:    ${ver}"
+    echo "  • ACPS_USERNAME: ${acps_user}"
+    echo "  • ACPS_BASE_URL: ${acps_url}"
+    echo
+    echo "3️⃣  Required Files:"
+    local script_file="${dl_img_dir}/virt_deploy_uvp_centos.sh"
+    local qcow2_file="${dl_img_dir}/aella-dataprocessor-${ver}.qcow2"
+    if [[ -f "${script_file}" ]]; then
+      echo "  ✅ Deployment script: virt_deploy_uvp_centos.sh"
+    else
+      echo "  ⚠️  Deployment script: virt_deploy_uvp_centos.sh (not found)"
+    fi
+    if [[ -f "${qcow2_file}" ]]; then
+      echo "  ✅ QCOW2 image: aella-dataprocessor-${ver}.qcow2"
+    else
+      echo "  ⚠️  QCOW2 image: aella-dataprocessor-${ver}.qcow2 (not found)"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • Downloaded files will be used in STEP 10 and STEP 11"
+    echo "  • Ensure all required files are present before proceeding"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 10 (DL Master VM Deployment)"
+    echo "  • Then proceed to STEP 11 (DA Master VM Deployment)"
   } >> "${tmp_info}"
 
   show_textbox "STEP 09 - Summary" "${tmp_info}"
@@ -3078,9 +4106,7 @@ This can heavily impact a running cluster (DL / DA service).\n\
 Proceed with redeploy?"
 
   if command -v whiptail >/dev/null 2>&1; then
-      if ! whiptail --title "${step_name} - ${vm_name} redeploy confirmation" \
-                    --defaultno \
-                    --yesno "${msg}" 18 80; then
+      if ! whiptail_yesno "${step_name} - ${vm_name} redeploy confirmation" "${msg}"; then
           log "[${step_name}] Redeploy of ${vm_name} canceled by user."
           return 1
       fi
@@ -3109,20 +4135,22 @@ Proceed with redeploy?"
 # DL / DA VM memory setting (GB) – user input
 ###############################################################################
 prompt_vm_memory() {
-  # If config has values use them; otherwise use defaults shown (e.g., 156/80)
-  local default_dl="${DL_MEM_GB:-156}"
+  # If config has values use them; otherwise use defaults shown (e.g., 136/80)
+  local default_dl="${DL_MEM_GB:-136}"
   local default_da="${DA_MEM_GB:-80}"
 
   local dl_input da_input
 
   if command -v whiptail >/dev/null 2>&1; then
-    dl_input=$(whiptail --title "DL VM memory" \
-                         --inputbox "Enter DL VM memory in GB.\n\n(Current default: ${default_dl} GB)" \
-                         12 60 "${default_dl}" 3>&1 1>&2 2>&3) || return 1
+    dl_input=$(whiptail_inputbox "DL VM memory" "Enter DL VM memory in GB.\n\n(Current default: ${default_dl} GB)" "${default_dl}" 12 60)
+    if [[ $? -ne 0 ]] || [[ -z "${dl_input}" ]]; then
+      return 1
+    fi
 
-    da_input=$(whiptail --title "DA VM memory" \
-                         --inputbox "Enter DA VM memory in GB.\n\n(Current default: ${default_da} GB)" \
-                         12 60 "${default_da}" 3>&1 1>&2 2>&3) || return 1
+    da_input=$(whiptail_inputbox "DA VM memory" "Enter DA VM memory in GB.\n\n(Current default: ${default_da} GB)" "${default_da}" 12 60)
+    if [[ $? -ne 0 ]] || [[ -z "${da_input}" ]]; then
+      return 1
+    fi
   else
     echo "Set DL / DA VM memory in GB."
     read -r -p "DL VM memory (GB) [default: ${default_dl}]: " dl_input
@@ -3177,7 +4205,7 @@ step_10_dl_master_deploy() {
     local DL_CLUSTERSIZE="${DL_CLUSTERSIZE:-1}"
 
     local DL_VCPUS="${DL_VCPUS:-42}"
-    local DL_MEMORY_GB="${DL_MEMORY_GB:-156}"       # in GB
+    local DL_MEMORY_GB="${DL_MEMORY_GB:-136}"       # in GB
     local DL_DISK_GB="${DL_DISK_GB:-500}"           # in GB
 
     local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
@@ -3191,13 +4219,34 @@ step_10_dl_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail --title "STEP 10 - DL deploy" --msgbox "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
+        whiptail_msgbox "STEP 10 - DL deploy" "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
         return 0
     fi
 
     # DL image directory (same as STEP 09)
     local DL_IMAGE_DIR="${DL_INSTALL_DIR}/images"
+
+    ############################################################
+    # Clean up all VM directories in /stellar/dl/images/ before deployment
+    ############################################################
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Will clean up all VM directories in ${DL_IMAGE_DIR}/"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Cleaning up all existing VM directories in ${DL_IMAGE_DIR}/..."
+        # Find and remove all subdirectories (VM directories like dl-master/, da-master/, etc.)
+        # but keep files (qcow2, sha1, scripts)
+        local vm_dir
+        while IFS= read -r -d '' vm_dir; do
+            if [[ -d "${vm_dir}" ]]; then
+                local dir_name
+                dir_name=$(basename "${vm_dir}")
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing VM directory: ${dir_name}/"
+                sudo rm -rf "${vm_dir}" 2>/dev/null || log "[WARN] Failed to remove ${vm_dir}"
+            fi
+        done < <(find "${DL_IMAGE_DIR}" -maxdepth 1 -type d ! -path "${DL_IMAGE_DIR}" -print0 2>/dev/null || true)
+        log "[STEP 10] VM directories cleanup completed"
+    fi
 
     # mgmt interface – use STEP 01 selection if present, else assume mgt
     local MGT_NIC_NAME="${MGT_NIC:-mgt}"
@@ -3206,11 +4255,9 @@ step_10_dl_master_deploy() {
 
     if [ -z "${HOST_MGT_IP}" ]; then
         # Prompt if host mgt IP cannot be auto-detected
-        HOST_MGT_IP="$(whiptail --title "STEP 10 - DL deploy" \
-            --inputbox "Enter host management interface IP (${MGT_NIC_NAME}).\nExample: 10.4.0.210" 12 80 "" \
-            3>&1 1>&2 2>&3)"
+        HOST_MGT_IP="$(whiptail_inputbox "STEP 10 - DL deploy" "Enter host management interface IP (${MGT_NIC_NAME}).\nExample: 10.4.0.210" "" 12 80)"
         if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail --title "STEP 10 - DL deploy" --msgbox "Host management IP not available.\nSkipping DL-master deploy." 10 70
+            whiptail_msgbox "STEP 10 - DL deploy" "Host management IP not available.\nSkipping DL-master deploy." 10 70
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HOST_MGT_IP not available. Skipping."
             return 0
         fi
@@ -3239,7 +4286,7 @@ step_10_dl_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail --title "STEP 10 - DL deploy" --msgbox "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
+        whiptail_msgbox "STEP 10 - DL deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
         return 0
     fi
@@ -3256,7 +4303,7 @@ step_10_dl_master_deploy() {
 
     # Ensure DL LV is mounted on /stellar/dl
     if ! mount | grep -q "on ${DL_INSTALL_DIR} "; then
-        whiptail --title "STEP 10 - DL deploy" --msgbox "${DL_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
+        whiptail_msgbox "STEP 10 - DL deploy" "${DL_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
         return 0
     fi
@@ -3264,11 +4311,9 @@ step_10_dl_master_deploy() {
     # DL OTP: use from config or prompt/save once
     local _DL_OTP="${DL_OTP:-}"
     if [ -z "${_DL_OTP}" ]; then
-        _DL_OTP="$(whiptail --title "STEP 10 - DL deploy" \
-            --passwordbox "Enter OTP for DL-master (issued from ACPS)." 12 70 "" \
-            3>&1 1>&2 2>&3)"
+        _DL_OTP="$(whiptail_passwordbox "STEP 10 - DL deploy" "Enter OTP for DL-master (issued from Stellar Cyber)." "")"
         if [ $? -ne 0 ] || [ -z "${_DL_OTP}" ]; then
-            whiptail --title "STEP 10 - DL deploy" --msgbox "No OTP provided. Skipping DL-master deploy." 10 70
+            whiptail_msgbox "STEP 10 - DL deploy" "No OTP provided. Skipping DL-master deploy." 10 70
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
             return 0
         fi
@@ -3305,21 +4350,30 @@ step_10_dl_master_deploy() {
 
             # Delete disk images/logs (free up space)
             if [ -d "${DL_VM_DIR}" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing old DL-master image files in ${DL_VM_DIR} (raw/log)."
-                rm -f "${DL_VM_DIR}/${DL_HOSTNAME}.raw"  >/dev/null 2>&1 || true
-                rm -f "${DL_VM_DIR}/${DL_HOSTNAME}.log"  >/dev/null 2>&1 || true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing old DL-master image files in ${DL_VM_DIR} (raw/log and all contents)."
+                # Remove all files in the VM directory (raw, log, and any other files)
+                sudo rm -rf "${DL_VM_DIR}"/* 2>/dev/null || true
+                # Also try to remove the directory itself if empty
+                sudo rmdir "${DL_VM_DIR}" 2>/dev/null || true
+                log "[STEP 10] Old DL-master image directory ${DL_VM_DIR} cleaned up"
+            else
+                # Fallback: try to remove files directly if directory doesn't exist
+                local fallback_raw="${DL_IMAGE_DIR}/${DL_HOSTNAME}.raw"
+                local fallback_log="${DL_IMAGE_DIR}/${DL_HOSTNAME}.log"
+                if [ -f "${fallback_raw}" ] || [ -f "${fallback_log}" ]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing old DL-master image files (fallback location)."
+                    sudo rm -f "${fallback_raw}" "${fallback_log}" 2>/dev/null || true
+                fi
             fi
         fi
     fi
 
     ############################################################
-    # Prompt for DL memory (default = current DL_MEMORY_GB)
+    # Prompt for DL VM configuration (memory, vCPU, disk)
     ############################################################
+    # 1) Memory
     local _DL_MEM_INPUT
-    _DL_MEM_INPUT="$(whiptail --title "STEP 10 - DL memory" \
-        --inputbox "Enter memory (GB) for DL-master VM.\n\nCurrent default: ${DL_MEMORY_GB} GB" \
-        12 70 "${DL_MEMORY_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DL_MEM_INPUT="$(whiptail_inputbox "STEP 10 - DL memory" "Enter memory (GB) for DL-master VM.\n\nCurrent default: ${DL_MEMORY_GB} GB" "${DL_MEMORY_GB}" 12 70)"
 
     # If Cancel keep default; if OK validate and apply
     if [ $? -eq 0 ] && [ -n "${_DL_MEM_INPUT}" ]; then
@@ -3327,8 +4381,31 @@ step_10_dl_master_deploy() {
         if [[ "${_DL_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_MEM_INPUT}" -gt 0 ]; then
             DL_MEMORY_GB="${_DL_MEM_INPUT}"
         else
-            whiptail --title "STEP 10 - DL memory" \
-                --msgbox "Invalid memory value.\nUsing current default (${DL_MEMORY_GB} GB)." 10 70
+            whiptail_msgbox "STEP 10 - DL memory" "Invalid memory value.\nUsing current default (${DL_MEMORY_GB} GB)." 10 70
+        fi
+    fi
+
+    # 2) vCPU
+    local _DL_VCPU_INPUT
+    _DL_VCPU_INPUT="$(whiptail_inputbox "STEP 10 - DL vCPU" "Enter number of vCPUs for DL-master VM.\n\nCurrent default: ${DL_VCPUS}" "${DL_VCPUS}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_DL_VCPU_INPUT}" ]; then
+        if [[ "${_DL_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_VCPU_INPUT}" -gt 0 ]; then
+            DL_VCPUS="${_DL_VCPU_INPUT}"
+        else
+            whiptail_msgbox "STEP 10 - DL vCPU" "Invalid vCPU value.\nUsing current default (${DL_VCPUS})." 10 70
+        fi
+    fi
+
+    # 3) Disk size
+    local _DL_DISK_INPUT
+    _DL_DISK_INPUT="$(whiptail_inputbox "STEP 10 - DL disk" "Enter disk size (GB) for DL-master VM.\n\nCurrent default: ${DL_DISK_GB} GB" "${DL_DISK_GB}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_DL_DISK_INPUT}" ]; then
+        if [[ "${_DL_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_DISK_INPUT}" -gt 0 ]; then
+            DL_DISK_GB="${_DL_DISK_INPUT}"
+        else
+            whiptail_msgbox "STEP 10 - DL disk" "Invalid disk size value.\nUsing current default (${DL_DISK_GB} GB)." 10 70
         fi
     fi
 
@@ -3382,7 +4459,8 @@ step_10_dl_master_deploy() {
 
 Run virt_deploy_uvp_centos.sh with these settings?"
 
-    if ! whiptail --title "STEP 10 - DL deploy" --yesno "${SUMMARY}" 24 80; then
+    # Calculate dialog size dynamically and center message
+    if ! whiptail_yesno "STEP 10 - DL deploy" "${SUMMARY}"; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled DL-master deploy."
         return 0
     fi
@@ -3394,7 +4472,7 @@ Run virt_deploy_uvp_centos.sh with these settings?"
 
     if [ "${_DRY_RUN}" -eq 1 ]; then
         echo "[DRY_RUN] Command not executed (DRY_RUN=1)."
-        whiptail --title "STEP 10 - DL deploy (DRY RUN)" --msgbox "DRY_RUN mode.\n\nCommand printed but not executed:\n\n${CMD}" 20 80
+        whiptail_msgbox "STEP 10 - DL deploy (DRY RUN)" "DRY_RUN mode.\n\nCommand printed but not executed:\n\n${CMD}" 20 80
         # Call mark_step_done function if it exists
         if type mark_step_done >/dev/null 2>&1; then
             mark_step_done "${STEP_ID}"
@@ -3403,13 +4481,18 @@ Run virt_deploy_uvp_centos.sh with these settings?"
     fi
 
     # Actual execution
-    eval "${CMD}"
-    local RC=$?
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Would execute: ${CMD}"
+        log "[DRY-RUN] DL-master VM deployment skipped in DRY_RUN mode"
+    else
+        eval "${CMD}"
+        local RC=$?
 
-    if [ ${RC} -ne 0 ]; then
-        whiptail --title "STEP 10 - DL deploy" --msgbox "virt_deploy_uvp_centos.sh exited with code ${RC}.\nCheck status via virsh list / virsh console ${DL_HOSTNAME}." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master deploy failed with RC=${RC}."
-        return ${RC}
+        if [ ${RC} -ne 0 ]; then
+            whiptail_msgbox "STEP 10 - DL deploy" "virt_deploy_uvp_centos.sh exited with code ${RC}.\nCheck status via virsh list / virsh console ${DL_HOSTNAME}." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master deploy failed with RC=${RC}."
+            return ${RC}
+        fi
     fi
 
     # Simple validation: VM definition existence / status
@@ -3419,7 +4502,47 @@ Run virt_deploy_uvp_centos.sh with these settings?"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] WARNING: virt_deploy script finished, but virsh dominfo ${DL_HOSTNAME} failed."
     fi
 
-    whiptail --title "STEP 10 - DL deploy complete" --msgbox "DL-master VM deployment complete.\n\nCheck install log output and\nvirsh list / virsh console ${DL_HOSTNAME} for status." 14 80
+    local step10_summary
+    step10_summary=$(cat <<EOF
+═══════════════════════════════════════════════════════════
+  STEP 10: DL-master VM Deployment - Complete
+═══════════════════════════════════════════════════════════
+
+✅ DEPLOYMENT STATUS:
+  • DL-master VM (${DL_HOSTNAME}) deployment completed
+  • VM configuration: UEFI boot, NAT network (virbr0)
+  • Initial boot may take time due to Cloud-Init operations
+
+📊 VERIFICATION COMMANDS:
+  • Check VM status:     virsh list --all
+  • View VM console:     virsh console ${DL_HOSTNAME}
+  • Check VM info:       virsh dominfo ${DL_HOSTNAME}
+  • View VM XML:         virsh dumpxml ${DL_HOSTNAME}
+
+⚠️  IMPORTANT NOTES:
+  • VM may take several minutes to complete initial boot
+  • Cloud-Init will configure network and system settings
+  • Monitor console output for any errors during boot
+  • If VM fails to start, check logs: ${LOG_FILE}
+
+🔧 TROUBLESHOOTING:
+  • If VM doesn't start:
+    1. Check: virsh list --all
+    2. Check: virsh dominfo ${DL_HOSTNAME}
+    3. Review logs: ${LOG_FILE}
+    4. Verify disk space: df -h /stellar/dl
+  • If network issues:
+    1. Verify libvirt hooks: /etc/libvirt/hooks/qemu
+    2. Check iptables rules: iptables -t nat -L
+    3. Verify virbr0: virsh net-info default
+
+📝 NEXT STEPS:
+  • Wait for VM to complete initial boot
+  • Verify VM is accessible via console
+  • Proceed to STEP 11 (DA-master VM Deployment)
+EOF
+)
+    whiptail_msgbox "STEP 10 - DL deploy complete" "${step10_summary}"
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -3457,6 +4580,27 @@ step_11_da_master_deploy() {
     local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
     local DA_IMAGE_DIR="${DA_INSTALL_DIR}/images"
 
+    ############################################################
+    # Clean up all VM directories in /stellar/da/images/ before deployment
+    ############################################################
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Will clean up all VM directories in ${DA_IMAGE_DIR}/"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Cleaning up all existing VM directories in ${DA_IMAGE_DIR}/..."
+        # Find and remove all subdirectories (VM directories like da-master/, etc.)
+        # but keep files (qcow2, sha1, scripts)
+        local vm_dir
+        while IFS= read -r -d '' vm_dir; do
+            if [[ -d "${vm_dir}" ]]; then
+                local dir_name
+                dir_name=$(basename "${vm_dir}")
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Removing VM directory: ${dir_name}/"
+                sudo rm -rf "${vm_dir}" 2>/dev/null || log "[WARN] Failed to remove ${vm_dir}"
+            fi
+        done < <(find "${DA_IMAGE_DIR}" -maxdepth 1 -type d ! -path "${DA_IMAGE_DIR}" -print0 2>/dev/null || true)
+        log "[STEP 11] VM directories cleanup completed"
+    fi
+
     local DA_IP="${DA_IP:-192.168.122.3}"
     local DA_NETMASK="${DA_NETMASK:-255.255.255.0}"
     local DA_GW="${DA_GW:-192.168.122.1}"
@@ -3465,7 +4609,7 @@ step_11_da_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then re-run.\nSkipping this step." 12 80
+        whiptail_msgbox "STEP 11 - DA Deployment" "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then re-run.\nSkipping this step." 12 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DP_VERSION not set. Skipping DA-master deploy."
         return 0
     fi
@@ -3478,11 +4622,9 @@ step_11_da_master_deploy() {
     HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
 
     if [ -z "${HOST_MGT_IP}" ]; then
-        HOST_MGT_IP="$(whiptail --title "STEP 11 - DA Deployment" \
-            --inputbox "Please enter the IP address of the host management (mgt) interface (${MGT_NIC_NAME}).\n(Example: 10.4.0.210)" 12 80 "" \
-            3>&1 1>&2 2>&3)"
+        HOST_MGT_IP="$(whiptail_inputbox "STEP 11 - DA Deployment" "Please enter the IP address of the host management (mgt) interface (${MGT_NIC_NAME}).\n(Example: 10.4.0.210)" "" 12 80)"
         if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail --title "STEP 11 - DA Deployment" --msgbox "Unable to determine host management IP.\nSkipping DA-master deployment step." 10 70
+            whiptail_msgbox "STEP 11 - DA Deployment" "Unable to determine host management IP.\nSkipping DA-master deployment step." 10 70
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] HOST_MGT_IP not available. Skipping."
             return 0
         fi
@@ -3520,7 +4662,7 @@ step_11_da_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first, then run again.\nSkipping this step." 14 80
+        whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first, then run again.\nSkipping this step." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] virt_deploy_uvp_centos.sh not found. Skipping."
         return 0
     fi
@@ -3536,7 +4678,7 @@ step_11_da_master_deploy() {
 
     # Check if DA LV is mounted at /stellar/da
     if ! mount | grep -q "on ${DA_INSTALL_DIR} "; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "${DA_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen run again.\nSkipping this step." 14 80
+        whiptail_msgbox "STEP 11 - DA Deployment" "${DA_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen run again.\nSkipping this step." 14 80
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] ${DA_INSTALL_DIR} not mounted. Skipping."
         return 0
     fi
@@ -3566,31 +4708,61 @@ step_11_da_master_deploy() {
 
             # Delete actual image/log files
             if [ -d "${DA_VM_IMAGE_DIR}" ]; then
-                rm -f "${DA_VM_RAW}" "${DA_VM_LOG}" 2>/dev/null || true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Removing old DA-master image files in ${DA_VM_IMAGE_DIR} (raw/log and all contents)."
+                # Remove all files in the VM directory (raw, log, and any other files)
+                sudo rm -rf "${DA_VM_IMAGE_DIR}"/* 2>/dev/null || true
+                # Also try to remove the directory itself if empty
+                sudo rmdir "${DA_VM_IMAGE_DIR}" 2>/dev/null || true
+                log "[STEP 11] Old DA-master image directory ${DA_VM_IMAGE_DIR} cleaned up"
             else
                 # Fallback in case of old layout (/stellar/da/images/da-master.raw)
-                rm -f "${DA_INSTALL_DIR}/images/${DA_HOSTNAME}.raw" \
-                      "${DA_INSTALL_DIR}/images/${DA_HOSTNAME}.log" 2>/dev/null || true
+                local fallback_raw="${DA_INSTALL_DIR}/images/${DA_HOSTNAME}.raw"
+                local fallback_log="${DA_INSTALL_DIR}/images/${DA_HOSTNAME}.log"
+                if [ -f "${fallback_raw}" ] || [ -f "${fallback_log}" ]; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Removing old DA-master image files (fallback location)."
+                    sudo rm -f "${fallback_raw}" "${fallback_log}" 2>/dev/null || true
+                fi
             fi
         fi
     fi
 
 
     ############################################################
-    # DA memory size input (default = current DA_MEMORY_GB)
+    # Prompt for DA VM configuration (memory, vCPU, disk)
     ############################################################
+    # 1) Memory
     local _DA_MEM_INPUT
-    _DA_MEM_INPUT="$(whiptail --title "STEP 11 - DA Memory Configuration" \
-        --inputbox "Please enter the memory (GB) to allocate to the DA-master VM.\n\nCurrent default: ${DA_MEMORY_GB} GB" \
-        12 70 "${DA_MEMORY_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DA_MEM_INPUT="$(whiptail_inputbox "STEP 11 - DA Memory Configuration" "Please enter the memory (GB) to allocate to the DA-master VM.\n\nCurrent default: ${DA_MEMORY_GB} GB" "${DA_MEMORY_GB}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DA_MEM_INPUT}" ]; then
         if [[ "${_DA_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_MEM_INPUT}" -gt 0 ]; then
             DA_MEMORY_GB="${_DA_MEM_INPUT}"
         else
-            whiptail --title "STEP 11 - DA Memory Configuration" \
-                --msgbox "The entered memory value is invalid.\nUsing the existing default (${DA_MEMORY_GB} GB)." 10 70
+            whiptail_msgbox "STEP 11 - DA Memory Configuration" "The entered memory value is invalid.\nUsing the existing default (${DA_MEMORY_GB} GB)." 10 70
+        fi
+    fi
+
+    # 2) vCPU
+    local _DA_VCPU_INPUT
+    _DA_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - DA vCPU Configuration" "Please enter the number of vCPUs for the DA-master VM.\n\nCurrent default: ${DA_VCPUS}" "${DA_VCPUS}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_DA_VCPU_INPUT}" ]; then
+        if [[ "${_DA_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_VCPU_INPUT}" -gt 0 ]; then
+            DA_VCPUS="${_DA_VCPU_INPUT}"
+        else
+            whiptail_msgbox "STEP 11 - DA vCPU Configuration" "The entered vCPU value is invalid.\nUsing the existing default (${DA_VCPUS})." 10 70
+        fi
+    fi
+
+    # 3) Disk size
+    local _DA_DISK_INPUT
+    _DA_DISK_INPUT="$(whiptail_inputbox "STEP 11 - DA Disk Configuration" "Please enter the disk size (GB) for the DA-master VM.\n\nCurrent default: ${DA_DISK_GB} GB" "${DA_DISK_GB}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_DA_DISK_INPUT}" ]; then
+        if [[ "${_DA_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_DISK_INPUT}" -gt 0 ]; then
+            DA_DISK_GB="${_DA_DISK_INPUT}"
+        else
+            whiptail_msgbox "STEP 11 - DA Disk Configuration" "The entered disk size value is invalid.\nUsing the existing default (${DA_DISK_GB} GB)." 10 70
         fi
     fi
 
@@ -3647,7 +4819,8 @@ step_11_da_master_deploy() {
 
 Execute virt_deploy_uvp_centos.sh with the above settings?"
 
-    if ! whiptail --title "STEP 11 - DA Deployment" --yesno "${SUMMARY}" 24 80; then
+    # Calculate dialog size dynamically and center message
+    if ! whiptail_yesno "STEP 11 - DA Deployment" "${SUMMARY}"; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled DA-master deploy."
         return 0
     fi
@@ -3659,7 +4832,7 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
 
     if [ "${_DRY_RUN}" -eq 1 ]; then
         echo "[DRY_RUN] Not executing the above command."
-        whiptail --title "STEP 11 - DA Deployment (DRY RUN)" --msgbox "DRY_RUN mode.\n\nOnly printed the command below without executing it.\n\n${CMD}" 20 80
+        whiptail_msgbox "STEP 11 - DA Deployment (DRY RUN)" "DRY_RUN mode.\n\nOnly printed the command below without executing it.\n\n${CMD}" 20 80
         if type mark_step_done >/dev/null 2>&1; then
             mark_step_done "${STEP_ID}"
         fi
@@ -3667,13 +4840,18 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
     fi
 
     # Actual execution
-    eval "${CMD}"
-    local RC=$?
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Would execute: ${CMD}"
+        log "[DRY-RUN] DA-master VM deployment skipped in DRY_RUN mode"
+    else
+        eval "${CMD}"
+        local RC=$?
 
-    if [ ${RC} -ne 0 ]; then
-        whiptail --title "STEP 11 - DA Deployment" --msgbox "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nPlease check the status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
-        return ${RC}
+        if [ ${RC} -ne 0 ]; then
+            whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nPlease check the status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
+            return ${RC}
+        fi
     fi
 
     # Simple validation: VM definition existence / status
@@ -3683,7 +4861,47 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] WARNING: virt_deploy script finished, but virsh dominfo ${DA_HOSTNAME} failed."
     fi
 
-    whiptail --title "STEP 11 - DA Deployment Complete" --msgbox "DA-master VM deployment completed.\n\nPlease check the installation script output log and\nstatus using virsh list / virsh console ${DA_HOSTNAME}." 14 80
+    local step11_summary
+    step11_summary=$(cat <<EOF
+═══════════════════════════════════════════════════════════
+  STEP 11: DA-master VM Deployment - Complete
+═══════════════════════════════════════════════════════════
+
+✅ DEPLOYMENT STATUS:
+  • DA-master VM (${DA_HOSTNAME}) deployment completed
+  • VM configuration: UEFI boot, NAT network (virbr0)
+  • Initial boot may take time due to Cloud-Init operations
+
+📊 VERIFICATION COMMANDS:
+  • Check VM status:     virsh list --all
+  • View VM console:     virsh console ${DA_HOSTNAME}
+  • Check VM info:       virsh dominfo ${DA_HOSTNAME}
+  • View VM XML:         virsh dumpxml ${DA_HOSTNAME}
+
+⚠️  IMPORTANT NOTES:
+  • VM may take several minutes to complete initial boot
+  • Cloud-Init will configure network and system settings
+  • Monitor console output for any errors during boot
+  • If VM fails to start, check logs: ${LOG_FILE}
+
+🔧 TROUBLESHOOTING:
+  • If VM doesn't start:
+    1. Check: virsh list --all
+    2. Check: virsh dominfo ${DA_HOSTNAME}
+    3. Review logs: ${LOG_FILE}
+    4. Verify disk space: df -h /stellar/da
+  • If network issues:
+    1. Verify libvirt hooks: /etc/libvirt/hooks/qemu
+    2. Check iptables rules: iptables -t nat -L
+    3. Verify virbr0: virsh net-info default
+
+📝 NEXT STEPS:
+  • Wait for VM to complete initial boot
+  • Verify VM is accessible via console
+  • Proceed to STEP 12 (SR-IOV / CPU Affinity Configuration)
+EOF
+)
+    whiptail_msgbox "STEP 11 - DA Deployment Complete" "${step11_summary}"
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -3745,7 +4963,7 @@ step_12_sriov_cpu_affinity() {
     vf_list="$(lspci | awk '/Ethernet/ && /Virtual Function/ {print $1}' || true)"
 
     if [[ -z "${vf_list}" ]]; then
-        whiptail --title "STEP 12 - SR-IOV" --msgbox "Failed to detect SR-IOV VF PCI devices.\nPlease check STEP 03 or BIOS settings." 12 70
+        whiptail_msgbox "STEP 12 - SR-IOV" "Failed to detect SR-IOV VF PCI devices.\nPlease check STEP 03 or BIOS settings." 12 70
         log "[STEP 12] No SR-IOV VF found → aborting STEP"
         return 1
     fi
@@ -4092,8 +5310,16 @@ step_13_install_dp_cli() {
         load_config || true
     fi
 
+    # Calculate dialog size dynamically and center message
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 15 85)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    local centered_msg
+    centered_msg=$(center_message "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?")
+    
     if ! whiptail --title "STEP 13 Execution Confirmation" \
-                  --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
+                  --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
     then
         log "User canceled STEP 13 execution."
         return 0
@@ -4106,6 +5332,25 @@ step_13_install_dp_cli() {
         mkdir -p /var/log/aella || true
         : > "${ERRLOG}" || true
         chmod 644 "${ERRLOG}" || true
+    fi
+
+    # 0-1) Install required packages first (before download/extraction)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] apt-get update -y"
+        log "[DRY-RUN] apt-get install -y python3-pip python3-venv wget curl unzip"
+    else
+        if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            return 1
+        fi
+        if ! apt-get install -y python3-pip python3-venv wget curl unzip >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            return 1
+        fi
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Required packages installed successfully"
     fi
 
     # 1) Download dp_cli from GitHub
@@ -4153,15 +5398,10 @@ step_13_install_dp_cli() {
         fi
 
         echo "=== Extracting downloaded file ==="
-        # Extract zip file
-        if command -v unzip >/dev/null 2>&1; then
-            if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
-                rm -rf "${TEMP_DIR}" || true
-                return 1
-            fi
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: unzip is not available. Please install unzip package." | tee -a "${ERRLOG}"
+        # Extract zip file (unzip should already be installed)
+        if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         fi
@@ -4177,11 +5417,7 @@ step_13_install_dp_cli() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Successfully downloaded and extracted dp_cli from GitHub"
     fi
 
-    # 2) required packages
-    run_cmd "apt-get update -y"
-    run_cmd "apt-get install -y python3-pip python3-venv wget curl unzip"
-
-    # 3) Create/initialize venv then install dp-cli
+    # 2) Create/initialize venv then install dp-cli
     if [[ "${_DRY}" -eq 1 ]]; then
         log "[DRY-RUN] Creating venv: ${VENV_DIR}"
         log "[DRY-RUN] Installing dp-cli in venv: ${pkg}"
@@ -4361,28 +5597,63 @@ menu_config() {
     msg+="CLTR0_NIC    : ${CLTR0_NIC:-<Not Set>}\n"
     msg+="DATA_SSD_LIST: ${DATA_SSD_LIST:-<Not Set>}\n"
 
+    # Calculate menu size dynamically (5 menu items)
+    local menu_dims
+    menu_dims=$(calc_menu_size 5 80 8)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Center-align the menu message based on terminal height
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg}\n" "${menu_height}")
+
     local choice
     choice=$(whiptail --title "XDR Installer - Configuration" \
-      --menu "${msg}" 22 80 10 \
+      --menu "${centered_msg}" \
+      "${menu_height}" "${menu_width}" "${menu_list_height}" \
       "1" "Toggle DRY_RUN (0/1)" \
       "2" "Set DP_VERSION" \
       "3" "Set ACPS Account/Password" \
       "4" "Set ACPS URL" \
       "5" "Go Back" \
-      3>&1 1>&2 2>&3) || break
+      3>&1 1>&2 2>&3) || {
+      # ESC or Cancel pressed - go back to main menu
+      break
+    }
+    
+    # Additional check: if choice is empty, also break
+    if [[ -z "${choice}" ]]; then
+      break
+    fi
 
     case "${choice}" in
       "1")
         # Toggle DRY_RUN
         if [[ "${DRY_RUN}" -eq 1 ]]; then
+          # Calculate dialog size dynamically and center message
+          local dialog_dims
+          dialog_dims=$(calc_dialog_size 12 70)
+          local dialog_height dialog_width
+          read -r dialog_height dialog_width <<< "${dialog_dims}"
+          local centered_msg
+          centered_msg=$(center_message "Current DRY_RUN=1 (simulation mode).\n\nChange to DRY_RUN=0 to execute actual commands?")
+          
           if whiptail --title "DRY_RUN Configuration" \
-                      --yesno "Current DRY_RUN=1 (simulation mode).\n\nChange to DRY_RUN=0 to execute actual commands?" 12 70
+                      --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
           then
             DRY_RUN=0
           fi
         else
+          # Calculate dialog size dynamically and center message
+          local dialog_dims
+          dialog_dims=$(calc_dialog_size 12 70)
+          local dialog_height dialog_width
+          read -r dialog_height dialog_width <<< "${dialog_dims}"
+          local centered_msg
+          centered_msg=$(center_message "Current DRY_RUN=0 (actual execution mode).\n\nSafely change to DRY_RUN=1 (simulation mode)?")
+          
           if whiptail --title "DRY_RUN Configuration" \
-                      --yesno "Current DRY_RUN=0 (actual execution mode).\n\nSafely change to DRY_RUN=1 (simulation mode)?" 12 70
+                      --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
           then
             DRY_RUN=1
           fi
@@ -4393,29 +5664,35 @@ menu_config() {
       "2")
         # Set DP_VERSION
         local new_ver
-        new_ver=$(whiptail --title "DP_VERSION Configuration" \
-                           --inputbox "Enter DP version (e.g., 6.2.0)." 10 60 "${DP_VERSION}" \
-                           3>&1 1>&2 2>&3) || continue
+        new_ver=$(whiptail_inputbox "DP_VERSION Configuration" "Enter DP version (e.g., 6.2.0)." "${DP_VERSION}" 10 60)
+        if [[ $? -ne 0 ]] || [[ -z "${new_ver}" ]]; then
+          continue
+        fi
         if [[ -n "${new_ver}" ]]; then
           DP_VERSION="${new_ver}"
           save_config
-          whiptail --title "DP_VERSION Configuration" \
-                   --msgbox "DP_VERSION has been set to ${DP_VERSION}." 8 60
+          whiptail_msgbox "DP_VERSION Configuration" "DP_VERSION has been set to ${DP_VERSION}." 8 60
         fi
         ;;
 
       "3")
         # ACPS account / password
         local user pass
-        user=$(whiptail --title "ACPS Account Configuration" \
-                        --inputbox "Enter ACPS account (ID)." 10 60 "${ACPS_USERNAME}" \
-                        3>&1 1>&2 2>&3) || continue
-        if [[ -z "${user}" ]]; then
+        user=$(whiptail_inputbox "ACPS Account Configuration" "Enter ACPS account (ID)." "${ACPS_USERNAME}" 10 60)
+        if [[ $? -ne 0 ]] || [[ -z "${user}" ]]; then
           continue
         fi
 
+        # For password, use whiptail directly with passwordbox (we'll add dynamic sizing)
+        local dialog_dims
+        dialog_dims=$(calc_dialog_size 10 60)
+        local dialog_height dialog_width
+        read -r dialog_height dialog_width <<< "${dialog_dims}"
+        local centered_pass_msg
+        centered_pass_msg=$(center_message "Enter ACPS password.\n(This value will be saved to the config file and automatically used in STEP 09)")
+        
         pass=$(whiptail --title "ACPS Password Configuration" \
-                        --passwordbox "Enter ACPS password.\n(This value will be saved to the config file and automatically used in STEP 09)" 10 60 "${ACPS_PASSWORD}" \
+                        --passwordbox "${centered_pass_msg}" "${dialog_height}" "${dialog_width}" "${ACPS_PASSWORD}" \
                         3>&1 1>&2 2>&3) || continue
         if [[ -z "${pass}" ]]; then
           continue
@@ -4424,21 +5701,20 @@ menu_config() {
         ACPS_USERNAME="${user}"
         ACPS_PASSWORD="${pass}"
         save_config
-        whiptail --title "ACPS Account Configuration" \
-                 --msgbox "ACPS_USERNAME has been set to '${ACPS_USERNAME}'." 8 70
+        whiptail_msgbox "ACPS Account Configuration" "ACPS_USERNAME has been set to '${ACPS_USERNAME}'." 8 70
         ;;
 
       "4")
         # ACPS URL
         local new_url
-        new_url=$(whiptail --title "ACPS URL Configuration" \
-                           --inputbox "Enter ACPS BASE URL." 10 70 "${ACPS_BASE_URL}" \
-                           3>&1 1>&2 2>&3) || continue
+        new_url=$(whiptail_inputbox "ACPS URL Configuration" "Enter ACPS BASE URL." "${ACPS_BASE_URL}" 10 70)
+        if [[ $? -ne 0 ]] || [[ -z "${new_url}" ]]; then
+          continue
+        fi
         if [[ -n "${new_url}" ]]; then
           ACPS_BASE_URL="${new_url}"
           save_config
-          whiptail --title "ACPS URL Configuration" \
-                   --msgbox "ACPS_BASE_URL has been set to '${ACPS_BASE_URL}'." 8 70
+          whiptail_msgbox "ACPS URL Configuration" "ACPS_BASE_URL has been set to '${ACPS_BASE_URL}'." 8 70
         fi
         ;;
 
@@ -4498,11 +5774,15 @@ build_validation_summary() {
     if grep -q 'intel_iommu=on' /etc/default/grub && grep -q 'iommu=pt' /etc/default/grub; then
       ok_msgs+=("HWE kernel series (linux-*-generic-hwe-24.04) + GRUB IOMMU options (intel_iommu=on iommu=pt) applied")
     else
-      warn_msgs+=("HWE kernel series is installed but GRUB IOMMU options may differ from installation guide. Please re-check GRUB_CMDLINE_LINUX value in /etc/default/grub.")
+      warn_msgs+=("HWE kernel series is installed but GRUB IOMMU options may differ from installation guide.")
+      warn_msgs+=("  → ACTION: Re-run STEP 05 (Kernel Tuning) to configure IOMMU parameters")
+      warn_msgs+=("  → MANUAL: Edit /etc/default/grub and add 'intel_iommu=on iommu=pt' to GRUB_CMDLINE_LINUX, then run 'sudo update-grub'")
     fi
   else
     # Only WARN here
-    warn_msgs+=("Could not find linux-image-generic-hwe-24.04 / linux-generic-hwe-24.04 packages in dpkg -l | grep hwe output. Please compare current kernel version (uname -r) with \"HWE 24.04 Installation\" section in installation guide.")
+    warn_msgs+=("Could not find linux-image-generic-hwe-24.04 / linux-generic-hwe-24.04 packages.")
+    warn_msgs+=("  → ACTION: Re-run STEP 02 (HWE Kernel Installation)")
+    warn_msgs+=("  → VERIFY: Check current kernel with 'uname -r' and compare with installation guide")
   fi
 
 
@@ -4513,20 +5793,56 @@ build_validation_summary() {
   if ip link show mgt >/dev/null 2>&1 && ip link show cltr0 >/dev/null 2>&1; then
     ok_msgs+=("mgt / cltr0 interface rename applied")
   else
-    err_msgs+=("mgt or cltr0 interface not visible. Need to re-check 03_NIC/ifupdown configuration (udev rename and /etc/network/interfaces.d/*).")
+    err_msgs+=("mgt or cltr0 interface not visible.")
+    err_msgs+=("  → ACTION: Re-run STEP 03 (NIC/ifupdown Configuration)")
+    err_msgs+=("  → CHECK: Verify /etc/udev/rules.d/99-custom-ifnames.rules exists and contains correct PCI addresses")
+    err_msgs+=("  → CHECK: Verify /etc/network/interfaces.d/00-cltr0.cfg exists")
+    err_msgs+=("  → MANUAL: Run 'sudo udevadm control --reload' and 'sudo udevadm trigger' then reboot")
   fi
 
   # Check include setting in /etc/network/interfaces
   if grep -qE '^source /etc/network/interfaces.d/\*' /etc/network/interfaces 2>/dev/null; then
     ok_msgs+=("/etc/network/interfaces include setting for /etc/network/interfaces.d/* confirmed")
   else
-    warn_msgs+=("/etc/network/interfaces does not have 'source /etc/network/interfaces.d/*' line. If mgt/cltr0 individual settings are in interfaces.d/*.cfg, need to add include setting.")
+    warn_msgs+=("/etc/network/interfaces does not have 'source /etc/network/interfaces.d/*' line.")
+    warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC/ifupdown Configuration)")
+    warn_msgs+=("  → MANUAL: Add 'source /etc/network/interfaces.d/*' to /etc/network/interfaces")
   fi
 
-  if systemctl is-active --quiet networking; then
-    ok_msgs+=("ifupdown-based networking service active")
+  # Check networking service: enabled status is more important than active status
+  # In Ubuntu 16.04 with ifupdown, networking service may be inactive after boot
+  # but interfaces can still work correctly. Check both enabled status and actual interface state.
+  local networking_enabled=0
+  local mgt_interface_up=0
+  
+  if systemctl is-enabled --quiet networking 2>/dev/null; then
+    networking_enabled=1
+  fi
+  
+  # Check if mgt interface is UP and has an IP address
+  if ip link show mgt 2>/dev/null | grep -q "state UP" && ip addr show mgt 2>/dev/null | grep -q "inet "; then
+    mgt_interface_up=1
+  fi
+  
+  if [[ ${networking_enabled} -eq 1 ]] && [[ ${mgt_interface_up} -eq 1 ]]; then
+    ok_msgs+=("ifupdown networking service enabled and mgt interface is UP with IP")
+  elif [[ ${mgt_interface_up} -eq 1 ]]; then
+    # Interface is working, but service might not be enabled (less critical)
+    warn_msgs+=("mgt interface is UP, but networking service may not be enabled for auto-start.")
+    warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC/ifupdown Configuration)")
+    warn_msgs+=("  → MANUAL: Run 'sudo systemctl enable networking' to enable auto-start on boot")
+  elif [[ ${networking_enabled} -eq 1 ]]; then
+    # Service is enabled but interface is not up
+    warn_msgs+=("networking service is enabled, but mgt interface may not be UP or configured.")
+    warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC/ifupdown Configuration)")
+    warn_msgs+=("  → MANUAL: Run 'sudo ifup mgt' to bring up the interface")
+    warn_msgs+=("  → CHECK: Verify /etc/network/interfaces syntax with 'ifup --dry-run mgt'")
   else
-    warn_msgs+=("networking service is not in active state. Please re-check ifupdown transition and /etc/network/interfaces configuration.")
+    # Neither enabled nor interface up
+    warn_msgs+=("networking service is not enabled and mgt interface may not be configured.")
+    warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC/ifupdown Configuration)")
+    warn_msgs+=("  → MANUAL: Run 'sudo systemctl enable networking' and 'sudo ifup mgt'")
+    warn_msgs+=("  → CHECK: Verify /etc/network/interfaces syntax with 'ifup --dry-run mgt'")
   fi
 
   ###############################
@@ -4537,13 +5853,19 @@ build_validation_summary() {
   elif lsmod | egrep -q '^(kvm|kvm_intel|kvm_amd)\b'; then
     ok_msgs+=("kvm-related kernel modules loaded (based on lsmod)")
   else
-    warn_msgs+=("Cannot verify kvm device (/dev/kvm) or kvm modules. May need to re-check BIOS VT-x/VT-d or KVM settings.")
+    warn_msgs+=("Cannot verify kvm device (/dev/kvm) or kvm modules.")
+    warn_msgs+=("  → CHECK: Verify BIOS VT-x/VT-d settings are enabled")
+    warn_msgs+=("  → CHECK: Run 'lsmod | grep kvm' to verify kernel modules")
+    warn_msgs+=("  → ACTION: If modules not loaded, re-run STEP 04 (KVM/Libvirt Installation)")
   fi
 
   if systemctl is-active --quiet libvirtd; then
     ok_msgs+=("libvirtd service active")
   else
-    err_msgs+=("libvirtd service is inactive. Please run 'sudo systemctl enable --now libvirtd' before using virsh.")
+    err_msgs+=("libvirtd service is inactive.")
+    err_msgs+=("  → ACTION: Re-run STEP 04 (KVM/Libvirt Installation)")
+    err_msgs+=("  → MANUAL: Run 'sudo systemctl enable --now libvirtd'")
+    err_msgs+=("  → CHECK: Verify service status with 'sudo systemctl status libvirtd'")
   fi
 
   ###############################
@@ -4552,7 +5874,10 @@ build_validation_summary() {
   if sysctl vm.min_free_kbytes 2>/dev/null | grep -q '1048576'; then
     ok_msgs+=("vm.min_free_kbytes = 1048576 (OOM prevention tuning applied)")
   else
-    warn_msgs+=("vm.min_free_kbytes value may differ from installation guide (1048576). Please re-check /etc/sysctl.d/*.conf settings.")
+    warn_msgs+=("vm.min_free_kbytes value may differ from installation guide (expected: 1048576).")
+    warn_msgs+=("  → ACTION: Re-run STEP 05 (Kernel Tuning)")
+    warn_msgs+=("  → CHECK: Verify /etc/sysctl.d/*.conf contains 'vm.min_free_kbytes=1048576'")
+    warn_msgs+=("  → MANUAL: Run 'sudo sysctl -w vm.min_free_kbytes=1048576' and add to /etc/sysctl.conf")
   fi
 
   if [[ -f /sys/kernel/mm/ksm/run ]]; then
@@ -4561,12 +5886,16 @@ build_validation_summary() {
     if [[ "${ksm_run}" = "0" ]]; then
       ok_msgs+=("KSM disabled (run=0)")
     else
-      warn_msgs+=("KSM is still enabled (run=${ksm_run}). May need /etc/default/qemu-kvm configuration and service restart.")
+      warn_msgs+=("KSM is still enabled (run=${ksm_run}).")
+      warn_msgs+=("  → ACTION: Re-run STEP 05 (Kernel Tuning)")
+      warn_msgs+=("  → MANUAL: Run 'echo 0 | sudo tee /sys/kernel/mm/ksm/run'")
     fi
   fi
 
   if swapon --show | grep -q .; then
-    warn_msgs+=("swap is still enabled. Need to comment out /swap.img and re-check swapoff status.")
+    warn_msgs+=("swap is still enabled.")
+    warn_msgs+=("  → ACTION: Re-run STEP 05 (Kernel Tuning)")
+    warn_msgs+=("  → MANUAL: Run 'sudo swapoff -a' and comment out /swap.img in /etc/fstab")
   else
     ok_msgs+=("swap disabled")
   fi
@@ -4577,7 +5906,10 @@ build_validation_summary() {
   if systemctl is-active --quiet ntpsec; then
     ok_msgs+=("ntpsec service active")
   else
-    warn_msgs+=("ntpsec service is not active. Time synchronization issues may occur, please configure ntpsec or alternative NTP service.")
+    warn_msgs+=("ntpsec service is not active.")
+    warn_msgs+=("  → ACTION: Re-run STEP 06 (SR-IOV + NTPsec)")
+    warn_msgs+=("  → MANUAL: Run 'sudo systemctl enable --now ntpsec'")
+    warn_msgs+=("  → CHECK: Verify configuration in /etc/ntpsec/ntp.conf")
   fi
 
   ###############################
@@ -4589,13 +5921,21 @@ build_validation_summary() {
       if mountpoint -q /stellar/dl && mountpoint -q /stellar/da; then
         ok_msgs+=("lv_dl_root / lv_da_root registered in fstab and /stellar/dl, /stellar/da mounted")
       else
-        warn_msgs+=("Registered in fstab but /stellar/dl or /stellar/da mount seems missing. Please check 'mount -a' or individual mounts.")
+        warn_msgs+=("Registered in fstab but /stellar/dl or /stellar/da mount seems missing.")
+        warn_msgs+=("  → ACTION: Re-run STEP 07 (LVM Storage Configuration)")
+        warn_msgs+=("  → MANUAL: Run 'sudo mount -a' to mount all filesystems")
+        warn_msgs+=("  → CHECK: Verify mount with 'mount | grep stellar'")
       fi
     else
-      warn_msgs+=("/stellar/dl or /stellar/da directory does not exist. Need to create directory and remount.")
+      warn_msgs+=("/stellar/dl or /stellar/da directory does not exist.")
+      warn_msgs+=("  → ACTION: Re-run STEP 07 (LVM Storage Configuration)")
+      warn_msgs+=("  → MANUAL: Run 'sudo mkdir -p /stellar/dl /stellar/da' then 'sudo mount -a'")
     fi
   else
-    err_msgs+=("/etc/fstab does not have lv_dl_root / lv_da_root entries. Please refer to LVM configuration section in installation guide to modify fstab.")
+    err_msgs+=("/etc/fstab does not have lv_dl_root / lv_da_root entries.")
+    err_msgs+=("  → ACTION: Re-run STEP 07 (LVM Storage Configuration)")
+    err_msgs+=("  → CHECK: Verify LVM volumes exist with 'sudo lvs'")
+    err_msgs+=("  → MANUAL: Add entries to /etc/fstab: /dev/ubuntu-vg/lv_dl_root and /dev/ubuntu-vg/lv_da_root")
   fi
 
   ###############################
@@ -4615,9 +5955,16 @@ build_validation_summary() {
   if (( dl_defined == 1 && da_defined == 1 )); then
     ok_msgs+=("dl-master / da-master libvirt domain definition complete")
   elif (( dl_defined == 1 || da_defined == 1 )); then
-    warn_msgs+=("Only one of dl-master or da-master is defined. Please check virt_deploy step progress.")
+    warn_msgs+=("Only one of dl-master or da-master is defined.")
+    if (( dl_defined == 1 )); then
+      warn_msgs+=("  → ACTION: Re-run STEP 11 (DA-master VM Deployment)")
+    else
+      warn_msgs+=("  → ACTION: Re-run STEP 10 (DL-master VM Deployment)")
+    fi
   else
-    warn_msgs+=("dl-master / da-master domain not yet defined. This is normal if before STEP 10/11 execution.")
+    warn_msgs+=("dl-master / da-master domain not yet defined.")
+    warn_msgs+=("  → NOTE: This is normal if before STEP 10/11 execution")
+    warn_msgs+=("  → ACTION: Complete STEP 09 (DP Download) then run STEP 10 and STEP 11")
   fi
 
   # 7-2. dl-master detailed validation (only if defined)
@@ -4626,19 +5973,25 @@ build_validation_summary() {
     if virsh dumpxml dl-master 2>/dev/null | grep -q '<hostdev '; then
       ok_msgs+=("dl-master SR-IOV VF(hostdev) passthrough configuration detected")
     else
-      warn_msgs+=("dl-master XML does not have hostdev(SR-IOV) configuration yet. If using SR-IOV, need to complete STEP 12(SR-IOV/CPU Affinity).")
+      warn_msgs+=("dl-master XML does not have hostdev(SR-IOV) configuration yet.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+      warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
     fi
 
     # CPU pinning(cputune)
     if virsh dumpxml dl-master 2>/dev/null | grep -q '<cputune>'; then
       ok_msgs+=("dl-master CPU pinning(cputune) configuration detected")
     else
-      warn_msgs+=("dl-master XML does not have CPU pinning(cputune) configuration. NUMA-based vCPU placement may not be applied.")
+      warn_msgs+=("dl-master XML does not have CPU pinning(cputune) configuration.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+      warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
     fi
 
     # CD-ROM / ISO connection status
     if virsh dumpxml dl-master 2>/dev/null | grep -q '\.iso'; then
-      warn_msgs+=("dl-master XML still has ISO(.iso) file connected. Need to remove ISO using virsh change-media or XML editing.")
+      warn_msgs+=("dl-master XML still has ISO(.iso) file connected.")
+      warn_msgs+=("  → MANUAL: Remove ISO with 'virsh change-media dl-master --eject hda'")
+      warn_msgs+=("  → MANUAL: Or edit XML with 'virsh edit dl-master' and remove ISO source")
     else
       ok_msgs+=("dl-master ISO not connected (even if CD-ROM device remains, .iso file is not connected)")
     fi
@@ -4650,19 +6003,25 @@ build_validation_summary() {
     if virsh dumpxml da-master 2>/dev/null | grep -q '<hostdev '; then
       ok_msgs+=("da-master SR-IOV VF(hostdev) passthrough configuration detected")
     else
-      warn_msgs+=("da-master XML does not have hostdev(SR-IOV) configuration yet. If using SR-IOV, need to complete STEP 12(SR-IOV/CPU Affinity).")
+      warn_msgs+=("da-master XML does not have hostdev(SR-IOV) configuration yet.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+      warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
     fi
 
     # CPU pinning(cputune)
     if virsh dumpxml da-master 2>/dev/null | grep -q '<cputune>'; then
       ok_msgs+=("da-master CPU pinning(cputune) configuration detected")
     else
-      warn_msgs+=("da-master XML does not have CPU pinning(cputune) configuration. NUMA-based vCPU placement may not be applied.")
+      warn_msgs+=("da-master XML does not have CPU pinning(cputune) configuration.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+      warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
     fi
 
     # CD-ROM / ISO connection status
     if virsh dumpxml da-master 2>/dev/null | grep -q '\.iso'; then
-      warn_msgs+=("da-master XML still has ISO(.iso) file connected. Need to remove ISO using virsh change-media or XML editing.")
+      warn_msgs+=("da-master XML still has ISO(.iso) file connected.")
+      warn_msgs+=("  → MANUAL: Remove ISO with 'virsh change-media da-master --eject hda'")
+      warn_msgs+=("  → MANUAL: Or edit XML with 'virsh edit da-master' and remove ISO source")
     else
       ok_msgs+=("da-master ISO not connected (even if CD-ROM device remains, .iso file is not connected)")
     fi
@@ -4674,56 +6033,95 @@ build_validation_summary() {
   if [[ -f /etc/libvirt/hooks/qemu ]]; then
     ok_msgs+=("/etc/libvirt/hooks/qemu script exists")
   else
-    warn_msgs+=("Could not find /etc/libvirt/hooks/qemu script. NAT and OOM restart automation may not work.")
+    warn_msgs+=("Could not find /etc/libvirt/hooks/qemu script.")
+    warn_msgs+=("  → ACTION: Re-run STEP 08 (Libvirt Hooks Configuration)")
+    warn_msgs+=("  → NOTE: NAT and OOM restart automation may not work without this")
   fi
 
   ###############################
   # Build summary message (error → warning → normal)
   ###############################
   local summary=""
+  
+  # Count only main messages (not → ACTION, → CHECK, etc.)
+  local err_main_cnt=0
+  local warn_main_cnt=0
   local ok_cnt=${#ok_msgs[@]}
-  local warn_cnt=${#warn_msgs[@]}
-  local err_cnt=${#err_msgs[@]}
+  
+  for msg in "${err_msgs[@]}"; do
+    if [[ ! "${msg}" =~ ^[[:space:]]*→ ]]; then
+      ((err_main_cnt++))
+    fi
+  done
+  
+  for msg in "${warn_msgs[@]}"; do
+    if [[ ! "${msg}" =~ ^[[:space:]]*→ ]]; then
+      ((warn_main_cnt++))
+    fi
+  done
 
-  summary+="[Full Configuration Validation Summary]\n\n"
+  # Build summary text for msgbox
+  summary+="Full Configuration Validation Summary\n\n"
 
-  # 1) Overall status one-line summary
-  if (( err_cnt == 0 && warn_cnt == 0 )); then
-    summary+="- All major validation items defined in installation guide are normal.\n"
-    summary+="  (No critical errors/warnings)\n\n"
-  elif (( err_cnt == 0 && warn_cnt > 0 )); then
-    summary+="- No critical errors, but some items may differ from guide.\n"
-    summary+="  Please check [WARN] items below.\n\n"
+  # 1) Overall status
+  if (( err_main_cnt == 0 && warn_main_cnt == 0 )); then
+    summary+="✅ All validation items are normal.\n"
+    summary+="✅ No errors or warnings detected.\n\n"
+  elif (( err_main_cnt == 0 && warn_main_cnt > 0 )); then
+    summary+="⚠️  No critical errors, but ${warn_main_cnt} warning(s) found.\n"
+    summary+="⚠️  Please review [WARN] items below.\n\n"
   else
-    summary+="- Some items detected with status different from guide.\n"
-    summary+="  Please check [ERROR] and [WARN] items below first.\n\n"
+    summary+="❌ ${err_main_cnt} error(s) and ${warn_main_cnt} warning(s) detected.\n"
+    summary+="❌ Please address [ERROR] items first, then review [WARN] items.\n\n"
   fi
 
-  # 2) ERROR first
-  if (( err_cnt > 0 )); then
-    summary+="[ERROR]\n"
+  # 2) ERROR first (most critical)
+  if (( err_main_cnt > 0 )); then
+    summary+="❌ [ERROR] - Critical Issues (Must Fix):\n"
+    summary+="─────────────────────────────────────────\n"
+    local idx=1
     for msg in "${err_msgs[@]}"; do
-      summary+="  - ${msg}\n"
+      if [[ "${msg}" =~ ^[[:space:]]*→ ]]; then
+        # This is an action/check line, add it directly
+        summary+="${msg}\n"
+      else
+        # This is a main error message
+        summary+="\n${idx}. ${msg}\n"
+        ((idx++))
+      fi
     done
     summary+="\n"
   fi
 
   # 3) Then WARN
-  if (( warn_cnt > 0 )); then
-    summary+="[WARN]\n"
+  if (( warn_main_cnt > 0 )); then
+    summary+="⚠️  [WARN] - Warnings (Recommended to Fix):\n"
+    summary+="─────────────────────────────────────────\n"
+    local idx=1
     for msg in "${warn_msgs[@]}"; do
-      summary+="  - ${msg}\n"
+      if [[ "${msg}" =~ ^[[:space:]]*→ ]]; then
+        # This is an action/check line, add it directly
+        summary+="${msg}\n"
+      else
+        # This is a main warning message
+        summary+="\n${idx}. ${msg}\n"
+        ((idx++))
+      fi
     done
     summary+="\n"
   fi
 
-  # 4) OK is not listed in detail, just one line
-  if (( err_cnt == 0 && warn_cnt == 0 )); then
-    summary+="[OK]\n"
-    summary+="  - All validation items match installation guide.\n"
+  # 4) OK summary
+  if (( err_main_cnt == 0 && warn_main_cnt == 0 )); then
+    summary+="✅ [OK] - All Validation Items:\n"
+    summary+="─────────────────────────────────────────\n"
+    summary+="All validation items match installation guide.\n"
+    summary+="No issues detected.\n"
   else
-    summary+="[OK]\n"
-    summary+="  - Other validation items not listed above are judged to be within normal range without major issues.\n"
+    summary+="✅ [OK] - Validated Items:\n"
+    summary+="─────────────────────────────────────────\n"
+    summary+="${ok_cnt} item(s) validated successfully.\n"
+    summary+="Items not listed above are all normal.\n"
   fi
 
   echo "${summary}"
@@ -4998,16 +6396,28 @@ menu_full_validation() {
   # Re-enable set -e
   set -e
 
-  # 1) Generate summary
+  # 1) Generate summary text
   local summary
   summary=$(build_validation_summary "${tmp_file}")
 
-  # 2) Show summary first in msgbox
-  whiptail --title "Full Configuration Validation Summary" \
-           --msgbox "${summary}" 25 90
+  # 2) Save summary to temporary file for scrollable textbox
+  local summary_file="/tmp/xdr_validation_summary_$(date '+%Y%m%d-%H%M%S').txt"
+  echo "${summary}" > "${summary_file}"
 
-  # 3) Show full validation log in detail using less
-  show_paged "Full Configuration Validation Results (Detailed Log)" "${tmp_file}"
+  # 3) Show summary in scrollable textbox (so user can see all ERROR and WARN messages)
+  show_textbox "Full Configuration Validation Summary" "${summary_file}"
+
+  # 4) Ask if user wants to view detailed log
+  local view_detail_msg
+  view_detail_msg=$(center_message "Do you want to view the detailed validation log?\n\nThis will show all command outputs and detailed information.")
+  
+  if whiptail_yesno "View Detailed Log" "${view_detail_msg}"; then
+    # 5) Show full validation log in detail using less
+    show_paged "Full Configuration Validation Results (Detailed Log)" "${tmp_file}"
+  fi
+
+  # Clean up temporary summary file
+  rm -f "${summary_file}"
 }
 
 
@@ -5017,87 +6427,279 @@ menu_full_validation() {
 show_usage_help() {
 
   local msg
-  msg=$'────────────────────────────────────────────────────────────
-              ⭐ Stellar Cyber Open XDR Platform – KVM Installer Usage Guide ⭐
+  msg=$'═══════════════════════════════════════════════════════════════
+        ⭐ Stellar Cyber Open XDR Platform – KVM Installer Usage Guide ⭐
+═══════════════════════════════════════════════════════════════
+
+
+📌 **Prerequisites and Getting Started**
 ────────────────────────────────────────────────────────────
+• This installer requires *root privileges*.
+  Setup steps:
+    1) Switch to root: sudo -i
+    2) Create directory: mkdir -p /root/xdr-installer
+    3) Save this script to that directory
+    4) Make executable: chmod +x installer.sh
+    5) Execute: ./installer.sh
+
+• Navigation in this guide:
+  - Press **SPACEBAR** or **↓** to scroll to next page
+  - Press **↑** to scroll to previous page
+  - Press **q** to exit
 
 
-📌 **Required Information Before Use**
-- This installer requires *root privileges*.
-  Please follow the steps below to start:
-    1) Switch to root using sudo -i
-    2) Create /root/xdr-installer directory
-    3) Save this script to that directory and execute
-- Use **spacebar / ↓ arrow key** to move to next page in guide messages
-- Press **q** to exit
+═══════════════════════════════════════════════════════════════
+📋 **Main Menu Options Overview**
+═══════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Auto Execute All Steps                                    │
+│    → Automatically runs all steps from the next incomplete   │
+│    → Resumes from last completed step after reboot          │
+│    → Best for: Initial installation or continuing after      │
+│      reboot                                                  │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Select and Run Specific Step Only                        │
+│    → Run individual steps independently                      │
+│    → Best for: VM redeployment, image updates, or           │
+│      reconfiguring specific components                       │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Configuration                                             │
+│    → Configure installation parameters:                      │
+│      • DRY_RUN: Simulation mode (default: 1)                │
+│      • DP_VERSION: Data Processor version                    │
+│      • ACPS credentials (username, password, URL)             │
+│      • Hardware selections (NIC, disks)                     │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Full Configuration Validation                            │
+│    → Comprehensive system validation                         │
+│    → Checks: KVM, VMs, network, SR-IOV, storage            │
+│    → Displays errors and warnings with detailed logs         │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Script Usage Guide                                        │
+│    → Displays this help guide                                │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ 6. Exit                                                      │
+│    → Exit the installer                                      │
+└─────────────────────────────────────────────────────────────┘
 
 
-────────────────────────────────────────────
-① 🔰 When using immediately after Ubuntu 24.04 initial installation
-────────────────────────────────────────────
-- Selecting menu **1 (Full Auto Execution)** will  
-  automatically execute STEP 01 → STEP 02 → STEP 03 → … in order.
+═══════════════════════════════════════════════════════════════
+🔰 **Scenario 1: Fresh Installation (Ubuntu 16.04)**
+═══════════════════════════════════════════════════════════════
 
-- **STEP 03, STEP 05 require server reboot.**
-    → After reboot, run the script again and  
-       selecting menu 1 again will **automatically continue from the next step**.
+Step-by-Step Process:
+────────────────────────────────────────────────────────────
+1. Initial Setup:
+   • Configure menu 3: Set DRY_RUN=0, DP_VERSION, ACPS credentials
+   • Select menu 1 to start automatic installation
 
-────────────────────────────────────────────
-② 🔧 When some installation/environment is already configured
-────────────────────────────────────────────
-- Menu **3 (Configuration)** allows you to set:
-    • DRY_RUN (simulation mode) — default: DRY_RUN=1  
-    • DP_VERSION  
-    • ACPS authentication information, etc.
+2. Installation Flow:
+   STEP 01 → Hardware/NIC/Disk detection and selection
+   STEP 02 → HWE kernel installation
+   STEP 03 → NIC renaming, network configuration (ifupdown)
+            ⚠️  System will automatically reboot after STEP 03
 
-- After configuration, selecting menu **1** will  
-  automatically proceed from "the next step that is not yet completed".
+3. After First Reboot:
+   • Run script again
+   • Select menu 1 → Automatically continues from STEP 04
 
-────────────────────────────────────────────
-③ 🧩 When you want to run specific features or individual steps only
-────────────────────────────────────────────
-- Examples: DL / DA redeployment, new DP image download, etc.  
-- Menu **2 (Run Specific STEP)** allows you to run only the desired step independently.
+4. Continue Installation:
+   STEP 04 → KVM/Libvirt installation
+   STEP 05 → Kernel parameter tuning (IOMMU, KSM, Swap)
+            ⚠️  System will automatically reboot after STEP 05
 
-────────────────────────────────────────────
-④ 🔍 After full installation completion – Configuration validation step
-────────────────────────────────────────────
-- After completing all installation, running menu **4 (Full Configuration Validation)** will  
-  allow you to verify that the following items match the installation guide:
-    • KVM configuration  
-    • DL / DA VM deployment status  
-    • Network / SR-IOV / Storage configuration, etc.
+5. After Second Reboot:
+   • Run script again
+   • Select menu 1 → Automatically continues from STEP 06
 
-- If WARN messages appear during validation,  
-  you can re-apply necessary settings individually from menu **2**.
+6. Final Steps:
+   STEP 06 → SR-IOV drivers + NTPsec
+   STEP 07 → LVM storage setup
+   STEP 08 → Libvirt hooks + OOM recovery
+   STEP 09 → DP image download
+   STEP 10 → DL-master VM deployment
+   STEP 11 → DA-master VM deployment
+   STEP 12 → SR-IOV VF passthrough + CPU affinity
+   STEP 13 → DP Appliance CLI installation
 
-────────────────────────────────────────────
-                📦 Hardware and Software Requirements
-────────────────────────────────────────────
+7. Verification:
+   • Select menu 4 to validate complete installation
 
-● OS Requirements
-  - Ubuntu Server 24.04  
-  - Keep default options during installation (only add SSH activation)
-  - OS recommended on separate SSD of 1.7GB or more
-  - Default management network (MGT) configured with netplan
 
-● Server Requirements (Dell R650 or higher recommended)
-  - CPU: 2 × Intel Xeon Gold 6542Y  
-         (Hyper-threading enabled → total 96 vCPUs)
-  - Memory: 256GB or more
-  - Disk configuration:
-      • Ubuntu OS + DL/DA VM → 1.92TB SSD (SATA)  
-      • Elastic Data Lake → total 23TB  
-        (3.84TB SSD × 6, SATA)
-  - NIC configuration:
-      • Management/Data network: 1Gb or 10Gb  
-      • Cluster network: Intel X710 or E810 Dual-Port 10/25GbE SFP28
+═══════════════════════════════════════════════════════════════
+🔧 **Scenario 2: Partial Installation or Reconfiguration**
+═══════════════════════════════════════════════════════════════
 
-● BIOS Requirements
-  - Intel Virtualization Technology → Enabled  
-  - SR-IOV Global Enable → Enabled
+When to Use:
+────────────────────────────────────────────────────────────
+• Some steps already completed
+• Need to update specific components
+• Changing configuration (NIC, disk, version)
 
-────────────────────────────────────────────────────────────'
+Process:
+────────────────────────────────────────────────────────────
+1. Review current state:
+   • Main menu shows last completed step
+   • Check menu 4 (validation) for current status
+
+2. Configure if needed:
+   • Menu 3: Update DRY_RUN, DP_VERSION, or credentials
+
+3. Continue or re-run:
+   • Menu 1: Auto-continue from next incomplete step
+   • Menu 2: Run specific steps that need updating
+
+
+═══════════════════════════════════════════════════════════════
+🧩 **Scenario 3: Specific Operations**
+═══════════════════════════════════════════════════════════════
+
+Common Use Cases:
+────────────────────────────────────────────────────────────
+• DL/DA VM Redeployment:
+  → Menu 2 → STEP 10 (DL-master) or STEP 11 (DA-master)
+  → Configure vCPU, memory, disk size as needed
+
+• Update DP Version:
+  → Menu 2 → STEP 09 (Download DP image)
+  → Old version files are automatically cleaned up
+
+• Network Configuration Change:
+  → Menu 2 → STEP 01 (Hardware selection) → STEP 03 (Network)
+  → STEP 12 (SR-IOV) if cluster NIC changed
+
+• Reconfigure Storage:
+  → Menu 2 → STEP 07 (LVM storage)
+  → Note: Existing data may be affected
+
+
+═══════════════════════════════════════════════════════════════
+🔍 **Scenario 4: Validation and Troubleshooting**
+═══════════════════════════════════════════════════════════════
+
+Full System Validation:
+────────────────────────────────────────────────────────────
+• Select menu 4 (Full Configuration Validation)
+
+Validation Checks:
+────────────────────────────────────────────────────────────
+✓ KVM/Libvirt installation and service status
+✓ DL/DA VM deployment and running status
+✓ Network configuration (NIC naming, IPs, routing)
+✓ SR-IOV configuration (PF/VF status, passthrough)
+✓ Storage configuration (LVM volumes, mount points)
+✓ Service status (libvirtd, ntpsec)
+
+Understanding Results:
+────────────────────────────────────────────────────────────
+• ✅ Green checkmarks: Configuration is correct
+• ⚠️  Yellow warnings: Review recommended, may need attention
+• ❌ Red errors: Must be fixed before proceeding
+
+Fixing Issues:
+────────────────────────────────────────────────────────────
+• Review detailed log (option available after validation)
+• Identify which step needs to be re-run
+• Menu 2 → Select the specific step to fix
+• Re-run validation after fixes
+
+
+═══════════════════════════════════════════════════════════════
+📦 **Hardware and Software Requirements**
+═══════════════════════════════════════════════════════════════
+
+Operating System:
+────────────────────────────────────────────────────────────
+• Ubuntu Server 24.04 LTS
+• Installation: Keep default options (add SSH only)
+• OS disk: Separate SSD, 1.7GB+ recommended
+• Network: Default management network (MGT) via netplan
+           (Will be converted to ifupdown during installation)
+
+Server Hardware (Dell R650 or higher recommended):
+────────────────────────────────────────────────────────────
+• CPU:
+  - 2 × Intel Xeon Gold 6542Y
+  - Hyper-threading enabled → Total 96 vCPUs
+
+• Memory:
+  - 256GB or more
+
+• Disk Configuration:
+  - Ubuntu OS + DL/DA VMs: 1.92TB SSD (SATA)
+  - Elastic Data Lake: Total 23TB (3.84TB SSD × 6, SATA)
+
+• Network Interfaces:
+  - Management/Data: 1Gb or 10Gb
+  - Cluster: Intel X710 or E810 Dual-Port 10/25GbE SFP28
+
+BIOS Settings (Required):
+────────────────────────────────────────────────────────────
+• Intel Virtualization Technology → Enabled
+• SR-IOV Global Enable → Enabled
+
+
+═══════════════════════════════════════════════════════════════
+⚠️  **Important Notes and Troubleshooting**
+═══════════════════════════════════════════════════════════════
+
+Reboot Requirements:
+────────────────────────────────────────────────────────────
+• STEP 03 and STEP 05 require system reboot
+• After reboot, script automatically resumes from next step
+• Do not skip reboots - kernel and network changes require it
+
+DRY_RUN Mode:
+────────────────────────────────────────────────────────────
+• Default: DRY_RUN=1 (simulation mode)
+• Commands are logged but not executed
+• Set DRY_RUN=0 in menu 3 for actual installation
+• Always test with DRY_RUN=1 first
+
+Disk Space Management:
+────────────────────────────────────────────────────────────
+• STEP 09: Old version files are automatically deleted
+• STEP 10/11: Existing VM directories are cleaned up
+• Monitor disk space: df -h /stellar
+• If space issues occur, manually clean /stellar/dl/images/
+
+Network Configuration Changes:
+────────────────────────────────────────────────────────────
+• Changing cluster NIC requires: STEP 01 → STEP 03 → STEP 12
+• Network changes take effect after STEP 03 reboot
+• Verify with: ip addr show, virsh net-list
+
+Log Files:
+────────────────────────────────────────────────────────────
+• Main log: /var/log/xdr-installer.log
+• Step logs: Displayed during each step execution
+• Validation logs: Available in menu 4 detailed view
+
+
+═══════════════════════════════════════════════════════════════
+💡 **Tips for Success**
+═══════════════════════════════════════════════════════════════
+
+• Always start with DRY_RUN=1 to preview changes
+• Review validation results (menu 4) before final deployment
+• Keep installation guide document handy for reference
+• Check hardware compatibility before starting
+• Ensure BIOS settings are correct (virtualization, SR-IOV)
+• Monitor disk space throughout installation
+• Save configuration after menu 3 changes
+
+═══════════════════════════════════════════════════════════════'
 
   # Save content to temporary file and display with show_textbox
   local tmp_help_file="/tmp/xdr_dp_usage_help_$(date '+%Y%m%d-%H%M%S').txt"
@@ -5111,16 +6713,46 @@ menu_select_step_and_run() {
   local menu_items=()
   local i
   for ((i=0; i<NUM_STEPS; i++)); do
-    menu_items+=("$i" "${STEP_NAMES[$i]}")
+    # Use STEP_IDS as menu tags instead of numeric indices
+    menu_items+=("${STEP_IDS[$i]}" "${STEP_NAMES[$i]}")
   done
+
+  # Calculate menu size dynamically based on number of steps
+  local menu_dims
+  menu_dims=$(calc_menu_size "${NUM_STEPS}" 80 10)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+  # Center-align the menu message based on terminal height
+  local centered_msg
+  centered_msg=$(center_menu_message "Select step to execute:\n" "${menu_height}")
 
   local choice
   choice=$(whiptail --title "XDR Installer - Select Step to Run" \
-                    --menu "Select step to execute:" 20 80 10 \
+                    --menu "${centered_msg}" \
+                    "${menu_height}" "${menu_width}" "${menu_list_height}" \
                     "${menu_items[@]}" \
-                    3>&1 1>&2 2>&3) || return 0
+                    3>&1 1>&2 2>&3) || {
+    # ESC or Cancel pressed - return to main menu
+    return 0
+  }
+  
+  # Additional check: if choice is empty, also return
+  if [[ -z "${choice}" ]]; then
+    return 0
+  fi
 
-  run_step "${choice}"
+  # Find the index of the selected step_id
+  local idx
+  for ((idx=0; idx<NUM_STEPS; idx++)); do
+    if [[ "${STEP_IDS[$idx]}" == "${choice}" ]]; then
+      run_step "${idx}"
+      return
+    fi
+  done
+  
+  log "ERROR: Selected step_id '${choice}' not found in STEP_IDS"
+  return 1
 }
 
 menu_auto_continue_from_state() {
@@ -5128,15 +6760,29 @@ menu_auto_continue_from_state() {
   next_idx=$(get_next_step_index)
 
   if (( next_idx >= NUM_STEPS )); then
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 10 70)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    
     whiptail --title "XDR Installer" \
-             --msgbox "All steps are already completed.\n\nSTATE_FILE: ${STATE_FILE}" 10 70
+             --msgbox "All steps are already completed.\n\nSTATE_FILE: ${STATE_FILE}" \
+             "${dialog_height}" "${dialog_width}"
     return 0
   fi
 
   local next_step_name="${STEP_NAMES[$next_idx]}"
 
+  # Calculate dialog size dynamically for yesno
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 15 70)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+
   if ! whiptail --title "XDR Installer - Auto Continue" \
-                --yesno "From current state, the next step is:\n\n${next_step_name}\n\nExecute from this step sequentially?" 15 70
+                --yesno "From current state, the next step is:\n\n${next_step_name}\n\nExecute from this step sequentially?" \
+                "${dialog_height}" "${dialog_width}"
   then
     # No / Cancel → cancel auto continue, return to main menu (not an error)
     log "User canceled auto continue."
@@ -5146,8 +6792,15 @@ menu_auto_continue_from_state() {
   local i
   for ((i=next_idx; i<NUM_STEPS; i++)); do
     if ! run_step "$i"; then
+      # Calculate dialog size dynamically
+      local dialog_dims
+      dialog_dims=$(calc_dialog_size 10 70)
+      local dialog_height dialog_width
+      read -r dialog_height dialog_width <<< "${dialog_dims}"
+      
       whiptail --title "XDR Installer" \
-               --msgbox "STEP execution stopped.\n\nPlease check the log (${LOG_FILE}) for details." 10 70
+               --msgbox "STEP execution stopped.\n\nPlease check the log (${LOG_FILE}) for details." \
+               "${dialog_height}" "${dialog_width}"
       break
     fi
   done
@@ -5168,16 +6821,40 @@ main_menu() {
 
     local choice
 
+    # Calculate menu size dynamically (6 menu items)
+    local menu_dims
+    menu_dims=$(calc_menu_size 6 90 8)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Create message content
+    local msg_content="${status_msg}\n\nDRY_RUN=${DRY_RUN}, DP_VERSION=${DP_VERSION}, ACPS_BASE_URL=${ACPS_BASE_URL}\nSTATE_FILE=${STATE_FILE}\n"
+    
+    # Center-align the menu message based on terminal height
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+
+        # Run whiptail and capture both output and exit code
+        # Important: Don't use command substitution in a way that loses exit code
         choice=$(whiptail --title "XDR Installer Main Menu" \
-          --menu "${status_msg}\n\nDRY_RUN=${DRY_RUN}, DP_VERSION=${DP_VERSION}, ACPS_BASE_URL=${ACPS_BASE_URL}\nSTATE_FILE=${STATE_FILE}" \
-          20 90 10 \
+          --menu "${centered_msg}" \
+          "${menu_height}" "${menu_width}" "${menu_list_height}" \
           "1" "Auto execute all steps (continue from next step based on current state)" \
           "2" "Select and run specific step only" \
           "3" "Configuration (DRY_RUN, DP_VERSION, etc.)" \
           "4" "Full configuration validation" \
           "5" "Script usage guide" \
           "6" "Exit" \
-		  3>&1 1>&2 2>&3) || choice="6"
+		  3>&1 1>&2 2>&3) || {
+          # ESC or Cancel pressed - exit code is non-zero
+          # Continue loop instead of exiting
+          continue
+        }
+        
+        # Additional check: if choice is empty, also continue
+        if [[ -z "${choice}" ]]; then
+          continue
+        fi
           
 
 
@@ -5201,6 +6878,8 @@ main_menu() {
             exit 0
             ;;
           *)
+            # Unknown choice - continue loop
+            continue
             ;;
         esac
 

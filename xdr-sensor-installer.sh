@@ -65,20 +65,259 @@ STEP_IDS=(
 
 # STEP Names (descriptions displayed in UI)
 STEP_NAMES=(
-  "01. Hardware / NIC / CPU / Memory / SPAN NIC Selection"
-  "02. HWE Kernel Installation"
-  "03. NIC Name/ifupdown Switch and Network Configuration"
-  "04. KVM / Libvirt Installation and Basic Configuration"
-  "05. Kernel Parameters / KSM / Swap Tuning"
-  "06. libvirt hooks Installation"
-  "07. Sensor LV Creation + Image/Script Download"
-  "08. Sensor VM Deployment"
-  "09. PCI Passthrough / CPU Affinity (Sensor)"
-  "10. Install DP Appliance CLI package"
+  "Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  "HWE Kernel Installation"
+  "NIC Name/ifupdown Switch and Network Configuration"
+  "KVM / Libvirt Installation and Basic Configuration"
+  "Kernel Parameters / KSM / Swap Tuning"
+  "libvirt hooks Installation"
+  "Sensor LV Creation + Image/Script Download"
+  "Sensor VM Deployment"
+  "PCI Passthrough / CPU Affinity (Sensor)"
+  "Install DP Appliance CLI package"
 )
 
 NUM_STEPS=${#STEP_IDS[@]}
 
+
+# Calculate whiptail menu dimensions dynamically
+calc_menu_size() {
+  local item_count="$1"  # Number of menu items
+  local min_width="${2:-80}"  # Minimum width (default 80)
+  local min_height="${3:-10}"  # Minimum menu height (default 10)
+  
+  local HEIGHT WIDTH MENU_HEIGHT
+  
+  # Get terminal size
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+    WIDTH=$(tput cols)
+  else
+    HEIGHT=25
+    WIDTH=100
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  [ -z "${WIDTH}" ] && WIDTH=100
+  
+  # Calculate dialog height (leave space for title, message, buttons)
+  # Title: ~1 line, Message: ~2-3 lines, Buttons: ~2 lines, Padding: ~2 lines
+  local dialog_height=$((HEIGHT - 8))
+  [ "${dialog_height}" -lt 15 ] && dialog_height=15
+  
+  # Calculate menu height (number of items + some padding)
+  MENU_HEIGHT=$((item_count + 2))
+  [ "${MENU_HEIGHT}" -lt "${min_height}" ] && MENU_HEIGHT="${min_height}"
+  # Don't exceed dialog height minus message/button space
+  local max_menu_height=$((dialog_height - 6))
+  [ "${MENU_HEIGHT}" -gt "${max_menu_height}" ] && MENU_HEIGHT="${max_menu_height}"
+  
+  # Calculate dialog width (use most of terminal width, but respect minimum)
+  local dialog_width=$((WIDTH - 10))
+  [ "${dialog_width}" -lt "${min_width}" ] && dialog_width="${min_width}"
+  # Don't exceed terminal width too much
+  [ "${dialog_width}" -gt 120 ] && dialog_width=120
+  
+  echo "${dialog_height} ${dialog_width} ${MENU_HEIGHT}"
+}
+
+# Calculate whiptail dialog dimensions for simple dialogs (msgbox, yesno, inputbox, etc.)
+calc_dialog_size() {
+  local min_height="${1:-10}"  # Minimum height
+  local min_width="${2:-70}"   # Minimum width
+  
+  local HEIGHT WIDTH
+  
+  # Get terminal size
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+    WIDTH=$(tput cols)
+  else
+    HEIGHT=25
+    WIDTH=100
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  [ -z "${WIDTH}" ] && WIDTH=100
+  
+  # Calculate dialog height - use more of terminal height for better centering
+  # Reserve minimal space for title/buttons to allow message to be more centered
+  local dialog_height=$((HEIGHT - 4))
+  [ "${dialog_height}" -lt "${min_height}" ] && dialog_height="${min_height}"
+  # Don't limit max height too much - allow larger dialogs for better centering
+  [ "${dialog_height}" -gt 35 ] && dialog_height=35  # Increased max reasonable height
+  
+  # Calculate dialog width (use most of terminal width, but respect minimum)
+  local dialog_width=$((WIDTH - 6))
+  [ "${dialog_width}" -lt "${min_width}" ] && dialog_width="${min_width}"
+  [ "${dialog_width}" -gt 100 ] && dialog_width=100  # Max reasonable width
+  
+  echo "${dialog_height} ${dialog_width}"
+}
+
+# Center-align message text by adding empty lines
+center_message() {
+  local msg="$1"
+  echo "\n\n${msg}\n"
+}
+
+# Center-align menu by calculating proper spacing based on terminal height
+center_menu_message() {
+  local message="$1"
+  local menu_height="$2"  # Height of the menu dialog
+  
+  local HEIGHT
+  if command -v tput >/dev/null 2>&1; then
+    HEIGHT=$(tput lines)
+  else
+    HEIGHT=25
+  fi
+  
+  [ -z "${HEIGHT}" ] && HEIGHT=25
+  
+  # Calculate how many empty lines to add at top to center the menu
+  # whiptail menu structure:
+  # - Title: 1 line
+  # - Message area: variable (our msg)
+  # - Menu list: menu_list_height lines
+  # - Buttons: 2 lines
+  # - Border: 2 lines (top + bottom)
+  # Total dialog height = menu_height (which includes all of the above)
+  
+  # We want to center the entire dialog box, not just the message
+  # Calculate top padding: (terminal_height - dialog_height) / 2
+  # But leave some margin (about 2-3 lines)
+  local margin=3
+  local available_height=$((HEIGHT - margin * 2))
+  
+  # Calculate top padding to center the dialog
+  local top_padding=0
+  if [[ "${available_height}" -gt "${menu_height}" ]]; then
+    top_padding=$(( (available_height - menu_height) / 2 ))
+    # Ensure we have at least some padding, but not too much
+    [[ "${top_padding}" -lt 2 ]] && top_padding=2
+    [[ "${top_padding}" -gt 15 ]] && top_padding=15
+  else
+    # If menu is larger than available space, use minimal padding
+    top_padding=2
+  fi
+  
+  # Build padding string with newlines
+  local padding=""
+  local i
+  for ((i=0; i<top_padding; i++)); do
+    padding+="\n"
+  done
+  
+  echo "${padding}${message}"
+}
+
+# Wrapper function for whiptail msgbox with dynamic sizing, centering, and ESC handling
+whiptail_msgbox() {
+  local title="$1"
+  local message="$2"
+  local min_height="${3:-10}"
+  local min_width="${4:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog (ESC key won't exit script - just returns)
+  whiptail --title "${title}" --msgbox "${centered_msg}" "${dialog_height}" "${dialog_width}" || true
+}
+
+# Wrapper function for whiptail yesno with dynamic sizing, centering, and ESC handling
+whiptail_yesno() {
+  local title="$1"
+  local message="$2"
+  local min_height="${3:-10}"
+  local min_width="${4:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and return exit code (ESC returns 1, but we handle it gracefully)
+  whiptail --title "${title}" --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+  local rc=$?
+  # Return 0 for ESC (don't exit script), 0 for Yes, 1 for No
+  return ${rc}
+}
+
+# Wrapper function for whiptail inputbox with dynamic sizing, centering, and ESC handling
+whiptail_inputbox() {
+  local title="$1"
+  local message="$2"
+  local default_value="${3:-}"
+  local min_height="${4:-10}"
+  local min_width="${5:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and capture output
+  local result
+  result=$(whiptail --title "${title}" --inputbox "${centered_msg}" "${dialog_height}" "${dialog_width}" "${default_value}" 3>&1 1>&2 2>&3)
+  local rc=$?
+  # Return empty string for ESC, actual value otherwise
+  if [[ ${rc} -ne 0 ]]; then
+    echo ""
+    return 1
+  fi
+  echo "${result}"
+  return 0
+}
+
+# Wrapper function for whiptail passwordbox with dynamic sizing, centering, and ESC handling
+whiptail_passwordbox() {
+  local title="$1"
+  local message="$2"
+  local default_value="${3:-}"
+  local min_height="${4:-10}"
+  local min_width="${5:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and capture output
+  local result
+  result=$(whiptail --title "${title}" --passwordbox "${centered_msg}" "${dialog_height}" "${dialog_width}" "${default_value}" 3>&1 1>&2 2>&3)
+  local rc=$?
+  # Return empty string for ESC, actual value otherwise
+  if [[ ${rc} -ne 0 ]]; then
+    echo ""
+    return 1
+  fi
+  echo "${result}"
+  return 0
+}
 
 # Common whiptail textbox helper (scrollable)
 show_textbox() {
@@ -474,8 +713,7 @@ run_step() {
   local step_name="${STEP_NAMES[$idx]}"
 
   # Confirm STEP execution
-  if ! whiptail --title "XDR Installer - ${step_id}" \
-                --yesno "${step_name}\n\nDo you want to execute this step?" 12 70
+  if ! whiptail_yesno "XDR Installer - ${step_id}" "${step_name}\n\nDo you want to execute this step?"
   then
     # User cancellation is considered "normal flow" (not an error)
     log "User canceled execution of STEP ${step_id}."
@@ -825,13 +1063,13 @@ step_01_hw_detect() {
       
       # numeric format Verification
       if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
-        whiptail --title "Input Error" --msgbox "Please enter a valid number.\nInput value: ${lv_size_gb}" 8 50
+        whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
         continue
       fi
       
       # Minimum Size Verification (80GB)
       if [[ "${lv_size_gb}" -lt 80 ]]; then
-        whiptail --title "Size Insufficient" --msgbox "Minimum size must be at least 80GB.\nInput value: ${lv_size_gb}GB" 8 50
+        whiptail_msgbox "Size Insufficient" "Minimum size must be at least 80GB.\nInput value: ${lv_size_gb}GB"
         continue
       fi
       
@@ -956,7 +1194,7 @@ step_01_hw_detect() {
     
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Configuration Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
+    whiptail_msgbox "Configuration Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
     return 1
   fi
 
@@ -1308,7 +1546,7 @@ step_03_nic_ifupdown() {
     return $?
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Network Mode Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
+    whiptail_msgbox "Network Mode Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
     return 1
   fi
 }
@@ -2581,7 +2819,7 @@ step_06_libvirt_hooks() {
     return $?
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail --title "Network Mode Error" --msgbox "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration." 12 70
+    whiptail_msgbox "Network Mode Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
     return 1
   fi
 }
@@ -3310,7 +3548,7 @@ step_07_sensor_download() {
     msg+="[Yes] Use this file (skip download)\n"
     msg+="[No] Use existing file or download"
     
-    if whiptail --title "STEP 07 - Reuse Local qcow2" --yesno "${msg}" 18 80; then
+    if whiptail_yesno "STEP 07 - Reuse Local qcow2" "${msg}"; then
       use_local_qcow=1
       log "[STEP 07] User chose to use local qcow2 file (${local_qcow})."
       
@@ -4097,7 +4335,7 @@ step_09_sensor_passthrough() {
     # 1. Sensor VM Exists Check
     ###########################################################################
     if ! virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
-        whiptail --title "STEP 09 - Sensor VM Not Found" --msgbox "Sensor VM (${SENSOR_VM}) does not exist.\n\nPlease complete STEP 08 (Sensor Deployment) first." 12 70
+        whiptail_msgbox "STEP 09 - Sensor VM Not Found" "Sensor VM (${SENSOR_VM}) does not exist.\n\nPlease complete STEP 08 (Sensor Deployment) first."
         log "[STEP 09] Sensor VM not found -> STEP Abort"
         return 1
     fi
@@ -4115,7 +4353,7 @@ step_09_sensor_passthrough() {
     else
         # Verify mount point exists and is mounted
         if ! mountpoint -q "${VM_STORAGE_BASE}" 2>/dev/null; then
-            whiptail --title "STEP 09 - Mount Error" --msgbox "${VM_STORAGE_BASE} is not mounted.\n\nPlease complete STEP 07 (sensor LV mount) first." 12 70
+            whiptail_msgbox "STEP 09 - Mount Error" "${VM_STORAGE_BASE} is not mounted.\n\nPlease complete STEP 07 (sensor LV mount) first."
             log "[STEP 09] ERROR: ${VM_STORAGE_BASE} not mounted -> STEP Abort"
             return 1
         fi
@@ -4148,7 +4386,7 @@ step_09_sensor_passthrough() {
         done < <(virsh dumpxml "${SENSOR_VM}" | awk -F"'" '/<source file=/{print $2}')
 
         if [[ "${missing}" -gt 0 ]]; then
-            whiptail --title "STEP 09 - File Missing" --msgbox "VM XML references ${missing} missing file(s).\n\nPlease re-run STEP 08 (Deployment) or check image file locations." 12 70
+            whiptail_msgbox "STEP 09 - File Missing" "VM XML references ${missing} missing file(s).\n\nPlease re-run STEP 08 (Deployment) or check image file locations."
             log "[STEP 09] ERROR: XML source file missing count=${missing}"
             return 1
         fi
@@ -4301,6 +4539,25 @@ step_10_install_dp_cli() {
         chmod 644 "${ERRLOG}" || true
     fi
 
+    # 0-1) Install required packages first (before download/extraction)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
+    if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] apt-get update -y"
+        log "[DRY-RUN] apt-get install -y python3-pip python3-venv wget curl unzip"
+    else
+        if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            return 1
+        fi
+        if ! apt-get install -y python3-pip python3-venv wget curl unzip >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            return 1
+        fi
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Required packages installed successfully"
+    fi
+
     # 1) Download dp_cli from GitHub
     local GITHUB_REPO="https://github.com/RickLee-kr/Stellar-appliance-cli"
     local DOWNLOAD_URL="${GITHUB_REPO}/archive/refs/heads/main.zip"
@@ -4346,15 +4603,10 @@ step_10_install_dp_cli() {
         fi
 
         echo "=== Extracting downloaded file ==="
-        # Extract zip file
-        if command -v unzip >/dev/null 2>&1; then
-            if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
-                rm -rf "${TEMP_DIR}" || true
-                return 1
-            fi
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: unzip is not available. Please install unzip package." | tee -a "${ERRLOG}"
+        # Extract zip file (unzip should already be installed)
+        if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         fi
@@ -4370,11 +4622,7 @@ step_10_install_dp_cli() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Successfully downloaded and extracted dp_cli from GitHub"
     fi
 
-    # 2) required packages
-    run_cmd "apt-get update -y"
-    run_cmd "apt-get install -y python3-pip python3-venv wget curl unzip"
-
-    # 3) venv Creation/ after dp-cli Installation
+    # 2) venv Creation/ after dp-cli Installation
     if [[ "${_DRY}" -eq 1 ]]; then
         log "[DRY-RUN] venv Creation: ${VENV_DIR}"
         log "[DRY-RUN] venv dp-cli Installation: ${pkg}"
@@ -4700,62 +4948,50 @@ menu_config() {
           new_dry_run=1
         fi
         save_config_var "DRY_RUN" "${new_dry_run}"
-        whiptail --title "Configuration Changed" --msgbox "DRY_RUN has been set to ${new_dry_run}." 8 60
+        whiptail_msgbox "Configuration Changed" "DRY_RUN has been set to ${new_dry_run}."
         ;;
       2)
         local new_version
         set +e
-        new_version=$(whiptail --title "Sensor Version Configuration" \
-                               --inputbox "Enter sensor version:" \
-                               8 60 "${SENSOR_VERSION}" \
-                               3>&1 1>&2 2>&3)
+        new_version=$(whiptail_inputbox "Sensor Version Configuration" "Enter sensor version:" "${SENSOR_VERSION}")
         local input_rc=$?
         set -e
         if [[ ${input_rc} -eq 0 && -n "${new_version}" ]]; then
           save_config_var "SENSOR_VERSION" "${new_version}"
-          whiptail --title "Configuration Changed" --msgbox "Sensor version has been set to ${new_version}." 8 60
+          whiptail_msgbox "Configuration Changed" "Sensor version has been set to ${new_version}."
         fi
         ;;
       3)
         local new_username
         set +e
-        new_username=$(whiptail --title "ACPS Username Configuration" \
-                                --inputbox "Enter ACPS username:" \
-                                8 60 "${ACPS_USERNAME:-}" \
-                               3>&1 1>&2 2>&3)
+        new_username=$(whiptail_inputbox "ACPS Username Configuration" "Enter ACPS username:" "${ACPS_USERNAME:-}")
         local input_rc=$?
         set -e
         if [[ ${input_rc} -eq 0 && -n "${new_username}" ]]; then
           save_config_var "ACPS_USERNAME" "${new_username}"
-          whiptail --title "Configuration Changed" --msgbox "ACPS username has been changed." 8 60
+          whiptail_msgbox "Configuration Changed" "ACPS username has been changed."
         fi
         ;;
       4)
         local new_password
         set +e
-        new_password=$(whiptail --title "ACPS Password Configuration" \
-                                --passwordbox "Enter ACPS password:" \
-                                8 60 \
-                                3>&1 1>&2 2>&3)
+        new_password=$(whiptail_passwordbox "ACPS Password Configuration" "Enter ACPS password:" "")
         local input_rc=$?
         set -e
         if [[ ${input_rc} -eq 0 && -n "${new_password}" ]]; then
           save_config_var "ACPS_PASSWORD" "${new_password}"
-          whiptail --title "Configuration Changed" --msgbox "ACPS password has been changed." 8 60
+          whiptail_msgbox "Configuration Changed" "ACPS password has been changed."
         fi
         ;;
       5)
         local new_url
         set +e
-        new_url=$(whiptail --title "ACPS URL Configuration" \
-                           --inputbox "Enter ACPS URL:" \
-                           8 80 "${ACPS_BASE_URL}" \
-                           3>&1 1>&2 2>&3)
+        new_url=$(whiptail_inputbox "ACPS URL Configuration" "Enter ACPS URL:" "${ACPS_BASE_URL}")
         local input_rc=$?
         set -e
         if [[ ${input_rc} -eq 0 && -n "${new_url}" ]]; then
           save_config_var "ACPS_BASE_URL" "${new_url}"
-          whiptail --title "Configuration Changed" --msgbox "ACPS URL has been changed." 8 60
+          whiptail_msgbox "Configuration Changed" "ACPS URL has been changed."
         fi
         ;;
       6)
@@ -4766,7 +5002,7 @@ menu_config() {
           new_reboot=1
         fi
         save_config_var "ENABLE_AUTO_REBOOT" "${new_reboot}"
-        whiptail --title "Configuration Changed" --msgbox "Auto Reboot has been set to ${new_reboot}." 8 60
+        whiptail_msgbox "Configuration Changed" "Auto Reboot has been set to ${new_reboot}."
         ;;
       7)
         local new_mode
@@ -4781,7 +5017,7 @@ menu_config() {
         set -e
         if [[ ${menu_rc} -eq 0 && -n "${new_mode}" ]]; then
           save_config_var "SPAN_ATTACH_MODE" "${new_mode}"
-          whiptail --title "Configuration Changed" --msgbox "SPAN attachment mode has been set to ${new_mode}." 8 60
+          whiptail_msgbox "Configuration Changed" "SPAN attachment mode has been set to ${new_mode}."
         fi
         ;;
       8)
@@ -4797,7 +5033,7 @@ menu_config() {
         set -e
         if [[ ${menu_rc} -eq 0 && -n "${new_net_mode}" ]]; then
           save_config_var "SENSOR_NET_MODE" "${new_net_mode}"
-          whiptail --title "Configuration Changed" --msgbox "Sensor Network Mode has been set to ${new_net_mode}.\n\nTo apply this change, please re-run STEP 01." 12 70
+          whiptail_msgbox "Configuration Changed" "Sensor Network Mode has been set to ${new_net_mode}.\n\nTo apply this change, please re-run STEP 01."
         fi
         ;;
       9)
@@ -4832,36 +5068,31 @@ menu_select_step_and_run() {
         fi
       fi
 
-      menu_items+=("${i}" "${step_name} [${status}]")
+      # Use STEP_IDS as menu tags instead of numeric indices
+      menu_items+=("${step_id}" "${step_name} [${status}]")
     done
     menu_items+=("back" "Return to main menu")
 
-    # Calculate menu height dynamically
-    # whiptail --menu format: height width menu-height
-    # menu-height should be number of menu items (NUM_STEPS + 1 for back)
+    # Calculate menu size dynamically
     local menu_item_count=$((NUM_STEPS + 1))
-    # menu_height: total dialog height, menu_item_count: scrollable menu items
-    local menu_height=22
-    local menu_width=100
-    # Limit menu_item_count to reasonable value (whiptail can handle scrolling)
-    [[ ${menu_item_count} -gt 20 ]] && menu_item_count=20
+    local menu_dims
+    menu_dims=$(calc_menu_size "${menu_item_count}" 100 10)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Center-align the menu message
+    local centered_msg
+    centered_msg=$(center_menu_message "Please select step to execute:" "${menu_height}")
 
     local choice
-    # Disable set -e temporarily to handle whiptail errors gracefully
-    set +e
     choice=$(whiptail --title "XDR Installer - step Selection" \
-                      --menu "Please select step to execute:" \
-                      ${menu_height} ${menu_width} ${menu_item_count} \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "${menu_items[@]}" \
-                      3>&1 1>&2 2>&3)
-    local whiptail_rc=$?
-    set -e
-
-    # Check if whiptail was cancelled or failed
-    if [[ ${whiptail_rc} -ne 0 ]]; then
-      # User cancelled or ESC pressed - return to main menu
+                      3>&1 1>&2 2>&3) || {
+      # ESC or Cancel pressed - return to main menu
       return 0
-    fi
+    }
 
     # Handle empty choice (should not happen, but safety check)
     if [[ -z "${choice}" ]]; then
@@ -4870,12 +5101,25 @@ menu_select_step_and_run() {
 
     if [[ "${choice}" == "back" ]]; then
       break
-    elif [[ "${choice}" =~ ^[0-9]+$ && ${choice} -ge 0 && ${choice} -lt ${NUM_STEPS} ]]; then
-      # Disable set -e temporarily to handle run_step errors gracefully
-      set +e
-      run_step "${choice}"
-      local step_rc=$?
-      set -e
+    else
+      # Find the index of the selected step_id
+      local idx
+      local found=0
+      for ((idx=0; idx<NUM_STEPS; idx++)); do
+        if [[ "${STEP_IDS[$idx]}" == "${choice}" ]]; then
+          found=1
+          # Disable set -e temporarily to handle run_step errors gracefully
+          set +e
+          run_step "${idx}"
+          local step_rc=$?
+          set -e
+          break
+        fi
+      done
+      if [[ ${found} -eq 0 ]]; then
+        log "ERROR: Selected step_id '${choice}' not found in STEP_IDS"
+        continue
+      fi
       # run_step always returns 0, but check anyway for safety
       if [[ ${step_rc} -ne 0 ]]; then
         log "WARNING: run_step returned non-zero exit code: ${step_rc}"
@@ -4898,22 +5142,19 @@ menu_auto_continue_from_state() {
   next_idx=$(get_next_step_index)
 
   if [[ ${next_idx} -ge ${NUM_STEPS} ]]; then
-    whiptail --title "XDR Installer - Auto Execution" \
-             --msgbox "All steps completed!" 8 60
+    whiptail_msgbox "XDR Installer - Auto Execution" "All steps completed!"
     return
   fi
 
   local next_step_name="${STEP_NAMES[$next_idx]}"
-  if ! whiptail --title "XDR Installer - Auto Execution" \
-                --yesno "Do you want to automatically execute from the next step?\n\nStarting step: ${next_step_name}\n\nExecution will stop if any step fails." 12 80
+  if ! whiptail_yesno "XDR Installer - Auto Execution" "Do you want to automatically execute from the next step?\n\nStarting step: ${next_step_name}\n\nExecution will stop if any step fails."
   then
     return
   fi
 
   for ((i=next_idx; i<NUM_STEPS; i++)); do
     if ! run_step "${i}"; then
-      whiptail --title "Auto Execution Abort" \
-               --msgbox "STEP ${STEP_IDS[$i]} execution failed.\n\nAuto execution aborted." 10 70
+      whiptail_msgbox "Auto Execution Abort" "STEP ${STEP_IDS[$i]} execution failed.\n\nAuto execution aborted."
       break
     fi
   done
@@ -4937,9 +5178,24 @@ main_menu() {
     fi
 
     local choice
+
+    # Calculate menu size dynamically (7 menu items)
+    local menu_dims
+    menu_dims=$(calc_menu_size 7 90 8)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Create message content
+    local msg_content="${status_msg}\n\nDRY_RUN=${DRY_RUN}, STATE_FILE=${STATE_FILE}\n"
+    
+    # Center-align the menu message based on terminal height
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+
+    # Run whiptail and capture both output and exit code
     choice=$(whiptail --title "XDR Sensor Installer Main Menu" \
-                      --menu "${status_msg}\n\nDRY_RUN=${DRY_RUN}, STATE_FILE=${STATE_FILE}" \
-                      20 90 10 \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "1" "Auto execute all steps (continue from next step based on current state)" \
                       "2" "Select and run specific step only" \
                       "3" "Configuration (DRY_RUN, etc.)" \
@@ -4947,7 +5203,16 @@ main_menu() {
                       "5" "Script usage guide" \
                       "6" "View log" \
                       "7" "Exit" \
-                      3>&1 1>&2 2>&3) || continue
+                      3>&1 1>&2 2>&3) || {
+      # ESC or Cancel pressed - exit code is non-zero
+      # Continue loop instead of exiting
+      continue
+    }
+    
+    # Additional check: if choice is empty, also continue
+    if [[ -z "${choice}" ]]; then
+      continue
+    fi
 
     case "${choice}" in
       1)
@@ -4969,11 +5234,11 @@ main_menu() {
         if [[ -f "${LOG_FILE}" ]]; then
           show_textbox "XDR Installer Log" "${LOG_FILE}"
         else
-          whiptail --title "Log Not Found" --msgbox "Log file does not exist yet." 8 60
+          whiptail_msgbox "Log Not Found" "Log file does not exist yet."
         fi
         ;;
       7)
-        if whiptail --title "Exit Confirmation" --yesno "Do you want to exit XDR Installer?" 8 60; then
+        if whiptail_yesno "Exit Confirmation" "Do you want to exit XDR Installer?"; then
           log "XDR Installer exit"
           exit 0
         fi
@@ -5144,86 +5409,308 @@ menu_full_validation() {
 
 show_usage_help() {
   local msg
-  msg=$'────────────────────────────────────────────────────────────
-  ⭐ Stellar Cyber XDR Sensor – KVM Installer Usage Guide ⭐
-  ────────────────────────────────────────────────────────────
+  msg=$'═══════════════════════════════════════════════════════════════
+        ⭐ Stellar Cyber XDR Sensor – KVM Installer Usage Guide ⭐
+═══════════════════════════════════════════════════════════════
 
 
-  📌 **Required Information Before Use**
-  - This installer requires *root* privileges.
-    Please start in the following order:
-      1) Switch to root using sudo -i
-      2) Create directory with: mkdir -p /root/xdr-installer
-      3) Save this script to that directory and execute
-  - Use **Space / ↓** to move to next page
-  - Press **q** to quit
+📌 **Prerequisites and Getting Started**
+────────────────────────────────────────────────────────────
+• This installer requires *root privileges*.
+  Setup steps:
+    1) Switch to root: sudo -i
+    2) Create directory: mkdir -p /root/xdr-installer
+    3) Save this script to that directory
+    4) Make executable: chmod +x installer.sh
+    5) Execute: ./installer.sh
+
+• Navigation in this guide:
+  - Press **SPACEBAR** or **↓** to scroll to next page
+  - Press **↑** to scroll to previous page
+  - Press **q** to exit
 
 
-  ────────────────────────────────────────────
-  ① 🔰 When using immediately after Ubuntu installation (Initial installation)
-  ────────────────────────────────────────────
-  - Select menu **1 (Auto-execute all steps)**  
-    STEP 01 -> STEP 02 -> STEP 03 -> … will be executed automatically.
+═══════════════════════════════════════════════════════════════
+📋 **Main Menu Options Overview**
+═══════════════════════════════════════════════════════════════
 
-  - **After STEP 03 (Network) and STEP 05 (kernel tuning) complete, the system will automatically reboot.**
-      -> After reboot, execute the script again  
-         and select menu 1 again to **automatically continue from the next step**.
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Auto Execute All Steps                                    │
+│    → Automatically runs all steps from the next incomplete   │
+│    → Resumes from last completed step after reboot            │
+│    → Best for: Initial installation or continuing after      │
+│      reboot                                                  │
+└─────────────────────────────────────────────────────────────┘
 
-  ────────────────────────────────────────────
-  ② 🔧 When some installation/environment is already configured
-  ────────────────────────────────────────────
-  - In menu **3 (Environment Configuration)**, you can configure the following:
-      • DRY_RUN (simulation mode) — Default: 1 (for testing)  
-      • SENSOR_VERSION (sensor version to install)
-      • SENSOR_NET_MODE (bridge or nat)
-      • SPAN_ATTACH_MODE (pci or bridge)
-      • ACPS authentication information 
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Select and Run Specific Step Only                         │
+│    → Run individual steps independently                      │
+│    → Best for: Sensor VM redeployment, network changes,     │
+│      or image updates                                        │
+└─────────────────────────────────────────────────────────────┘
 
-  - After configuration, select menu **1**  
-    to automatically proceed from "the next step that has not been completed".
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Configuration                                             │
+│    → Configure installation parameters:                      │
+│      • DRY_RUN: Simulation mode (default: 1)                 │
+│      • SENSOR_VERSION: Sensor version to install             │
+│      • SENSOR_NET_MODE: bridge or nat                            │
+│      • SPAN_ATTACH_MODE: pci or bridge                        │
+│      • ACPS credentials (username, password, URL)           │
+└─────────────────────────────────────────────────────────────┘
 
-  ────────────────────────────────────────────
-  ③ 🧩 When you want to execute only specific features or individual steps
-  ────────────────────────────────────────────
-  - Example: Sensor VM (mds) redeployment, network configuration change, image re-download, etc.  
-  - In menu **2 (Select and execute specific steps only)**, you can execute individual steps separately.
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Full Configuration Validation                            │
+│    → Comprehensive system validation                         │
+│    → Checks: KVM, Sensor VM, network, SPAN, storage         │
+│    → Displays errors and warnings with detailed logs         │
+└─────────────────────────────────────────────────────────────┘
 
-  ────────────────────────────────────────────
-  ④ 🔍 After all installation is complete – Configuration verification step
-  ────────────────────────────────────────────
-  - After installation is complete, execute menu **4 (Full configuration verification)**  
-    to check if the following items match the installation guide.
-      • KVM / Libvirt Status
-      • Sensor VM (mds) Deployment and Execution Status
-      • Network (ifupdown conversion) / SPAN PCI Passthrough connection Status
-      • LVM storage Configuration (ubuntu-vg)
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Script Usage Guide                                        │
+│    → Displays this help guide                                │
+└─────────────────────────────────────────────────────────────┘
 
-  - If WARN messages appear during verification  
-    you can apply the required configuration again individually in menu **2**.
+┌─────────────────────────────────────────────────────────────┐
+│ 6. View Log                                                   │
+│    → View installation log file                              │
+└─────────────────────────────────────────────────────────────┘
 
-  ────────────────────────────────────────────
-                  📦 Hardware and Software Requirements
-  ────────────────────────────────────────────
+┌─────────────────────────────────────────────────────────────┐
+│ 7. Exit                                                       │
+│    → Exit the installer                                       │
+└─────────────────────────────────────────────────────────────┘
 
-  ● OS Requirements
-    - Ubuntu Server 24.04 LTS
-    - Keep default options during initial installation (SSH enabled)
-    - **Note:** When executing the script, Netplan will be disabled and switched to **ifupdown**.
 
-  ● Server Recommended Specifications (for physical servers)
-    - CPU: 12 vCPU or more (automatically calculated based on total system cores)
-    - Memory: 16GB or more (automatically calculated based on total system memory)
-    - Disk: 
-        • For OS and Sensor: use **ubuntu-vg** volume group
-        • Minimum free space: 100GB or more recommended (minimum 80GB)
-    - NIC Configuration:
-        • Management (Host/MGT): 1GbE or more (for SSH access)
-        • SPAN (Data): for mirroring traffic reception (PCI Passthrough recommended)
+═══════════════════════════════════════════════════════════════
+🔰 **Scenario 1: Fresh Installation (Ubuntu 24.04)**
+═══════════════════════════════════════════════════════════════
 
-  ● BIOS Requirements
-    - Intel VT-d / AMD-Vi (IOMMU) -> **Enabled** (required)
-    - Virtualization Technology (VMX/SVM) -> **Enabled**
-────────────────────────────────────────────'
+Step-by-Step Process:
+────────────────────────────────────────────────────────────
+1. Initial Setup:
+   • Configure menu 3: Set DRY_RUN=0, SENSOR_VERSION, network mode,
+     SPAN attachment mode, ACPS credentials
+   • Select menu 1 to start automatic installation
+
+2. Installation Flow:
+   STEP 01 → Hardware/NIC/CPU/Memory/SPAN NIC selection
+   STEP 02 → HWE kernel installation
+   STEP 03 → NIC renaming, network configuration (ifupdown)
+            ⚠️  System will automatically reboot after STEP 03
+
+3. After First Reboot:
+   • Run script again
+   • Select menu 1 → Automatically continues from STEP 04
+
+4. Continue Installation:
+   STEP 04 → KVM/Libvirt installation
+   STEP 05 → Kernel parameter tuning (IOMMU, KSM, Swap)
+            ⚠️  System will automatically reboot after STEP 05
+
+5. After Second Reboot:
+   • Run script again
+   • Select menu 1 → Automatically continues from STEP 06
+
+6. Final Steps:
+   STEP 06 → Libvirt hooks installation
+   STEP 07 → Sensor LV creation + image/script download
+   STEP 08 → Sensor VM (mds) deployment
+   STEP 09 → PCI passthrough + CPU affinity (SPAN NIC)
+   STEP 10 → DP Appliance CLI installation
+
+7. Verification:
+   • Select menu 4 to validate complete installation
+
+
+═══════════════════════════════════════════════════════════════
+🔧 **Scenario 2: Partial Installation or Reconfiguration**
+═══════════════════════════════════════════════════════════════
+
+When to Use:
+────────────────────────────────────────────────────────────
+• Some steps already completed
+• Need to update specific components
+• Changing configuration (NIC, network mode, SPAN mode)
+
+Process:
+────────────────────────────────────────────────────────────
+1. Review current state:
+   • Main menu shows last completed step
+   • Check menu 4 (validation) for current status
+
+2. Configure if needed:
+   • Menu 3: Update DRY_RUN, SENSOR_VERSION, network mode,
+     SPAN attachment mode, or ACPS credentials
+
+3. Continue or re-run:
+   • Menu 1: Auto-continue from next incomplete step
+   • Menu 2: Run specific steps that need updating
+
+
+═══════════════════════════════════════════════════════════════
+🧩 **Scenario 3: Specific Operations**
+═══════════════════════════════════════════════════════════════
+
+Common Use Cases:
+────────────────────────────────────────────────────────────
+• Sensor VM Redeployment:
+  → Menu 2 → STEP 08 (Sensor VM deployment)
+  → VM resources (vCPU, memory) are automatically calculated
+
+• Update Sensor Image:
+  → Menu 2 → STEP 07 (Sensor LV + image download)
+  → New image will be downloaded and deployed
+
+• Network Configuration Change:
+  → Menu 2 → STEP 01 (Hardware selection) → STEP 03 (Network)
+  → Network mode changes require re-running from STEP 01
+
+• SPAN NIC Reconfiguration:
+  → Menu 2 → STEP 01 (SPAN NIC selection) → STEP 09 (PCI passthrough)
+  → SPAN attachment mode can be changed in menu 3
+
+• Change Network Mode (bridge/nat):
+  → Menu 3 → Update SENSOR_NET_MODE
+  → Menu 2 → STEP 01 → STEP 08 (to apply new network mode)
+
+
+═══════════════════════════════════════════════════════════════
+🔍 **Scenario 4: Validation and Troubleshooting**
+═══════════════════════════════════════════════════════════════
+
+Full System Validation:
+────────────────────────────────────────────────────────────
+• Select menu 4 (Full Configuration Validation)
+
+Validation Checks:
+────────────────────────────────────────────────────────────
+✓ KVM/Libvirt installation and service status
+✓ Sensor VM (mds) deployment and running status
+✓ Network configuration (ifupdown conversion, NIC naming)
+✓ SPAN PCI Passthrough connection status
+✓ LVM storage configuration (ubuntu-vg)
+✓ Service status (libvirtd)
+
+Understanding Results:
+────────────────────────────────────────────────────────────
+• ✅ Green checkmarks: Configuration is correct
+• ⚠️  Yellow warnings: Review recommended, may need attention
+• ❌ Red errors: Must be fixed before proceeding
+
+Fixing Issues:
+────────────────────────────────────────────────────────────
+• Review detailed log (option available after validation)
+• Identify which step needs to be re-run
+• Menu 2 → Select the specific step to fix
+• Re-run validation after fixes
+
+
+═══════════════════════════════════════════════════════════════
+📦 **Hardware and Software Requirements**
+═══════════════════════════════════════════════════════════════
+
+Operating System:
+────────────────────────────────────────────────────────────
+• Ubuntu Server 24.04 LTS
+• Installation: Keep default options (add SSH only)
+• Network: Netplan will be disabled and switched to ifupdown
+           during installation (STEP 03)
+
+Server Specifications (Physical Server Recommended):
+────────────────────────────────────────────────────────────
+• CPU:
+  - 12 vCPU or more
+  - Automatically calculated based on total system cores
+
+• Memory:
+  - 16GB or more
+  - Automatically calculated based on total system memory
+  - Sensor VM resources are auto-calculated from available resources
+
+• Disk:
+  - Use ubuntu-vg volume group for OS and Sensor
+  - Minimum free space: 100GB recommended (80GB minimum)
+  - Sensor LV is created automatically in STEP 07
+
+• Network Interfaces:
+  - Management (Host/MGT): 1GbE or more (for SSH access)
+  - SPAN (Data): For receiving mirroring traffic
+    • PCI Passthrough mode recommended for best performance
+    • Bridge mode available as alternative
+
+BIOS Settings (Required):
+────────────────────────────────────────────────────────────
+• Intel VT-d / AMD-Vi (IOMMU) → Enabled (required for PCI passthrough)
+• Virtualization Technology (VMX/SVM) → Enabled
+
+
+═══════════════════════════════════════════════════════════════
+⚠️  **Important Notes and Troubleshooting**
+═══════════════════════════════════════════════════════════════
+
+Reboot Requirements:
+────────────────────────────────────────────────────────────
+• STEP 03 and STEP 05 require system reboot
+• After reboot, script automatically resumes from next step
+• Do not skip reboots - kernel and network changes require it
+
+DRY_RUN Mode:
+────────────────────────────────────────────────────────────
+• Default: DRY_RUN=1 (simulation mode)
+• Commands are logged but not executed
+• Set DRY_RUN=0 in menu 3 for actual installation
+• Always test with DRY_RUN=1 first
+
+Network Mode Selection:
+────────────────────────────────────────────────────────────
+• SENSOR_NET_MODE: bridge (default) or nat
+  - Bridge: L2 bridge based (recommended for most cases)
+  - NAT: virbr0 NAT network based
+• Changes require re-running STEP 01 and STEP 08
+
+SPAN Attachment Mode:
+────────────────────────────────────────────────────────────
+• SPAN_ATTACH_MODE: pci (recommended) or bridge
+  - PCI: Direct PCI passthrough (best performance)
+  - Bridge: L2 bridge virtio NIC
+• PCI mode requires IOMMU enabled in BIOS
+• Changes require re-running STEP 01 and STEP 09
+
+Disk Space Management:
+────────────────────────────────────────────────────────────
+• Monitor disk space: df -h, vgs, lvs
+• Sensor LV is created in ubuntu-vg volume group
+• Ensure sufficient space in ubuntu-vg before STEP 07
+
+Network Configuration:
+────────────────────────────────────────────────────────────
+• Netplan is disabled and replaced with ifupdown in STEP 03
+• Network changes take effect after STEP 03 reboot
+• Verify with: ip addr show, virsh net-list
+
+Log Files:
+────────────────────────────────────────────────────────────
+• Main log: /var/log/xdr-installer.log
+• View logs: Menu 6 (View Log)
+• Step logs: Displayed during each step execution
+• Validation logs: Available in menu 4 detailed view
+
+
+═══════════════════════════════════════════════════════════════
+💡 **Tips for Success**
+═══════════════════════════════════════════════════════════════
+
+• Always start with DRY_RUN=1 to preview changes
+• Review validation results (menu 4) before final deployment
+• Choose appropriate network mode (bridge/nat) based on your network
+• PCI passthrough for SPAN provides best performance
+• Ensure IOMMU is enabled in BIOS for PCI passthrough
+• Monitor disk space in ubuntu-vg throughout installation
+• Save configuration after menu 3 changes
+• VM resources are auto-calculated - no manual configuration needed
+
+═══════════════════════════════════════════════════════════════'
 
   # Save content to temporary file and display with show_textbox
   local tmp_help_file="/tmp/xdr_sensor_usage_help_$(date '+%Y%m%d-%H%M%S').txt"

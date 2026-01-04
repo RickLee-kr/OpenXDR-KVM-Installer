@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# XDR Sensor Install Framework (SSH + Whiptail based TUI)
-# Version: 0.1 (sensor-specific)
-# OpenXDR-installer.sh based on Sensor specific Modified
+# XDR AIO & Sensor Installer Framework (SSH + Whiptail based TUI)
+# Version: 0.1 (AIO + Sensor deployment)
+# OpenXDR-installer.sh based on AIO + Sensor deployment scenario
 #
 
 set -euo pipefail
@@ -13,7 +13,7 @@ set -euo pipefail
 
 # Select appropriate directory based on execution environment
 if [[ "${EUID}" -eq 0 ]]; then
-  BASE_DIR="/opt/xdr-installer"  # when running as root /opt Use
+  BASE_DIR="/root/xdr-installer"  # when running as root /root Use
 else
   BASE_DIR="${HOME}/xdr-installer"  # use home directory when running as regular user
 fi
@@ -57,10 +57,13 @@ STEP_IDS=(
   "04_kvm_libvirt"
   "05_kernel_tuning"
   "06_libvirt_hooks"
-  "07_sensor_download"
-  "08_sensor_deploy"
-  "09_sensor_passthrough"
-  "10_install_dp_cli"
+  "07_lvm_storage"
+  "08_dp_download"
+  "09_aio_deploy"
+  "10_sensor_lv_download"
+  "11_sensor_deploy"
+  "12_sensor_passthrough"
+  "13_install_dp_cli"
 )
 
 # STEP Name (description displayed in UI)
@@ -71,10 +74,13 @@ STEP_NAMES=(
   "04. KVM / Libvirt Installation and Basic Configuration"
   "05. Kernel Parameters / KSM / Swap Tuning"
   "06. libvirt Hooks Installation"
-  "07. Sensor LV Creation + Image/Script Download"
-  "08. Sensor VM Deployment"
-  "09. PCI Passthrough / CPU Affinity (Sensor)"
-  "10. Install DP Appliance CLI package"
+  "07. LVM Storage Configuration (AIO)"
+  "08. DP Download (AIO)"
+  "09. AIO VM Deployment"
+  "10. Sensor LV Creation + Image/Script Download"
+  "11. Sensor VM Deployment"
+  "12. PCI Passthrough / CPU Affinity"
+  "13. Install DP Appliance CLI package"
 )
 
 NUM_STEPS=${#STEP_IDS[@]}
@@ -379,7 +385,7 @@ show_paged() {
   # --- Argument processing (safe for set -u environment) ---
   if [[ $# -eq 1 ]]; then
     # ① Case when only one argument is provided: content string only
-    title="XDR Installer Guide"
+    title="XDR AIO & Sensor Installer Guide"
     tmpfile=$(mktemp)
     printf "%s\n" "$1" > "$tmpfile"
     file="$tmpfile"
@@ -512,6 +518,58 @@ restart_vm_safely() {
 }
 
 #######################################
+# VM Destroy Confirmation Helper
+#######################################
+confirm_destroy_vm() {
+  local vm_name="$1"
+  local step_name="$2"
+
+  if ! virsh dominfo "${vm_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local state
+  state=$(virsh domstate "${vm_name}" 2>/dev/null | tr -d '\r')
+
+  local msg="The ${vm_name} VM is currently defined. (State: ${state})\n\
+\n\
+Continuing this step will:\n\
+  - Destroy and undefine the ${vm_name} VM\n\
+  - Delete existing disk image files (${vm_name}.raw / ${vm_name}.log, etc.).\n\
+\n\
+This can significantly impact the running cluster (DL / DA services).\n\
+\n\
+Are you sure you want to proceed with redeployment?"
+
+  if command -v whiptail >/dev/null 2>&1; then
+      if ! whiptail --title "${step_name} - ${vm_name} Redeployment Confirmation" \
+                    --defaultno \
+                    --yesno "${msg}" 18 80; then
+          log "[${step_name}] ${vm_name} redeployment canceled by user."
+          return 1
+      fi
+  else
+  
+    echo
+    echo "====================================================="
+    echo " ${step_name}: ${vm_name} Redeployment Warning"
+    echo "====================================================="
+    echo -e "${msg}"
+    echo
+    read -r -p "Do you want to continue? (Enter 'yes' to proceed) [default: no] : " answer
+    case "${answer}" in
+      yes|y|Y) ;;
+      *)
+        log "[${step_name}] ${vm_name} redeployment canceled by user."
+        return 1
+        ;;
+    esac
+  fi
+
+  return 0
+}
+
+#######################################
 # Configuration Management (CONFIG_FILE)
 #######################################
 
@@ -525,6 +583,7 @@ load_config() {
 
   # default value (Set only when not present)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
+  : "${DP_VERSION:=6.2.0}"  # DP version for AIO deployment (default: 6.2.0)
   : "${SENSOR_VERSION:=6.2.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
@@ -538,16 +597,25 @@ load_config() {
   # Set default values so NIC / disk selection values are always defined
   : "${HOST_NIC:=}"
   : "${DATA_NIC:=}"
+  : "${HOST_ACCESS_NIC:=}"
 
   : "${SPAN_NICS:=}"
 
-  # ===== 2VM Common/Total =====
-  : "${SENSOR_VM_COUNT:=2}"
+  # ===== Storage Configuration =====
+  : "${DATA_SSD_LIST:=}"
+
+  # ===== AIO Configuration =====
+  : "${AIO_VCPUS:=}"
+  : "${AIO_MEMORY_GB:=}"
+  : "${AIO_MEMORY_MB:=}"
+  : "${AIO_DISK_GB:=}"
+
+  # ===== 1VM (mds only) =====
+  : "${SENSOR_VM_COUNT:=1}"
 
   : "${SENSOR_TOTAL_VCPUS:=}"
   : "${SENSOR_VCPUS_PER_VM:=}"
-  : "${SENSOR_CPUSET_MDS1:=}"
-  : "${SENSOR_CPUSET_MDS2:=}"
+  : "${SENSOR_CPUSET_MDS:=}"
 
   : "${SENSOR_TOTAL_MEMORY_MB:=}"
   : "${SENSOR_MEMORY_MB_PER_VM:=}"
@@ -559,19 +627,17 @@ load_config() {
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_MEMORY_MB:=}"
 
-  # ===== SPAN NIC Separation =====
-  : "${SPAN_NICS_MDS1:=}"
-  : "${SPAN_NICS_MDS2:=}"
+  # ===== SPAN NIC (mds only) =====
+  : "${SPAN_NICS_MDS:=}"
 
-  # ===== SPAN PCI(PF) Separation =====
-  : "${SENSOR_SPAN_VF_PCIS_MDS1:=}"
-  : "${SENSOR_SPAN_VF_PCIS_MDS2:=}"
+  # ===== SPAN PCI(PF) (mds only) =====
+  : "${SENSOR_SPAN_VF_PCIS_MDS:=}"
   : "${SENSOR_SPAN_VF_PCIS:=}"     # Combined (Compatible)
 
   : "${SPAN_ATTACH_MODE:=sriov}"
   : "${SPAN_NIC_LIST:=}"
   : "${SPAN_BRIDGE_LIST:=}"
-  : "${SENSOR_NET_MODE:=bridge}"
+  : "${SENSOR_NET_MODE:=nat}"  # NAT mode only (bridge mode not supported)
   : "${LV_LOCATION:=}"
   : "${LV_SIZE_GB:=}"              # Legacy/Compatible (per-vm disk)
 }
@@ -582,37 +648,39 @@ save_config() {
   mkdir -p "$(dirname "${CONFIG_FILE}")"
 
   # Replace " with \" in values (to prevent config file from breaking)
-  local esc_sensor_version esc_acps_user esc_acps_pass esc_acps_url
+  local esc_dp_version esc_sensor_version esc_acps_user esc_acps_pass esc_acps_url
+  esc_dp_version=${DP_VERSION//\"/\\\"}
   esc_sensor_version=${SENSOR_VERSION//\"/\\\"}
   esc_acps_user=${ACPS_USERNAME//\"/\\\"}
   esc_acps_pass=${ACPS_PASSWORD//\"/\\\"}
   esc_acps_url=${ACPS_BASE_URL//\"/\\\"}
 
   # ★ Also escape NIC / sensor related values
-  local esc_host_nic esc_data_nic esc_span_nics
+  local esc_host_nic esc_data_nic esc_host_access_nic esc_span_nics
   local esc_sensor_vcpus esc_sensor_memory_mb
   local esc_span_attach_mode esc_span_nic_list esc_span_bridge_list esc_sensor_net_mode
-  local esc_lv_location esc_lv_size_gb
+  local esc_lv_location esc_lv_size_gb esc_data_ssd_list
 
   # ---- New escape ----
   local esc_sensor_vm_count
-  local esc_sensor_total_vcpus esc_sensor_vcpus_per_vm esc_sensor_cpuset_mds1 esc_sensor_cpuset_mds2
+  local esc_sensor_total_vcpus esc_sensor_vcpus_per_vm esc_sensor_cpuset_mds
   local esc_sensor_total_mem_mb esc_sensor_mem_mb_per_vm
   local esc_sensor_total_lv_gb esc_sensor_lv_gb_per_vm
+  local esc_aio_vcpus esc_aio_memory_gb esc_aio_memory_mb esc_aio_disk_gb
 
-  local esc_span_nics_mds1 esc_span_nics_mds2
-  local esc_sensor_span_pcis_mds1 esc_sensor_span_pcis_mds2 esc_sensor_span_pcis
+  local esc_span_nics_mds
+  local esc_sensor_span_pcis_mds esc_sensor_span_pcis
 
   esc_host_nic=${HOST_NIC//\"/\\\"}
   esc_data_nic=${DATA_NIC//\"/\\\"}
+  esc_host_access_nic=${HOST_ACCESS_NIC//\"/\\\"}
   esc_span_nics=${SPAN_NICS//\"/\\\"}
 
   esc_sensor_vm_count=${SENSOR_VM_COUNT//\"/\\\"}
 
   esc_sensor_total_vcpus=${SENSOR_TOTAL_VCPUS//\"/\\\"}
   esc_sensor_vcpus_per_vm=${SENSOR_VCPUS_PER_VM//\"/\\\"}
-  esc_sensor_cpuset_mds1=${SENSOR_CPUSET_MDS1//\"/\\\"}
-  esc_sensor_cpuset_mds2=${SENSOR_CPUSET_MDS2//\"/\\\"}
+  esc_sensor_cpuset_mds=${SENSOR_CPUSET_MDS//\"/\\\"}
 
   esc_sensor_total_mem_mb=${SENSOR_TOTAL_MEMORY_MB//\"/\\\"}
   esc_sensor_mem_mb_per_vm=${SENSOR_MEMORY_MB_PER_VM//\"/\\\"}
@@ -620,11 +688,14 @@ save_config() {
   esc_sensor_total_lv_gb=${SENSOR_TOTAL_LV_SIZE_GB//\"/\\\"}
   esc_sensor_lv_gb_per_vm=${SENSOR_LV_SIZE_GB_PER_VM//\"/\\\"}
 
-  esc_span_nics_mds1=${SPAN_NICS_MDS1//\"/\\\"}
-  esc_span_nics_mds2=${SPAN_NICS_MDS2//\"/\\\"}
+  esc_aio_vcpus=${AIO_VCPUS//\"/\\\"}
+  esc_aio_memory_gb=${AIO_MEMORY_GB//\"/\\\"}
+  esc_aio_memory_mb=${AIO_MEMORY_MB//\"/\\\"}
+  esc_aio_disk_gb=${AIO_DISK_GB//\"/\\\"}
 
-  esc_sensor_span_pcis_mds1=${SENSOR_SPAN_VF_PCIS_MDS1//\"/\\\"}
-  esc_sensor_span_pcis_mds2=${SENSOR_SPAN_VF_PCIS_MDS2//\"/\\\"}
+  esc_span_nics_mds=${SPAN_NICS_MDS//\"/\\\"}
+
+  esc_sensor_span_pcis_mds=${SENSOR_SPAN_VF_PCIS_MDS//\"/\\\"}
   esc_sensor_span_pcis=${SENSOR_SPAN_VF_PCIS//\"/\\\"}
 
   # ---- Legacy (Compatible): Values redefined as per-vm ----
@@ -637,10 +708,12 @@ save_config() {
   esc_sensor_net_mode=${SENSOR_NET_MODE//\"/\\\"}
   esc_lv_location=${LV_LOCATION//\"/\\\"}
   esc_lv_size_gb=${LV_SIZE_GB//\"/\\\"}
+  esc_data_ssd_list=${DATA_SSD_LIST//\"/\\\"}
 
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer environment configuration (auto-generated)
 DRY_RUN=${DRY_RUN}
+DP_VERSION="${esc_dp_version}"
 SENSOR_VERSION="${esc_sensor_version}"
 ACPS_USERNAME="${esc_acps_user}"
 ACPS_PASSWORD="${esc_acps_pass}"
@@ -651,15 +724,21 @@ AUTO_REBOOT_AFTER_STEP_ID="${AUTO_REBOOT_AFTER_STEP_ID}"
 # NIC / Sensor configuration selected in STEP 01
 HOST_NIC="${esc_host_nic}"
 DATA_NIC="${esc_data_nic}"
+HOST_ACCESS_NIC="${esc_host_access_nic}"
 SPAN_NICS="${esc_span_nics}"
 
-# ---- 2VM Common/Total ----
+# ---- AIO Configuration ----
+AIO_VCPUS="${esc_aio_vcpus}"
+AIO_MEMORY_GB="${esc_aio_memory_gb}"
+AIO_MEMORY_MB="${esc_aio_memory_mb}"
+AIO_DISK_GB="${esc_aio_disk_gb}"
+
+# ---- 1VM (mds only) ----
 SENSOR_VM_COUNT="${esc_sensor_vm_count}"
 
 SENSOR_TOTAL_VCPUS="${esc_sensor_total_vcpus}"
 SENSOR_VCPUS_PER_VM="${esc_sensor_vcpus_per_vm}"
-SENSOR_CPUSET_MDS1="${esc_sensor_cpuset_mds1}"
-SENSOR_CPUSET_MDS2="${esc_sensor_cpuset_mds2}"
+SENSOR_CPUSET_MDS="${esc_sensor_cpuset_mds}"
 
 SENSOR_TOTAL_MEMORY_MB="${esc_sensor_total_mem_mb}"
 SENSOR_MEMORY_MB_PER_VM="${esc_sensor_mem_mb_per_vm}"
@@ -671,12 +750,10 @@ SENSOR_LV_SIZE_GB_PER_VM="${esc_sensor_lv_gb_per_vm}"
 SENSOR_VCPUS="${esc_sensor_vcpus}"
 SENSOR_MEMORY_MB="${esc_sensor_memory_mb}"
 
-# ---- SPAN Separation ----
-SPAN_NICS_MDS1="${esc_span_nics_mds1}"
-SPAN_NICS_MDS2="${esc_span_nics_mds2}"
+# ---- SPAN (mds only) ----
+SPAN_NICS_MDS="${esc_span_nics_mds}"
 
-SENSOR_SPAN_VF_PCIS_MDS1="${esc_sensor_span_pcis_mds1}"
-SENSOR_SPAN_VF_PCIS_MDS2="${esc_sensor_span_pcis_mds2}"
+SENSOR_SPAN_VF_PCIS_MDS="${esc_sensor_span_pcis_mds}"
 SENSOR_SPAN_VF_PCIS="${esc_sensor_span_pcis}"
 
 SPAN_ATTACH_MODE="${esc_span_attach_mode}"
@@ -685,6 +762,7 @@ SPAN_BRIDGE_LIST="${esc_span_bridge_list}"
 SENSOR_NET_MODE="${esc_sensor_net_mode}"
 LV_LOCATION="${esc_lv_location}"
 LV_SIZE_GB="${esc_lv_size_gb}"
+DATA_SSD_LIST="${esc_data_ssd_list}"
 EOF
 
 }
@@ -698,6 +776,7 @@ save_config_var() {
 
   case "${key}" in
     DRY_RUN)        DRY_RUN="${value}" ;;
+    DP_VERSION)      DP_VERSION="${value}" ;;
     SENSOR_VERSION)     SENSOR_VERSION="${value}" ;;
     ACPS_USERNAME)  ACPS_USERNAME="${value}" ;;
     ACPS_PASSWORD)  ACPS_PASSWORD="${value}" ;;
@@ -708,21 +787,25 @@ save_config_var() {
     # ★ Add here
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_NIC)       DATA_NIC="${value}" ;;
-
+    HOST_ACCESS_NIC) HOST_ACCESS_NIC="${value}" ;;
     SPAN_NICS)      SPAN_NICS="${value}" ;;
 
-    # ---- 2VM Common/Total ----
+    # ---- AIO Configuration ----
+    AIO_VCPUS) AIO_VCPUS="${value}" ;;
+    AIO_MEMORY_GB) AIO_MEMORY_GB="${value}" ;;
+    AIO_MEMORY_MB) AIO_MEMORY_MB="${value}" ;;
+    AIO_DISK_GB) AIO_DISK_GB="${value}" ;;
+
+    # ---- 1VM (mds only) ----
     SENSOR_VM_COUNT) SENSOR_VM_COUNT="${value}" ;;
 
     SENSOR_TOTAL_VCPUS) SENSOR_TOTAL_VCPUS="${value}" ;;
     SENSOR_VCPUS_PER_VM) SENSOR_VCPUS_PER_VM="${value}" ;;
-    SENSOR_CPUSET_MDS1) SENSOR_CPUSET_MDS1="${value}" ;;
-    SENSOR_CPUSET_MDS2) SENSOR_CPUSET_MDS2="${value}" ;;
+    SENSOR_CPUSET_MDS) SENSOR_CPUSET_MDS="${value}" ;;
 
     SENSOR_TOTAL_MEMORY_MB) SENSOR_TOTAL_MEMORY_MB="${value}" ;;
     SENSOR_MEMORY_MB_PER_VM) SENSOR_MEMORY_MB_PER_VM="${value}" ;;
     SENSOR_LV_MDS)  SENSOR_LV_MDS="${value}" ;;
-    SENSOR_LV_MDS2) SENSOR_LV_MDS2="${value}" ;;
     SENSOR_TOTAL_LV_SIZE_GB) SENSOR_TOTAL_LV_SIZE_GB="${value}" ;;
     SENSOR_LV_SIZE_GB_PER_VM) SENSOR_LV_SIZE_GB_PER_VM="${value}" ;;
 
@@ -730,12 +813,10 @@ save_config_var() {
     SENSOR_VCPUS)   SENSOR_VCPUS="${value}" ;;
     SENSOR_MEMORY_MB) SENSOR_MEMORY_MB="${value}" ;;
 
-    # ---- SPAN Separation ----
-    SPAN_NICS_MDS1) SPAN_NICS_MDS1="${value}" ;;
-    SPAN_NICS_MDS2) SPAN_NICS_MDS2="${value}" ;;
+    # ---- SPAN (mds only) ----
+    SPAN_NICS_MDS) SPAN_NICS_MDS="${value}" ;;
 
-    SENSOR_SPAN_VF_PCIS_MDS1) SENSOR_SPAN_VF_PCIS_MDS1="${value}" ;;
-    SENSOR_SPAN_VF_PCIS_MDS2) SENSOR_SPAN_VF_PCIS_MDS2="${value}" ;;
+    SENSOR_SPAN_VF_PCIS_MDS) SENSOR_SPAN_VF_PCIS_MDS="${value}" ;;
     SENSOR_SPAN_VF_PCIS) SENSOR_SPAN_VF_PCIS="${value}" ;;
 
     SPAN_ATTACH_MODE) SPAN_ATTACH_MODE="${value}" ;;
@@ -744,6 +825,7 @@ save_config_var() {
     SENSOR_NET_MODE) SENSOR_NET_MODE="${value}" ;;
     LV_LOCATION) LV_LOCATION="${value}" ;;
     LV_SIZE_GB) LV_SIZE_GB="${value}" ;;
+    DATA_SSD_LIST) DATA_SSD_LIST="${value}" ;;
 
     *)
       # Unknown keys are ignored for now (can be extended here if needed)
@@ -826,13 +908,62 @@ run_step() {
   local step_name="${STEP_NAMES[$idx]}"
 
   # Check if STEP should be executed
-  if ! whiptail_yesno "XDR Installer - ${step_id}" "${step_name}\n\nDo you want to execute this step?"
+  # Generate step-specific description
+  local step_description=""
+  case "${step_id}" in
+    "01_hw_detect")
+      step_description="This step will detect hardware, configure NICs, CPU, memory, and storage settings."
+      ;;
+    "02_hwe_kernel")
+      step_description="This step will install Hardware Enablement (HWE) kernel for better hardware support."
+      ;;
+    "03_nic_ifupdown")
+      step_description="This step will configure network interfaces using ifupdown (NAT mode)."
+      ;;
+    "04_kvm_libvirt")
+      step_description="This step will install and configure KVM/libvirt for VM management."
+      ;;
+    "05_kernel_tuning")
+      step_description="This step will configure kernel parameters, disable KSM, and optionally disable swap."
+      ;;
+    "06_libvirt_hooks")
+      step_description="This step will install libvirt hooks for NAT/DNAT configuration and OOM monitoring."
+      ;;
+    "07_lvm_storage")
+      step_description="This step will configure LVM storage for AIO and Sensor VMs."
+      ;;
+    "08_dp_download")
+      step_description="This step will download AIO deployment script and image from ACPS."
+      ;;
+    "09_aio_deploy")
+      step_description="This step will deploy the AIO VM."
+      ;;
+    "10_sensor_lv_download")
+      step_description="This step will create sensor logical volume and download sensor image/script."
+      ;;
+    "11_sensor_deploy")
+      step_description="This step will deploy the Sensor VM (mds)."
+      ;;
+    "12_sensor_passthrough")
+      step_description="This step will configure PCI passthrough and CPU affinity for the Sensor VM."
+      ;;
+    "13_install_dp_cli")
+      step_description="This step will install DP Appliance CLI package."
+      ;;
+    *)
+      step_description="This step will perform the configured operations."
+      ;;
+  esac
+
+  if ! whiptail_yesno "XDR AIO & Sensor Installer - ${step_id}" "${step_name}\n\n${step_description}\n\nDo you want to execute this step?"
   then
     # User cancellation is considered "normal flow" (not an error)
-    log "User canceled execution of STEP ${step_id}."
+    log "[$(date '+%Y-%m-%d %H:%M:%S')] User canceled execution of STEP ${step_id} (${step_name})."
     return 0   # Must end with 0 here so set -e doesn't trigger in main case.
   fi
 
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${step_id} - ${step_name} ====="
   log "===== STEP START: ${step_id} - ${step_name} ====="
 
   local rc=0
@@ -857,17 +988,26 @@ run_step() {
     "06_libvirt_hooks")
       step_06_libvirt_hooks || rc=$?
       ;;
-    "07_sensor_download")
-      step_07_sensor_download || rc=$?
+    "07_lvm_storage")
+      step_07_lvm_storage || rc=$?
       ;;
-    "08_sensor_deploy")
-      step_08_sensor_deploy || rc=$?
+    "08_dp_download")
+      step_08_dp_download || rc=$?
       ;;
-    "09_sensor_passthrough")
-      step_09_sensor_passthrough || rc=$?
+    "09_aio_deploy")
+      step_09_aio_deploy || rc=$?
       ;;
-    "10_install_dp_cli")
-      step_10_install_dp_cli || rc=$?
+    "10_sensor_lv_download")
+      step_10_sensor_lv_download || rc=$?
+      ;;
+    "11_sensor_deploy")
+      step_11_sensor_deploy || rc=$?
+      ;;
+    "12_sensor_passthrough")
+      step_12_sensor_passthrough || rc=$?
+      ;;
+    "13_install_dp_cli")
+      step_13_install_dp_cli || rc=$?
       ;;	  
     *)
       log "ERROR: Undefined STEP ID: ${step_id}"
@@ -876,6 +1016,7 @@ run_step() {
   esac
 
   if [[ "${rc}" -eq 0 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP DONE: ${step_id} - ${step_name} ====="
     log "===== STEP DONE: ${step_id} - ${step_name} ====="
     
     # State verification summary after STEP completion
@@ -884,7 +1025,7 @@ run_step() {
       "02_hwe_kernel")
         local hwe_status="Unverified"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
-          # Check HWE package according to Ubuntu version
+          # Check HWE package according to Ubuntu version (multiple methods)
           local ubuntu_version
           ubuntu_version=$(lsb_release -rs 2>/dev/null || echo "unknown")
           local expected_pkg=""
@@ -896,50 +1037,216 @@ run_step() {
             *) expected_pkg="linux-generic" ;;
           esac
           
-          if dpkg -l | grep -q "^ii  ${expected_pkg}"; then
-            hwe_status="Installed"
-          elif dpkg -l | grep -q "linux-generic-hwe"; then
-            hwe_status="Installed (different version)"
+          if dpkg -l | grep -qE "^ii[[:space:]]+${expected_pkg}[[:space:]]"; then
+            hwe_status="Installed (${expected_pkg})"
+          elif dpkg -l | grep -qE "^ii[[:space:]]+linux-generic-hwe-"; then
+            local hwe_pkg=$(dpkg -l | grep -E "^ii[[:space:]]+linux-generic-hwe-" | head -1 | awk '{print $2}')
+            hwe_status="Installed (${hwe_pkg})"
+          elif dpkg -l | grep -qE "^ii[[:space:]]+linux-image-generic-hwe-"; then
+            local hwe_img=$(dpkg -l | grep -E "^ii[[:space:]]+linux-image-generic-hwe-" | head -1 | awk '{print $2}')
+            hwe_status="Installed (${hwe_img})"
+          elif dpkg -l | grep -qE "^ii[[:space:]]+linux-headers-generic-hwe-"; then
+            local hwe_headers=$(dpkg -l | grep -E "^ii[[:space:]]+linux-headers-generic-hwe-" | head -1 | awk '{print $2}')
+            hwe_status="Installed (${hwe_headers})"
           else
-            hwe_status="Installation failed"
+            hwe_status="Not detected"
           fi
         else
           hwe_status="DRY-RUN"
         fi
-        verification_summary="HWE Kernel Package: ${hwe_status}"
+        verification_summary="HWE Kernel: ${hwe_status}"
         ;;
       "03_nic_ifupdown")
-        verification_summary="Network interface configuration completed (applied after reboot)"
+        local net_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if [[ -f /etc/network/interfaces ]] && grep -q "mgt" /etc/network/interfaces 2>/dev/null; then
+            net_status="Configured (mgt interface found)"
+          elif [[ -f /etc/udev/rules.d/99-custom-ifnames.rules ]]; then
+            net_status="Configured (udev rules found)"
+          else
+            net_status="Configuration pending (reboot required)"
+          fi
+        else
+          net_status="DRY-RUN"
+        fi
+        verification_summary="Network: ${net_status}"
         ;;
       "04_kvm_libvirt")
         local kvm_status="Unverified"
+        local libvirt_status="Unverified"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
-          if systemctl is-active libvirtd >/dev/null 2>&1; then
-            kvm_status="libvirtd is running"
+          if command -v kvm-ok >/dev/null 2>&1 && kvm-ok 2>&1 | grep -q "KVM acceleration can be used"; then
+            kvm_status="Available"
           else
-            kvm_status="libvirtd is stopped"
+            kvm_status="Not available"
+          fi
+          if systemctl is-active libvirtd >/dev/null 2>&1; then
+            libvirt_status="Running"
+          else
+            libvirt_status="Stopped"
           fi
         else
           kvm_status="DRY-RUN"
+          libvirt_status="DRY-RUN"
         fi
-        verification_summary="KVM/libvirt: ${kvm_status}"
+        verification_summary="KVM: ${kvm_status}, libvirtd: ${libvirt_status}"
         ;;
       "05_kernel_tuning")
-        verification_summary="Kernel tuning completed (applied after reboot)"
+        local tuning_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if grep -q "intel_iommu=on iommu=pt" /etc/default/grub 2>/dev/null && \
+             grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf 2>/dev/null; then
+            tuning_status="Applied (reboot required)"
+          elif grep -q "intel_iommu=on iommu=pt" /etc/default/grub 2>/dev/null || \
+               grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf 2>/dev/null; then
+            tuning_status="Partially applied (reboot required)"
+          else
+            tuning_status="Pending (reboot required)"
+          fi
+        else
+          tuning_status="DRY-RUN"
+        fi
+        verification_summary="Kernel tuning: ${tuning_status}"
         ;;
-      "10_sensor_deploy")
+      "06_libvirt_hooks")
+        local hooks_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if [[ -f /etc/libvirt/hooks/network ]] && [[ -f /etc/libvirt/hooks/qemu ]]; then
+            hooks_status="Installed (network + qemu hooks)"
+          elif [[ -f /etc/libvirt/hooks/network ]] || [[ -f /etc/libvirt/hooks/qemu ]]; then
+            hooks_status="Partially installed"
+          else
+            hooks_status="Not installed"
+          fi
+        else
+          hooks_status="DRY-RUN"
+        fi
+        verification_summary="Libvirt hooks: ${hooks_status}"
+        ;;
+      "07_lvm_storage")
+        local lvm_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if vgs vg_aio >/dev/null 2>&1 && lvs ubuntu-vg/lv_aio_root >/dev/null 2>&1 && \
+             mountpoint -q /stellar/aio 2>/dev/null; then
+            lvm_status="Configured (VG/LV created, mounted)"
+          elif vgs vg_aio >/dev/null 2>&1 || lvs ubuntu-vg/lv_aio_root >/dev/null 2>&1; then
+            lvm_status="Partially configured"
+          else
+            lvm_status="Not configured"
+          fi
+        else
+          lvm_status="DRY-RUN"
+        fi
+        verification_summary="LVM storage: ${lvm_status}"
+        ;;
+      "08_dp_download")
+        local download_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if [[ -f /stellar/aio/images/virt_deploy_uvp_centos.sh ]] && \
+             [[ -f /stellar/aio/images/aella-dataprocessor-*.qcow2 ]]; then
+            download_status="Completed (script + image)"
+          elif [[ -f /stellar/aio/images/virt_deploy_uvp_centos.sh ]] || \
+               [[ -f /stellar/aio/images/aella-dataprocessor-*.qcow2 ]]; then
+            download_status="Partially downloaded"
+          else
+            download_status="Not downloaded"
+          fi
+        else
+          download_status="DRY-RUN"
+        fi
+        verification_summary="DP download: ${download_status}"
+        ;;
+      "09_aio_deploy")
+        local aio_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if virsh dominfo aio >/dev/null 2>&1; then
+            local aio_state=$(virsh domstate aio 2>/dev/null || echo "unknown")
+            aio_status="VM created (${aio_state})"
+          else
+            aio_status="VM not found"
+          fi
+        else
+          aio_status="DRY-RUN"
+        fi
+        verification_summary="AIO VM: ${aio_status}"
+        ;;
+      "10_sensor_lv_download")
+        local sensor_lv_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1 && \
+             mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null && \
+             [[ -f /var/lib/libvirt/images/mds/aella-modular-ds-*.qcow2 ]]; then
+            sensor_lv_status="Completed (LV + mount + image)"
+          elif lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1 && \
+               mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then
+            sensor_lv_status="LV created (image pending)"
+          elif lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1; then
+            sensor_lv_status="LV created (mount pending)"
+          else
+            sensor_lv_status="Not configured"
+          fi
+        else
+          sensor_lv_status="DRY-RUN"
+        fi
+        verification_summary="Sensor LV: ${sensor_lv_status}"
+        ;;
+      "11_sensor_deploy")
         local vm_verify="Unverified"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
-          if virsh list --all | grep -q "mds"; then
+          if virsh dominfo mds >/dev/null 2>&1; then
             local state=$(virsh domstate mds 2>/dev/null || echo "unknown")
             vm_verify="VM created (${state})"
           else
-            vm_verify="VM creation failed"
+            vm_verify="VM not found"
           fi
         else
           vm_verify="DRY-RUN"
         fi
         verification_summary="Sensor VM: ${vm_verify}"
+        ;;
+      "12_sensor_passthrough")
+        local passthrough_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if virsh dominfo mds >/dev/null 2>&1; then
+            local hostdev_count
+            hostdev_count=$(virsh dumpxml mds 2>/dev/null | grep -c "<hostdev" 2>/dev/null || echo "0")
+            # Remove all whitespace and convert to integer
+            hostdev_count=$(echo "${hostdev_count}" | tr -d '[:space:]')
+            # Ensure it's a valid integer, default to 0 if not
+            if ! [[ "${hostdev_count}" =~ ^[0-9]+$ ]]; then
+              hostdev_count="0"
+            fi
+            # Convert to integer for comparison
+            hostdev_count=$((hostdev_count + 0))
+            if [[ "${hostdev_count}" -gt 0 ]]; then
+              passthrough_status="Configured (${hostdev_count} PCI device(s))"
+            else
+              passthrough_status="Not configured (no PCI devices)"
+            fi
+          else
+            passthrough_status="VM not found"
+          fi
+        else
+          passthrough_status="DRY-RUN"
+        fi
+        verification_summary="PCI passthrough: ${passthrough_status}"
+        ;;
+      "13_install_dp_cli")
+        local cli_status="Unverified"
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+          if [[ -x /usr/local/bin/aella_cli ]] && \
+             [[ -d /opt/dp_cli_venv ]] && \
+             /opt/dp_cli_venv/bin/python -c "import dp_cli" >/dev/null 2>&1; then
+            cli_status="Installed (venv + CLI)"
+          elif [[ -x /usr/local/bin/aella_cli ]] || [[ -d /opt/dp_cli_venv ]]; then
+            cli_status="Partially installed"
+          else
+            cli_status="Not installed"
+          fi
+        else
+          cli_status="DRY-RUN"
+        fi
+        verification_summary="DP CLI: ${cli_status}"
         ;;
     esac
     
@@ -976,15 +1283,63 @@ run_step() {
 	      done
 	    fi
 	  else
+	    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
 	    log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
     
-    # On failure, guide to the log file location
+    # On failure, guide to the log file location and suggest which step to re-run
     local log_info=""
     if [[ -f "${LOG_FILE}" ]]; then
       log_info="\n\nCheck the detailed log: tail -f ${LOG_FILE}"
     fi
     
-    whiptail_msgbox "STEP Failed - ${step_id}" "An error occurred during execution of STEP ${step_id} (${step_name}).\n\nPlease check the log and re-run the STEP if necessary.\nThe installer can continue to run.${log_info}" 16 80
+    # Determine which step to re-run based on the failed step
+    local rerun_step=""
+    case "${step_id}" in
+      "01_hw_detect")
+        rerun_step="Please re-run STEP 01 to fix the configuration."
+        ;;
+      "02_hwe_kernel")
+        rerun_step="Please re-run STEP 02 to complete kernel installation."
+        ;;
+      "03_nic_ifupdown")
+        rerun_step="Please re-run STEP 03 to fix network configuration.\nIf network settings are missing, re-run STEP 01 first."
+        ;;
+      "04_kvm_libvirt")
+        rerun_step="Please re-run STEP 04 to complete KVM/libvirt installation."
+        ;;
+      "05_kernel_tuning")
+        rerun_step="Please re-run STEP 05 to complete kernel tuning."
+        ;;
+      "06_libvirt_hooks")
+        rerun_step="Please re-run STEP 06 to complete libvirt hooks installation."
+        ;;
+      "07_lvm_storage")
+        rerun_step="Please re-run STEP 01 to configure data disks (DATA_SSD_LIST),\nthen re-run STEP 07."
+        ;;
+      "08_dp_download")
+        rerun_step="Please re-run STEP 08 to complete AIO image download.\nCheck ACPS credentials and network connectivity."
+        ;;
+      "09_aio_deploy")
+        rerun_step="Please re-run STEP 09 to complete AIO VM deployment.\nEnsure STEP 07 and STEP 08 are completed first."
+        ;;
+      "10_sensor_lv_download")
+        rerun_step="Please re-run STEP 10 to complete sensor LV creation and image download.\nEnsure STEP 01 is completed first."
+        ;;
+      "11_sensor_deploy")
+        rerun_step="Please re-run STEP 11 to complete Sensor VM deployment.\nEnsure STEP 10 is completed first."
+        ;;
+      "12_sensor_passthrough")
+        rerun_step="Please re-run STEP 12 to complete PCI passthrough configuration.\nEnsure STEP 01 (SPAN NIC selection) and STEP 11 are completed first."
+        ;;
+      "13_install_dp_cli")
+        rerun_step="Please re-run STEP 13 to complete DP CLI installation."
+        ;;
+      *)
+        rerun_step="Please check the log and re-run this STEP if necessary."
+        ;;
+    esac
+    
+    whiptail_msgbox "STEP Failed - ${step_id}" "An error occurred during execution of STEP ${step_id} (${step_name}).\n\n${rerun_step}\n\nThe installer can continue to run.${log_info}" 18 80
   fi
 
   # ★ run_step always exits with 0 so set -e doesn't trigger here
@@ -1008,7 +1363,13 @@ list_nic_candidates() {
 #######################################
 
 step_01_hw_detect() {
+  local STEP_ID="01_hw_detect"
+  local STEP_NAME="01. Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 01] Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  log "[STEP 01] This step will configure hardware resources for AIO and Sensor VMs."
 
   # Load latest configuration (so script doesn't die even if not present)
   if type load_config >/dev/null 2>&1; then
@@ -1020,25 +1381,24 @@ step_01_hw_detect() {
   : "${DATA_NIC:=}"
 
   : "${SPAN_NICS:=}"                 # Total SPAN NIC (summary/compatible)
-  : "${SPAN_NICS_MDS1:=}"            # SPAN NIC for mds
-  : "${SPAN_NICS_MDS2:=}"            # SPAN NIC for mds2
+  : "${SPAN_NICS_MDS:=}"             # SPAN NIC for mds
 
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_MEMORY_MB:=}"
 
   : "${SENSOR_SPAN_VF_PCIS:=}"       # Legacy combined
-  : "${SENSOR_SPAN_VF_PCIS_MDS1:=}"  # PCI list for mds
-  : "${SENSOR_SPAN_VF_PCIS_MDS2:=}"  # PCI list for mds2
+  : "${SENSOR_SPAN_VF_PCIS_MDS:=}"   # PCI list for mds
 
-  : "${SPAN_ATTACH_MODE:=pci}"  
-  : "${SENSOR_NET_MODE:=bridge}"
+  : "${SPAN_ATTACH_MODE:=pci}"  # Force PCI passthrough only (no bridge mode)  
+  : "${SENSOR_NET_MODE:=nat}"  # Force NAT mode only
   
-  # Determine network mode
-  local net_mode="${SENSOR_NET_MODE}"
-  log "[STEP 01] Sensor network mode: ${net_mode}"
+  # Determine network mode (force NAT)
+  local net_mode="nat"
+  SENSOR_NET_MODE="nat"
+  log "[STEP 01] Sensor network mode: ${net_mode} (NAT only)"
 
   ########################
-  # 0) Whether to reuse existing values (different conditions per network mode)
+  # 0) Whether to reuse existing values (NAT mode only)
   ########################
   local can_reuse_config=0
   local reuse_message=""
@@ -1046,21 +1406,13 @@ step_01_hw_detect() {
   # Load storage configuration values
   : "${LV_LOCATION:=}"
   : "${LV_SIZE_GB:=}"
+  : "${DATA_SSD_LIST:=}"
   
-  if [[ "${net_mode}" == "bridge" ]]; then
-    if [[ -n "${HOST_NIC}" && -n "${DATA_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" ]]; then
+  # NAT mode only
+  if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" && -n "${DATA_SSD_LIST}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
-      [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- HOST NIC: ${HOST_NIC}\n- DATA NIC: ${DATA_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB"
-    fi
-  elif [[ "${net_mode}" == "nat" ]]; then
-    if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" ]]; then
-      can_reuse_config=1
-      local span_mode_label="PF PCI (Passthrough)"
-      [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB"
-    fi
+    reuse_message="The following values are already set:\n\n- Network mode: ${net_mode} (NAT only)\n- NAT uplink NIC: ${HOST_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB\n- Data disks: ${DATA_SSD_LIST}"
   fi
   
   if [[ "${can_reuse_config}" -eq 1 ]]; then
@@ -1091,119 +1443,206 @@ step_01_hw_detect() {
   fi
 
   ########################
-  # 1) CPU Calculation (total input → 2VM distribution)
+  # 1) CPU Calculation (AIO and MDS)
   ########################
-  SENSOR_VM_COUNT=2
+  SENSOR_VM_COUNT=1
   save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
-  local total_cpus default_sensor_total_vcpus sensor_vcpus
+  local total_cpus
   total_cpus=$(nproc)
-  default_sensor_total_vcpus=$((total_cpus - 4))
-  if [[ ${default_sensor_total_vcpus} -le 0 ]]; then
-    default_sensor_total_vcpus=2
+
+  # Check NUMA configuration
+  local numa_nodes=1
+  local node0_cpus="" node1_cpus=""
+  local node0_count=0 node1_count=0
+  
+  if command -v lscpu >/dev/null 2>&1; then
+    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
+    
+    if [[ "${numa_nodes}" -ge 2 ]]; then
+      # Extract NUMA node0 CPU list
+      node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
+      # Extract NUMA node1 CPU list
+      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
+      
+      # Count CPUs in each NUMA node
+      if [[ -n "${node0_cpus}" ]]; then
+        node0_count=$(echo "${node0_cpus}" | tr ',' '\n' | wc -l)
+      fi
+      if [[ -n "${node1_cpus}" ]]; then
+        node1_count=$(echo "${node1_cpus}" | tr ',' '\n' | wc -l)
+      fi
+    fi
   fi
 
-  sensor_vcpus=$(whiptail_inputbox "STEP 01 - Sensor vCPU (Total) Configuration" "Enter the total vCPU (total) that 2 sensor VMs will use.\n\nTotal logical CPUs: ${total_cpus}\nDefault value (total): ${default_sensor_total_vcpus}\nExample: Enter 44 → mds 22 / mds2 22" "${SENSOR_TOTAL_VCPUS:-${default_sensor_total_vcpus}}") || {
+  # ==============================================================================
+  # 1-1) AIO vCPU Configuration (NUMA0)
+  # ==============================================================================
+  local default_aio_vcpus aio_vcpus
+  
+  if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
+    # Default: All CPUs in NUMA0
+    default_aio_vcpus=${node0_count}
+  else
+    # Single NUMA or detection failed: Use half of total CPUs
+    default_aio_vcpus=$((total_cpus / 2))
+    if [[ ${default_aio_vcpus} -lt 2 ]]; then
+      default_aio_vcpus=2
+    fi
+  fi
+
+  aio_vcpus=$(whiptail_inputbox "STEP 01 - AIO vCPU Configuration" "Enter the number of vCPUs for the AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nNUMA0 CPUs: ${node0_count:-N/A}\nDefault value: ${default_aio_vcpus} (all NUMA0 CPUs)\nExample: Enter 46" "${AIO_VCPUS:-${default_aio_vcpus}}") || {
+    log "User canceled AIO vCPU configuration."
+    return 1
+  }
+
+  aio_vcpus=$(echo "${aio_vcpus}" | tr -d ' ')
+  if [[ -z "${aio_vcpus}" || ! "${aio_vcpus}" =~ ^[0-9]+$ || "${aio_vcpus}" -lt 2 ]]; then
+    whiptail_msgbox "Input Error" "AIO vCPU must be entered as a number greater than or equal to 2."
+    return 1
+  fi
+
+  AIO_VCPUS="${aio_vcpus}"
+  save_config_var "AIO_VCPUS" "${AIO_VCPUS}"
+  log "Configured AIO vCPU: ${AIO_VCPUS}"
+
+  # ==============================================================================
+  # 1-2) MDS (Sensor) vCPU Configuration (NUMA1)
+  # ==============================================================================
+  local default_sensor_vcpus sensor_vcpus
+  
+  if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
+    # Default: NUMA1 CPUs minus 4
+    default_sensor_vcpus=$((node1_count - 4))
+    if [[ ${default_sensor_vcpus} -lt 2 ]]; then
+      default_sensor_vcpus=2
+    fi
+  else
+    # Single NUMA or detection failed: Total CPUs minus 4
+    default_sensor_vcpus=$((total_cpus - 4))
+    if [[ ${default_sensor_vcpus} -le 0 ]]; then
+      default_sensor_vcpus=2
+    fi
+  fi
+
+  sensor_vcpus=$(whiptail_inputbox "STEP 01 - Sensor (MDS) vCPU Configuration" "Enter the number of vCPUs for the sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nNUMA1 CPUs: ${node1_count:-N/A}\nDefault value: ${default_sensor_vcpus} (NUMA1 CPUs - 4)\nExample: Enter 22" "${default_sensor_vcpus}") || {
     log "User canceled sensor vCPU configuration."
     return 1
   }
 
   sensor_vcpus=$(echo "${sensor_vcpus}" | tr -d ' ')
   if [[ -z "${sensor_vcpus}" || ! "${sensor_vcpus}" =~ ^[0-9]+$ || "${sensor_vcpus}" -lt 2 ]]; then
-    whiptail_msgbox "Input Error" "Sensor vCPU total must be entered as a number greater than or equal to 2."
+    whiptail_msgbox "Input Error" "Sensor vCPU must be entered as a number greater than or equal to 2."
     return 1
   fi
 
+  SENSOR_VCPUS="${sensor_vcpus}"
+  SENSOR_VCPUS_PER_VM="${sensor_vcpus}"
   SENSOR_TOTAL_VCPUS="${sensor_vcpus}"
-  SENSOR_VCPUS_PER_VM=$(( SENSOR_TOTAL_VCPUS / SENSOR_VM_COUNT ))
-
-  # Legacy/Compatible: Existing SENSOR_VCPUS is redefined as 'vCPU per VM'
-  SENSOR_VCPUS="${SENSOR_VCPUS_PER_VM}"
-
 
   # ==============================================================================
-  # [Modified] NUMA Aware CPUSET Calculation Logic
-  # Previous: Simply divided in half (0-45, 46-91) -> Performance degradation in NUMA interleaving environment
-  # Changed: Parse lscpu information to accurately separate Node 0 CPU list and Node 1 CPU list
+  # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
+  # mds uses NUMA1 cpuset
   # ==============================================================================
-
-  local numa_nodes=1
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-  fi
-
-  if [[ "${numa_nodes}" -ge 2 ]]; then
-    log "[STEP 01] NUMA node(${numa_nodes}count) Detected. Setting CPU Pinning according to NUMA Topology."
-  
-    # Extract NUMA node0 CPU list (e.g., 0,2,4,...)
-    local node0_cpus
-    node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-  
-    # Extract NUMA node1 CPU list (e.g., 1,3,5,...)
-    local node1_cpus
-    node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-
+  if [[ "${numa_nodes}" -ge 2 && -n "${node1_cpus}" ]]; then
+    log "[STEP 01] NUMA node(${numa_nodes}) Detected. Setting CPU Pinning for mds on NUMA1."
     # Cut the list according to the number of vCPUs entered by the user (allocate from the front)
-    # Split by comma (,) and recombine
-    SENSOR_CPUSET_MDS1=$(echo "${node0_cpus}" | cut -d',' -f1-"${SENSOR_VCPUS_PER_VM}")
-    SENSOR_CPUSET_MDS2=$(echo "${node1_cpus}" | cut -d',' -f1-"${SENSOR_VCPUS_PER_VM}")
-  
-    log "  -> MDS1 (Node0): ${SENSOR_CPUSET_MDS1}"
-    log "  -> MDS2 (Node1): ${SENSOR_CPUSET_MDS2}"
+    SENSOR_CPUSET_MDS=$(echo "${node1_cpus}" | cut -d',' -f1-"${SENSOR_VCPUS}")
+    log "  -> MDS (Node1): ${SENSOR_CPUSET_MDS}"
   else
     log "[STEP 01] Single NUMA node or detection impossible. Using sequential allocation."
-    SENSOR_CPUSET_MDS1="0-$((SENSOR_VCPUS_PER_VM-1))"
-    SENSOR_CPUSET_MDS2="${SENSOR_VCPUS_PER_VM}-$((SENSOR_VCPUS_PER_VM*2-1))"
+    SENSOR_CPUSET_MDS="0-$((SENSOR_VCPUS-1))"
   fi
   # ==============================================================================
 
-
-  log "Configured sensor vCPU (total): ${SENSOR_TOTAL_VCPUS} → per VM: ${SENSOR_VCPUS_PER_VM} (mds cpuset=${SENSOR_CPUSET_MDS1}, mds2 cpuset=${SENSOR_CPUSET_MDS2})"
+  log "Configured sensor vCPU: ${SENSOR_VCPUS} (mds cpuset=${SENSOR_CPUSET_MDS})"
 
   save_config_var "SENSOR_TOTAL_VCPUS" "${SENSOR_TOTAL_VCPUS}"
   save_config_var "SENSOR_VCPUS_PER_VM" "${SENSOR_VCPUS_PER_VM}"
   save_config_var "SENSOR_VCPUS" "${SENSOR_VCPUS}"
-  save_config_var "SENSOR_CPUSET_MDS1" "${SENSOR_CPUSET_MDS1}"
-  save_config_var "SENSOR_CPUSET_MDS2" "${SENSOR_CPUSET_MDS2}"
+  save_config_var "SENSOR_CPUSET_MDS" "${SENSOR_CPUSET_MDS}"
 
   ########################
-  # 2) Memory Calculation (total input → 2VM distribution)
+  # 2) Memory Calculation (AIO and MDS)
   ########################
-  SENSOR_VM_COUNT=2
+  SENSOR_VM_COUNT=1
   save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
-  local total_mem_kb total_mem_gb default_sensor_total_gb sensor_gb sensor_memory_mb
+  local total_mem_kb total_mem_gb available_mem_gb default_aio_gb default_sensor_gb
   total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   total_mem_gb=$((total_mem_kb / 1024 / 1024))
-  default_sensor_total_gb=$((total_mem_gb - 12))
-
-  if [[ ${default_sensor_total_gb} -le 0 ]]; then
-    whiptail_msgbox "Memory Insufficient Warning" "System memory is insufficient.\nTotal memory: ${total_mem_gb}GB\nDefault allocation value is 0 or less.\n\nPlease enter an appropriate memory size directly in the next screen." 12 70
-    default_sensor_total_gb=8  # Total suggestion (considering 2VM)
+  
+  # Reserve 12GB for KVM host
+  available_mem_gb=$((total_mem_gb - 12))
+  if [[ ${available_mem_gb} -le 0 ]]; then
+    whiptail_msgbox "Memory Insufficient Warning" "System memory is insufficient.\nTotal memory: ${total_mem_gb}GB\nAfter reserving 12GB for host, available memory is ${available_mem_gb}GB.\n\nPlease enter appropriate memory sizes manually." 12 70
+    available_mem_gb=16
   fi
 
-  sensor_gb=$(whiptail_inputbox "STEP 01 - Sensor Memory (Total) Configuration" \
-                       "Enter the total memory (GB, total) that 2 sensor VMs will use.\n\nTotal memory: ${total_mem_gb}GB\nRecommended value (total): ${default_sensor_total_gb}GB\nExample: Enter 64 → mds 32 / mds2 32" \
-                       "${SENSOR_TOTAL_MEMORY_GB:-${default_sensor_total_gb}}" \
+  # Calculate default values: 70% for AIO, 30% for MDS
+  default_aio_gb=$((available_mem_gb * 70 / 100))
+  default_sensor_gb=$((available_mem_gb * 30 / 100))
+  
+  # Ensure minimum values
+  if [[ ${default_aio_gb} -lt 8 ]]; then
+    default_aio_gb=8
+  fi
+  if [[ ${default_sensor_gb} -lt 8 ]]; then
+    default_sensor_gb=8
+  fi
+
+  # ==============================================================================
+  # 2-1) AIO Memory Configuration
+  # ==============================================================================
+  local aio_gb aio_memory_mb
+  aio_gb=$(whiptail_inputbox "STEP 01 - AIO Memory Configuration" \
+                       "Enter the memory (GB) for the AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_aio_gb}GB (70% of available)\nExample: Enter 136" \
+                       "${AIO_MEMORY_GB:-${default_aio_gb}}" \
+                       13 80) || {
+    log "User canceled AIO memory configuration."
+    return 1
+  }
+
+  aio_gb=$(echo "${aio_gb}" | tr -d ' ')
+  if [[ -z "${aio_gb}" || ! "${aio_gb}" =~ ^[0-9]+$ || "${aio_gb}" -lt 8 ]]; then
+    whiptail_msgbox "Input Error" "AIO memory must be entered as a number (GB) greater than or equal to 8."
+    return 1
+  fi
+
+  # Memory (MB) for AIO
+  aio_memory_mb=$(( aio_gb * 1024 ))
+  AIO_MEMORY_GB="${aio_gb}"
+  AIO_MEMORY_MB="${aio_memory_mb}"
+  
+  log "Configured AIO memory: ${aio_gb}GB (${AIO_MEMORY_MB}MB)"
+  save_config_var "AIO_MEMORY_GB" "${AIO_MEMORY_GB}"
+  save_config_var "AIO_MEMORY_MB" "${AIO_MEMORY_MB}"
+
+  # ==============================================================================
+  # 2-2) MDS (Sensor) Memory Configuration
+  # ==============================================================================
+  local sensor_gb sensor_memory_mb
+  sensor_gb=$(whiptail_inputbox "STEP 01 - Sensor (MDS) Memory Configuration" \
+                       "Enter the memory (GB) for the sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_sensor_gb}GB (30% of available)\nExample: Enter 32" \
+                       "${SENSOR_MEMORY_GB:-${default_sensor_gb}}" \
                        13 80) || {
     log "User canceled sensor memory configuration."
     return 1
   }
 
   sensor_gb=$(echo "${sensor_gb}" | tr -d ' ')
-  if [[ -z "${sensor_gb}" || ! "${sensor_gb}" =~ ^[0-9]+$ || "${sensor_gb}" -lt 2 ]]; then
-    whiptail_msgbox "Input Error" "Sensor memory total must be entered as a number (GB) greater than or equal to 2."
+  if [[ -z "${sensor_gb}" || ! "${sensor_gb}" =~ ^[0-9]+$ || "${sensor_gb}" -lt 8 ]]; then
+    whiptail_msgbox "Input Error" "Sensor memory must be entered as a number (GB) greater than or equal to 8."
     return 1
   fi
 
-  # Total (MB) and per-VM distribution (MB)
-  SENSOR_TOTAL_MEMORY_MB=$(( sensor_gb * 1024 ))
-  SENSOR_MEMORY_MB_PER_VM=$(( SENSOR_TOTAL_MEMORY_MB / SENSOR_VM_COUNT ))
+  # Memory (MB) for single VM
+  sensor_memory_mb=$(( sensor_gb * 1024 ))
+  SENSOR_MEMORY_MB="${sensor_memory_mb}"
+  SENSOR_MEMORY_MB_PER_VM="${sensor_memory_mb}"
+  SENSOR_TOTAL_MEMORY_MB="${sensor_memory_mb}"
 
-  # Legacy/Compatible: Existing SENSOR_MEMORY_MB is redefined as 'Per VM MB'
-  SENSOR_MEMORY_MB="${SENSOR_MEMORY_MB_PER_VM}"
-
-  log "Configured sensor memory (total): ${sensor_gb}GB (${SENSOR_TOTAL_MEMORY_MB}MB) → per VM: $((SENSOR_MEMORY_MB_PER_VM/1024))GB (${SENSOR_MEMORY_MB_PER_VM}MB)"
+  log "Configured sensor memory: ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)"
 
   save_config_var "SENSOR_TOTAL_MEMORY_MB" "${SENSOR_TOTAL_MEMORY_MB}"
   save_config_var "SENSOR_MEMORY_MB_PER_VM" "${SENSOR_MEMORY_MB_PER_VM}"
@@ -1211,8 +1650,47 @@ step_01_hw_detect() {
 
 
   ########################
-  # 3) Storage Allocation Configuration
+  # 3) Storage Allocation Configuration (AIO and MDS)
   ########################
+  
+  # ==============================================================================
+  # 3-1) AIO Storage Size Configuration
+  # ==============================================================================
+  local aio_disk_gb default_aio_disk_gb=500
+  
+  while true; do
+    aio_disk_gb=$(whiptail_inputbox "STEP 01 - AIO Storage Size Configuration" \
+                         "Please enter the storage size (GB) for the AIO VM.\n\n- Minimum size: 100GB\n- Default value: ${default_aio_disk_gb}GB\n\nExample: Enter 500\n\nSize (GB):" \
+                         "${AIO_DISK_GB:-${default_aio_disk_gb}}" \
+                         15 80) || {
+      log "User canceled AIO storage size configuration."
+      return 1
+    }
+
+    aio_disk_gb=$(echo "${aio_disk_gb}" | tr -d ' ')
+
+    # Number validation
+    if ! [[ "${aio_disk_gb}" =~ ^[0-9]+$ ]]; then
+      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${aio_disk_gb}"
+      continue
+    fi
+
+    # Minimum size validation (100GB)
+    if [[ "${aio_disk_gb}" -lt 100 ]]; then
+      whiptail_msgbox "Insufficient Size" "Minimum 100GB must be greater than or equal to.\nInput value: ${aio_disk_gb}GB"
+      continue
+    fi
+
+    break
+  done
+
+  AIO_DISK_GB="${aio_disk_gb}"
+  log "Configured AIO disk size: ${AIO_DISK_GB}GB"
+  save_config_var "AIO_DISK_GB" "${AIO_DISK_GB}"
+
+  # ==============================================================================
+  # 3-2) MDS (Sensor) Storage Size Configuration
+  # ==============================================================================
   # Check and display sda3 disk information
   log "[STEP 01] Check sda3 disk information"
 
@@ -1239,56 +1717,140 @@ step_01_hw_detect() {
   local available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
   [[ ${available_gb} -lt 0 ]] && available_gb=0
   
-  # LV locationset to ubuntu-vg (OpenXDR method)
+  # LV location set to ubuntu-vg (OpenXDR method)
   local lv_location="ubuntu-vg"
   log "[STEP 01] LV location Auto configured: ${lv_location} (Existing ubuntu-vg Available space Use)"
   
-  SENSOR_VM_COUNT=2
+  SENSOR_VM_COUNT=1
   save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
-  # From user "Total" LV size Receive input
-  local total_lv_size_gb
+  # From user LV size Receive input (single VM)
+  local lv_size_gb default_sensor_disk_gb=200
   while true; do
-    total_lv_size_gb=$(whiptail_inputbox "STEP 01 - Sensor Storage Size Configuration" \
-                         "Please enter the total storage size (GB, Total) that 2 Sensor VMs will use.\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Minimum size (Total): 160GB (Per VM 80GB Standard)\n- Default value (total): 1000GB\n\nExample: Enter 1000 → mds 500 / mds2 500\n\nSize (GB):" \
-                         "1000" \
+    lv_size_gb=$(whiptail_inputbox "STEP 01 - Sensor (MDS) Storage Size Configuration" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
+                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
                          18 80) || {
       log "User canceled sensor storage size configuration."
       return 1
     }
 
-    total_lv_size_gb=$(echo "${total_lv_size_gb}" | tr -d ' ')
+    lv_size_gb=$(echo "${lv_size_gb}" | tr -d ' ')
 
     # Number validation
-      if ! [[ "${total_lv_size_gb}" =~ ^[0-9]+$ ]]; then
-      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${total_lv_size_gb}"
+    if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
+      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
       continue
     fi
 
-    # Minimum size validation(Total 160GB)
-    if [[ "${total_lv_size_gb}" -lt 160 ]]; then
-      whiptail_msgbox "Insufficient Size" "Minimum 160GB (Total) must be greater than or equal to.\nInput value: ${total_lv_size_gb}GB"
+    # Minimum size validation (80GB)
+    if [[ "${lv_size_gb}" -lt 80 ]]; then
+      whiptail_msgbox "Insufficient Size" "Minimum 80GB must be greater than or equal to.\nInput value: ${lv_size_gb}GB"
       continue
     fi
 
     break
   done
 
-  SENSOR_TOTAL_LV_SIZE_GB="${total_lv_size_gb}"
-  SENSOR_LV_SIZE_GB_PER_VM=$(( SENSOR_TOTAL_LV_SIZE_GB / SENSOR_VM_COUNT ))
+  SENSOR_LV_SIZE_GB_PER_VM="${lv_size_gb}"
+  SENSOR_TOTAL_LV_SIZE_GB="${lv_size_gb}"
 
   log "Configured LV location: ${lv_location}"
-  log "Configured LV size(Total): ${SENSOR_TOTAL_LV_SIZE_GB}GB → per VM: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
+  log "Configured LV size: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
 
   LV_LOCATION="${lv_location}"
 
-  # Legacy/Compatible: Existing LV_SIZE_GB is redefined as 'Per VM' size
+  # Legacy/Compatible: Existing LV_SIZE_GB
   LV_SIZE_GB="${SENSOR_LV_SIZE_GB_PER_VM}"
 
   save_config_var "LV_LOCATION" "${LV_LOCATION}"
   save_config_var "SENSOR_TOTAL_LV_SIZE_GB" "${SENSOR_TOTAL_LV_SIZE_GB}"
   save_config_var "SENSOR_LV_SIZE_GB_PER_VM" "${SENSOR_LV_SIZE_GB_PER_VM}"
   save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"  
+
+  ########################
+  # 3.5) Select data disks for LVM (AIO storage)
+  ########################
+  log "[STEP 01] Select data disks for LVM storage (AIO)"
+
+  # Initialize variables
+  local root_info="OS Disk: detection failed (needs check)"
+  local disk_list=()
+  local all_disks
+
+  # List all physical disks (exclude loop, ram; include only type disk)
+  all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
+
+  if [[ -z "${all_disks}" ]]; then
+    whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
+    return 1
+  fi
+
+  # Iterate over disks
+  while read -r d_name d_size d_model; do
+    # Check if any child of the disk is mounted at /
+    if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^/$"; then
+      # OS disk found -> omit from list; keep for notice
+      root_info="OS Disk: ${d_name} (${d_size}) ${d_model} -> Ubuntu Linux (excluded)"
+    else
+      # Data disk candidate -> add to checklist
+      local flag="OFF"
+      for selected in ${DATA_SSD_LIST:-}; do
+        if [[ "${selected}" == "${d_name}" ]]; then
+          flag="ON"
+          break
+        fi
+      done
+      disk_list+=("${d_name}" "${d_size}_${d_model}" "${flag}")
+    fi
+  done <<< "${all_disks}"
+
+  # If no data disk candidates
+  if [[ ${#disk_list[@]} -eq 0 ]]; then
+    whiptail_msgbox "Warning" "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
+    return 1
+  fi
+
+  # Build guidance message
+  local msg_guide="Select disks for LVM/ES data storage (AIO).\n(Space: toggle, Enter: confirm)\n\n"
+  msg_guide+="==================================================\n"
+  msg_guide+=" [System protection] ${root_info}\n"
+  msg_guide+="==================================================\n\n"
+  msg_guide+="Select data disks from the list below:"
+
+  # Calculate menu size dynamically for disk selection
+  local disk_count=$(( ${#disk_list[@]} / 3 ))
+  local menu_dims
+  menu_dims=$(calc_menu_size "${disk_count}" 90 8)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+  # Center-align the menu message
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_guide}\n" "${menu_height}")
+
+  local selected_disks
+  selected_disks=$(whiptail --title "STEP 01 - Select data disks" \
+                             --checklist "${centered_msg}" \
+                             "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                             "${disk_list[@]}" \
+                             3>&1 1>&2 2>&3) || {
+    log "User canceled disk selection."
+    return 1
+  }
+
+  # whiptail output is like "sdb" "sdc" → remove quotes
+  selected_disks=$(echo "${selected_disks}" | tr -d '"')
+
+  if [[ -z "${selected_disks}" ]]; then
+    whiptail_msgbox "Warning" "No disks selected.\nCannot proceed with LVM configuration." 10 70
+    log "No data disk selected."
+    return 1
+  fi
+
+  log "Selected data disks: ${selected_disks}"
+  DATA_SSD_LIST="${selected_disks}"
+  save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
 
   ########################
   # 4) NIC Candidate Query and Selection
@@ -1338,61 +1900,11 @@ step_01_hw_detect() {
   done <<< "${nics}"
 
   ########################
-  # 4) NIC Selection (Branch by Network mode)
+  # 4) NIC Selection (NAT mode only)
   ########################
   
-  if [[ "${net_mode}" == "bridge" ]]; then
-    # Bridge Mode: HOST NIC + DATA NIC Selection
-    log "[STEP 01] Bridge Mode - HOST NIC and DATA NIC selection"
-    
-    # HOST NIC Selection
-    local host_nic
-    # Calculate menu size dynamically
-    local menu_dims
-    menu_dims=$(calc_menu_size ${#nic_list[@]} 80 10)
-    local menu_height menu_width menu_list_height
-    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-    
-    # Center-align menu message
-    local menu_msg
-    menu_msg=$(center_menu_message "Select NIC for KVM host access (for current SSH connection).\nCurrent setting: ${HOST_NIC:-<None>}" "${menu_height}")
-    
-    host_nic=$(whiptail --title "STEP 01 - HOST NIC Selection (Bridge Mode)" \
-                       --menu "${menu_msg}" \
-                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
-                       3>&1 1>&2 2>&3) || {
-      log "User canceled HOST NIC selection."
-      return 1
-    }
-
-    log "Selected HOST NIC: ${host_nic}"
-    HOST_NIC="${host_nic}"
-    save_config_var "HOST_NIC" "${HOST_NIC}"
-
-    # DATA NIC Selection  
-    local data_nic
-    # Calculate menu size dynamically
-    menu_dims=$(calc_menu_size ${#nic_list[@]} 80 10)
-    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-    
-    # Center-align menu message
-    menu_msg=$(center_menu_message "Select NIC for Sensor VM management/data.\nCurrent setting: ${DATA_NIC:-<None>}" "${menu_height}")
-    
-    data_nic=$(whiptail --title "STEP 01 - Data NIC Selection (Bridge Mode)" \
-                       --menu "${menu_msg}" \
-                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
-                       3>&1 1>&2 2>&3) || {
-      log "User canceled Data NIC selection."
-      return 1
-    }
-
-    log "Selected Data NIC: ${data_nic}"
-    DATA_NIC="${data_nic}"
-    save_config_var "DATA_NIC" "${DATA_NIC}"
-    
-  elif [[ "${net_mode}" == "nat" ]]; then
+  # NAT Mode: Select only 1 NAT uplink NIC
+  if [[ "${net_mode}" == "nat" ]]; then
     # NAT Mode: Select only 1 NAT uplink NIC
     log "[STEP 01] NAT Mode - NAT uplink NIC selection (select one)"
     
@@ -1414,14 +1926,14 @@ step_01_hw_detect() {
     }
 
     log "Selected NAT uplink NIC: ${nat_nic}"
-    HOST_NIC="${nat_nic}"  # HOST_NIC in variable NAT uplink NIC Store
+    HOST_NIC="${nat_nic}"  # HOST_NIC stores NAT uplink NIC
     DATA_NIC=""  # DATA NIC is not used in NAT mode
     save_config_var "HOST_NIC" "${HOST_NIC}"
     save_config_var "DATA_NIC" "${DATA_NIC}"
-    
+    save_config_var "SENSOR_NET_MODE" "${net_mode}"
   else
-    log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail_msgbox "Configuration Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
+    log "ERROR: Network mode must be NAT. Current: ${net_mode}"
+    whiptail_msgbox "Configuration Error" "Network mode must be NAT.\n\nCurrent mode: ${net_mode}"
     return 1
   fi
 
@@ -1490,53 +2002,65 @@ step_01_hw_detect() {
   SPAN_NICS="${selected_span_nics}"
   save_config_var "SPAN_NICS" "${SPAN_NICS}"
 
-  # ===== Additional: SPAN NIC Selection for mds2 (second sensor) =====
-  local mds2_candidates=()
-  for n in ${SPAN_NICS}; do
-    mds2_candidates+=("${n}" "Assign to mds2" "OFF")
-  done
+  # All SPAN NICs are assigned to mds (single sensor)
+  SPAN_NICS_MDS="${SPAN_NICS}"
+  save_config_var "SPAN_NICS_MDS" "${SPAN_NICS_MDS}"
 
-  local selected_span_nics_mds2
-  # Calculate menu size dynamically
-  menu_dims=$(calc_menu_size $((${#mds2_candidates[@]} / 3)) 80 10)
-  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  log "SPAN NIC(mds): ${SPAN_NICS_MDS}"
+
+  ########################
+  # 5-1) Select HOST access NIC (for direct KVM host access only, 192.168.0.100/24)
+  ########################
+  log "[STEP 01] Host access NIC selection (for direct KVM host access)"
   
-  # Center-align menu message
-  menu_msg=$(center_menu_message "Select NICs from all SPAN NICs to assign to mds2 (second sensor).\n\nNICs not selected will be automatically assigned to mds (first sensor)." "${menu_height}")
-  
-  selected_span_nics_mds2=$(whiptail --title "STEP 01 - mds2 SPAN NIC Selection" \
-    --checklist "${menu_msg}" \
-    "${menu_height}" "${menu_width}" "${menu_list_height}" \
-    "${mds2_candidates[@]}" \
-    3>&1 1>&2 2>&3) || {
-      log "User canceled mds2 SPAN NIC selection."
-      return 1
-    }
-
-  selected_span_nics_mds2=$(echo "${selected_span_nics_mds2}" | tr -d '"')
-
-  SPAN_NICS_MDS2="${selected_span_nics_mds2}"
-  save_config_var "SPAN_NICS_MDS2" "${SPAN_NICS_MDS2}"
-
-  # mds1 = All - mds2
-  local mds1=""
-  for n in ${SPAN_NICS}; do
-    local hit=0
-    for x in ${SPAN_NICS_MDS2}; do
-      [[ "${n}" == "${x}" ]] && hit=1 && break
-    done
-    [[ "${hit}" -eq 0 ]] && mds1="${mds1} ${n}"
+  # Get available NICs (exclude already selected NICs)
+  # nic_list format: [NIC_name, description, NIC_name, description, ...]
+  local available_nics=()
+  local i
+  for ((i=0; i<${#nic_list[@]}; i+=2)); do
+    local nic_name="${nic_list[i]}"
+    local nic_desc="${nic_list[i+1]}"
+    # Exclude already selected NICs
+    if [[ "${nic_name}" != "${HOST_NIC}" ]] && \
+       [[ ! "${SPAN_NICS}" =~ ${nic_name} ]]; then
+      available_nics+=("${nic_name}" "${nic_desc}")
+    fi
   done
-  SPAN_NICS_MDS1="${mds1# }"
-  save_config_var "SPAN_NICS_MDS1" "${SPAN_NICS_MDS1}"
-
-  # Combined(Compatible/Summary) Maintain
-  SPAN_NICS="$(echo "${SPAN_NICS_MDS1} ${SPAN_NICS_MDS2}" | xargs)"
-  save_config_var "SPAN_NICS" "${SPAN_NICS}"
-
-  log "SPAN NIC(mds) : ${SPAN_NICS_MDS1}"
-  log "SPAN NIC(mds2): ${SPAN_NICS_MDS2}"
-  log "SPAN NIC(Combined): ${SPAN_NICS}"
+  
+  if [[ ${#available_nics[@]} -eq 0 ]]; then
+    log "[STEP 01] No available NICs for host access (all NICs are already used). Skipping host access NIC selection."
+    HOST_ACCESS_NIC=""
+  else
+    # Calculate menu size dynamically
+    menu_dims=$(calc_menu_size ${#available_nics[@]} 90 10)
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+    
+    # Center-align menu message
+    local msg_content="Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_ACCESS_NIC:-<none>}\n"
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+    
+    local host_access_nic
+    host_access_nic=$(whiptail --title "STEP 01 - Select Host Access NIC" \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "${available_nics[@]}" \
+                      3>&1 1>&2 2>&3) || {
+      log "User canceled HOST_ACCESS_NIC selection."
+      HOST_ACCESS_NIC=""
+    })
+    
+    if [[ -n "${host_access_nic}" ]]; then
+      # Remove quotes from whiptail output
+      host_access_nic=$(echo "${host_access_nic}" | tr -d '"')
+      log "Selected HOST_ACCESS_NIC: ${host_access_nic}"
+      HOST_ACCESS_NIC="${host_access_nic}"
+      save_config_var "HOST_ACCESS_NIC" "${HOST_ACCESS_NIC}"
+    else
+      HOST_ACCESS_NIC=""
+      save_config_var "HOST_ACCESS_NIC" "${HOST_ACCESS_NIC}"
+    fi
+  fi
 
   ########################
   # 6) SPAN NIC PF PCI Address Collection (PCI passthrough specific)
@@ -1544,29 +2068,18 @@ step_01_hw_detect() {
   log "[STEP 01] SR-IOV based VF creation is not used (PF PCI direct assignment mode)."
   log "[STEP 01] Physical PCI address of SPAN NIC(PF)Collecting."
 
-  local span_pci_list_mds1=""
-  local span_pci_list_mds2=""
+  local span_pci_list_mds=""
 
   if [[ "${SPAN_ATTACH_MODE}" == "pci" ]]; then
     # PCI passthrough mode: Directly use Physical Function (PF) PCI address
-    for nic in ${SPAN_NICS_MDS1}; do
+    for nic in ${SPAN_NICS_MDS}; do
       pci_addr=$(readlink -f "/sys/class/net/${nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
       if [[ -z "${pci_addr}" ]]; then
         log "WARNING: ${nic} PCI address could not be found."
         continue
       fi
-      span_pci_list_mds1="${span_pci_list_mds1} ${pci_addr}"
+      span_pci_list_mds="${span_pci_list_mds} ${pci_addr}"
       log "[STEP 01] ${nic} (mds SPAN NIC) -> Physical PCI: ${pci_addr}"
-    done
-
-    for nic in ${SPAN_NICS_MDS2}; do
-      pci_addr=$(readlink -f "/sys/class/net/${nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-      if [[ -z "${pci_addr}" ]]; then
-        log "WARNING: ${nic} PCI address could not be found."
-        continue
-      fi
-      span_pci_list_mds2="${span_pci_list_mds2} ${pci_addr}"
-      log "[STEP 01] ${nic} (mds2 SPAN NIC) -> Physical PCI: ${pci_addr}"
     done
 
   else
@@ -1576,16 +2089,13 @@ step_01_hw_detect() {
 
   SPAN_ATTACH_MODE="pci"
 
-  # Store PCI list per sensor
-  SENSOR_SPAN_VF_PCIS_MDS1="${span_pci_list_mds1# }"
-  SENSOR_SPAN_VF_PCIS_MDS2="${span_pci_list_mds2# }"
-  save_config_var "SENSOR_SPAN_VF_PCIS_MDS1" "${SENSOR_SPAN_VF_PCIS_MDS1}"
-  save_config_var "SENSOR_SPAN_VF_PCIS_MDS2" "${SENSOR_SPAN_VF_PCIS_MDS2}"
-  log "mds SPAN NIC PCI List : ${SENSOR_SPAN_VF_PCIS_MDS1}"
-  log "mds2 SPAN NIC PCI List: ${SENSOR_SPAN_VF_PCIS_MDS2}"
+  # Store PCI list for mds
+  SENSOR_SPAN_VF_PCIS_MDS="${span_pci_list_mds# }"
+  save_config_var "SENSOR_SPAN_VF_PCIS_MDS" "${SENSOR_SPAN_VF_PCIS_MDS}"
+  log "mds SPAN NIC PCI List: ${SENSOR_SPAN_VF_PCIS_MDS}"
 
   # Legacy combined(For compatibility) + SPAN_NIC_LIST Update
-  SENSOR_SPAN_VF_PCIS="${SENSOR_SPAN_VF_PCIS_MDS1} ${SENSOR_SPAN_VF_PCIS_MDS2}"
+  SENSOR_SPAN_VF_PCIS="${SENSOR_SPAN_VF_PCIS_MDS}"
   save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
 
   SPAN_NIC_LIST="${SPAN_NICS}"
@@ -1604,43 +2114,8 @@ step_01_hw_detect() {
     pci_label="SPAN Interface (Bridge)"
   fi
 
-  if [[ "${net_mode}" == "bridge" ]]; then
-    summary=$(cat <<EOF
-[STEP 01 Result Summary - Bridge Mode]
-
-- Sensor network mode : ${net_mode}
-
-- Number of VMs     : ${SENSOR_VM_COUNT}
-
-- CPU (Total)         : ${SENSOR_TOTAL_VCPUS}
-- CPU (Per VM)         : ${SENSOR_VCPUS_PER_VM}
-- CPUSET (mds)       : ${SENSOR_CPUSET_MDS1:-<automatic/Not configured>}
-- CPUSET (mds2)      : ${SENSOR_CPUSET_MDS2:-<automatic/Not configured>}
-
-- Memory (Total, MB)  : ${SENSOR_TOTAL_MEMORY_MB}
-- Memory (Per VM, MB)  : ${SENSOR_MEMORY_MB_PER_VM}
-
-- LV location            : ${LV_LOCATION}
-- LV size (Total, GB) : ${SENSOR_TOTAL_LV_SIZE_GB}
-- LV size (Per VM, GB) : ${SENSOR_LV_SIZE_GB_PER_VM}
-
-- Host NIC           : ${HOST_NIC}
-- Data NIC           : ${DATA_NIC}
-
-- SPAN NIC (mds)      : ${SPAN_NICS_MDS1:-<None>}
-- SPAN NIC (mds2)     : ${SPAN_NICS_MDS2:-<None>}
-- SPAN NIC (Combined)     : ${SPAN_NICS}
-
-- SPAN attachment mode      : ${SPAN_ATTACH_MODE}
-- ${pci_label} (mds)  : ${SENSOR_SPAN_VF_PCIS_MDS1:-<None>}
-- ${pci_label} (mds2) : ${SENSOR_SPAN_VF_PCIS_MDS2:-<None>}
-- ${pci_label} (Combined) : ${SENSOR_SPAN_VF_PCIS}
-
-Configuration file: ${CONFIG_FILE}
-EOF
-)
-
-  elif [[ "${net_mode}" == "nat" ]]; then
+  # NAT mode only - bridge mode summary removed
+  if [[ "${net_mode}" == "nat" ]]; then
     summary=$(cat <<EOF
 [STEP 01 Result Summary - NAT Mode]
 
@@ -1651,8 +2126,9 @@ EOF
 - LV size          : ${LV_SIZE_GB}GB
 - NAT uplink NIC     : ${HOST_NIC}
 - Data NIC         : N/A (NAT mode using virbr0)
+- Data disks (LVM)  : ${DATA_SSD_LIST}
 - SPAN NICs       : ${SPAN_NICS}
-- SPAN attachment mode    : ${SPAN_ATTACH_MODE}
+- SPAN attachment mode    : ${SPAN_ATTACH_MODE} (PCI passthrough only)
 - ${pci_label}     : ${SENSOR_SPAN_VF_PCIS}
 
 Configuration file: ${CONFIG_FILE}
@@ -1677,7 +2153,13 @@ Unknown Network mode: ${net_mode}
 
 
 step_02_hwe_kernel() {
+  local STEP_ID="02_hwe_kernel"
+  local STEP_NAME="02. HWE Kernel Installation"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 02] HWE Kernel Installation"
+  log "[STEP 02] This step will install Hardware Enablement (HWE) kernel for better hardware support."
   load_config
 
   #######################################
@@ -1722,24 +2204,50 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "Current kernel version(uname -r): ${cur_kernel}"
-    echo
-    echo "HWE kernel status: ${hwe_installed}"
+    echo "STEP 02 - HWE Kernel Installation Overview"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+      echo
+    fi
+    echo "📊 CURRENT STATUS:"
+    echo "  • HWE kernel status: ${hwe_installed}"
     if [[ "${hwe_installed}" == "yes" ]]; then
-      echo "  ✅ ${hwe_status_detail}"
+      echo "    ✅ ${hwe_status_detail}"
     else
-      echo "  ⚠️  ${hwe_status_detail}"
-      echo "  Expected package: ${pkg_name}"
+      echo "    ⚠️  ${hwe_status_detail}"
+      echo "    Expected package: ${pkg_name}"
     fi
     echo
-    echo "This STEP performs the following tasks:"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "📋 SIMULATED EXECUTION STEPS:"
+      echo "  1) apt update (simulated)"
+      echo "  2) apt full-upgrade -y (simulated)"
+      echo "  3) ${pkg_name} Installation (simulated, skip if already installed)"
+      echo
+      echo "ℹ️  In real execution mode:"
+      echo "  • HWE kernel package would be installed"
+      echo "  • New kernel would be available but NOT yet active"
+      echo "  • Kernel would become active after reboot"
+    else
+      echo "📋 EXECUTION STEPS:"
     echo "  1) apt update"
     echo "  2) apt full-upgrade -y"
-    echo "  3) ${pkg_name} install (Skip if already installed)"
+      echo "  3) ${pkg_name} Installation (skip if already installed)"
+    fi
     echo
-    echo "New HWE kernel will be applied on next host reboot."
-    echo "This script STEP 05 (kernel tuning) after completion,"
-    echo "is configured to automatically reboot the host only once."
+    echo "📝 IMPORTANT NOTES:"
+    echo "  • HWE kernel will be applied after next reboot"
+    echo "    (uname -r output may not change until after reboot)"
+    echo
+    echo "  • After STEP 03 (NIC/Network configuration) completes,"
+    echo "    the system will automatically reboot"
+    echo "    The new HWE kernel will be applied during that reboot"
+    echo
+    echo "  • After STEP 05 (kernel tuning) completes,"
+    echo "    the system will automatically reboot again"
+    echo "    According to AUTO_REBOOT_AFTER_STEP_ID settings,"
+    echo "    the host will automatically reboot only once per step"
   } > "${tmp_status}"
 
 
@@ -1751,7 +2259,7 @@ step_02_hwe_kernel() {
     skip_msg+="Current kernel: ${cur_kernel}\n\n"
     skip_msg+="Do you want to skip this STEP?\n\n"
     skip_msg+="(Yes: Skip / No: Continue with package update and verification)"
-    if ! whiptail_yesno "STEP 02 - HWE Kernel Already Detected" "${skip_msg}" 18 80
+    if whiptail_yesno "STEP 02 - HWE Kernel Already Detected" "${skip_msg}" 18 80
     then
       log "User chose to skip STEP 02 entirely (HWE kernel already detected: ${hwe_status_detail})."
       save_state "02_hwe_kernel"
@@ -1815,7 +2323,7 @@ step_02_hwe_kernel() {
   else
     # In actual execution mode, check current kernel version and HWE package installation status again
     new_kernel=$(uname -r 2>/dev/null || echo "unknown")
-    hwe_now="no"
+      hwe_now="no"
     hwe_now_detail="not installed"
     
     # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
@@ -1826,24 +2334,59 @@ step_02_hwe_kernel() {
   fi
 
   {
-    echo "STEP 02 execution summary"
-    echo "----------------------"
-    echo "Previous kernel(uname -r): ${cur_kernel}"
-    echo "Current kernel(uname -r): ${new_kernel}"
-    echo
-    echo "HWE kernel status: ${hwe_now}"
-    if [[ "${hwe_now}" == "yes" ]]; then
-      echo "  ✅ ${hwe_now_detail}"
+    echo "STEP 02 - HWE Kernel Installation Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • Previous kernel (uname -r): ${cur_kernel}"
+      echo "  • Current kernel (uname -r): ${new_kernel}"
+      echo "  • HWE kernel status: ${hwe_now}"
+      if [[ "${hwe_now}" == "yes" ]]; then
+        echo "    ✅ ${hwe_now_detail}"
+      else
+        echo "    ⚠️  ${hwe_now_detail}"
+        echo "    Expected package: ${pkg_name}"
+      fi
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. Package update (apt update)"
+      echo "  2. System upgrade (apt full-upgrade -y)"
+      echo "  3. Network tools installation (ifupdown, net-tools)"
+      echo "     - Required for STEP 03 (NIC configuration)"
+      echo "  4. HWE kernel package installation (${pkg_name})"
+      echo "     - Would be skipped if already installed"
     else
-      echo "  ⚠️  ${hwe_now_detail}"
-      echo "  Expected package: ${pkg_name}"
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 KERNEL STATUS:"
+      echo "  • HWE kernel status: ${hwe_now}"
+      if [[ "${hwe_now}" == "yes" ]]; then
+        echo "    ✅ ${hwe_now_detail}"
+      else
+        echo "    ⚠️  ${hwe_now_detail}"
+        echo "    Expected package: ${pkg_name}"
+        echo "    Note: HWE kernel will be active after reboot"
+      fi
     fi
     echo
-    echo "※ New HWE kernel will be 'next host reboot' will be applied."
-    echo "   (now uname -r output is before reboot, so may not change.)"
+    echo "📝 IMPORTANT NOTES:"
+    echo "  • New HWE kernel will be applied after next host reboot"
+    echo "    (uname -r output may not change until after reboot)"
     echo
-    echo "※ This script STEP 05 (kernel tuning) upon completion,"
-    echo "   According to AUTO_REBOOT_AFTER_STEP_ID settings, the host will automatically reboot only once."
+    echo "  • After STEP 03 (NIC/Network configuration) completes,"
+    echo "    the system will automatically reboot"
+    echo "    The new HWE kernel will be applied during that reboot"
+    echo
+    echo "  • After STEP 05 (kernel tuning) completes,"
+    echo "    the system will automatically reboot again"
+    echo "    According to AUTO_REBOOT_AFTER_STEP_ID settings,"
+    echo "    the host will automatically reboot only once per step"
+    echo
+    echo "💡 TIP: After reboot, verify the new kernel with:"
+    echo "   uname -r"
+    echo "   dpkg -l | grep ${pkg_name}"
   } > "${tmp_status}"
 
 
@@ -1851,33 +2394,33 @@ step_02_hwe_kernel() {
 
   # reboot itself STEP 05 upon completion, common logic(AUTO_REBOOT_AFTER_STEP_ID)performed only once in
   log "[STEP 02] HWE Kernel Installation step has been completed. New HWE kernel will be applied on host reboot."
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 02] HWE kernel installation completed successfully. New kernel will be active after reboot."
 
   return 0
 }
 
 
 step_03_nic_ifupdown() {
+  local STEP_ID="03_nic_ifupdown"
+  local STEP_NAME="03. NIC Name/ifupdown Switch and Network Configuration"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 03] NIC Name/ifupdown Switch and Network Configuration"
+  log "[STEP 03] This step will configure network interfaces using ifupdown (NAT mode only)."
   load_config
 
-  # Check Network mode
-  local net_mode="${SENSOR_NET_MODE:-bridge}"
-  log "[STEP 03] Sensor network mode: ${net_mode}"
+  # Force NAT mode only
+  local net_mode="nat"
+  SENSOR_NET_MODE="nat"
+  log "[STEP 03] Sensor network mode: ${net_mode} (NAT only)"
 
-  # Execute branch by mode
-  if [[ "${net_mode}" == "bridge" ]]; then
-    log "[STEP 03] Bridge Mode - Configuring L2 bridge method"
-    step_03_bridge_mode
-    return $?
-  elif [[ "${net_mode}" == "nat" ]]; then
+  # Execute NAT mode only
     log "[STEP 03] NAT Mode - OpenXDR execute NAT configuration method"
     step_03_nat_mode 
     return $?
-  else
-    log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail_msgbox "Network Mode Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
-    return 1
-  fi
 }
 
 #######################################
@@ -1904,8 +2447,7 @@ step_03_bridge_mode() {
     echo "DATA_NIC  : ${DATA_NIC} (SR-IOV not applied)"
     echo
     echo "SPAN NICs (PCI Passthrough application target):"
-    echo "  - mds (1th sensor) : ${SPAN_NICS_MDS1:-<None>}"
-    echo "  - mds2(2th sensor) : ${SPAN_NICS_MDS2:-<None>}"
+    echo "  - mds (sensor) : ${SPAN_NICS_MDS:-<None>}"
     echo
 
     if [[ -z "${SPAN_NIC_LIST:-}" ]]; then
@@ -2464,8 +3006,7 @@ step_03_nat_mode() {
     echo "NAT uplink NIC  : ${HOST_NIC}"
     echo "  -> PCI     : ${nat_pci}"
     echo
-    echo "Sensor VM will be virbr0 connected to NAT bridge."
-    echo "DATA NIC is not used in NAT mode."
+    echo "AIO & Sensor VM will be virbr0 connected to NAT bridge."
   } > "${tmp_pci}"
 
   show_textbox "STEP 03 - NAT NIC/PCI Verification" "${tmp_pci}"
@@ -2476,13 +3017,27 @@ step_03_nat_mode() {
   local maybe_done=0
   local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
   local iface_file="/etc/network/interfaces"
+  local host_cfg="/etc/network/interfaces.d/02-hostmgmt.cfg"
 
   if [[ -f "${udev_file}" ]] && \
      grep -q "KERNELS==\"${nat_pci}\".*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null; then
     if [[ -f "${iface_file}" ]] && \
        grep -q "^auto mgt" "${iface_file}" 2>/dev/null && \
        grep -q "iface mgt inet static" "${iface_file}" 2>/dev/null; then
-      maybe_done=1
+      # Check hostmgmt if HOST_ACCESS_NIC is set
+      if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+        local host_access_pci
+        host_access_pci=$(readlink -f "/sys/class/net/${HOST_ACCESS_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
+        if [[ -n "${host_access_pci}" ]] && \
+           grep -q "KERNELS==\"${host_access_pci}\".*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null && \
+           [[ -f "${host_cfg}" ]] && \
+           grep -q "^auto hostmgmt" "${host_cfg}" 2>/dev/null && \
+           grep -q "address 192\.168\.0\.100" "${host_cfg}" 2>/dev/null; then
+          maybe_done=1
+        fi
+      else
+        maybe_done=1
+      fi
     fi
   fi
 
@@ -2513,9 +3068,113 @@ step_03_nat_mode() {
   cur_gw=$(ip route | awk '/default.*'"${HOST_NIC}"'/ {print $3}' | head -n1)
   [[ -z "${cur_gw}" ]] && cur_gw=$(ip route | awk '/default/ {print $3}' | head -n1)
 
-  # Find DNS
-  cur_dns=$(awk '/nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+  # Find DNS (Ubuntu 24.04 uses systemd-resolved, so get actual DNS servers from the interface)
+  cur_dns=""
+  
+  # Method 1: Try resolvectl status for the specific interface (most accurate for Ubuntu 24.04)
+  if command -v resolvectl >/dev/null 2>&1; then
+    # Get DNS servers for the current interface
+    local iface_dns
+    iface_dns=$(resolvectl status "${HOST_NIC}" 2>/dev/null | awk '/DNS Servers:/ {getline; while (NF > 0 && $1 !~ /^Link/ && $1 !~ /^DNS/) {print $1; getline}}' 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    if [[ -n "${iface_dns}" ]]; then
+      cur_dns="${iface_dns}"
+    else
+      # If interface-specific DNS not found, try global DNS
+      iface_dns=$(resolvectl status 2>/dev/null | awk '/DNS Servers:/ {getline; while (NF > 0 && $1 !~ /^Link/ && $1 !~ /^DNS/) {print $1; getline}}' 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+      [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
+    fi
+  fi
+  
+  # Method 2: Try /run/systemd/resolve/resolv.conf (systemd-resolved actual config)
+  if [[ -z "${cur_dns}" ]] && [[ -f /run/systemd/resolve/resolv.conf ]]; then
+    local all_dns
+    all_dns=$(awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf 2>/dev/null | grep -v "^127.0.0" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    [[ -n "${all_dns}" ]] && cur_dns="${all_dns}"
+  fi
+  
+  # Method 3: Try to get DNS from netplan configuration (Ubuntu 18.04+)
+  if [[ -z "${cur_dns}" ]] && [[ -d /etc/netplan ]]; then
+    local netplan_file
+    # Find the first netplan YAML file
+    netplan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
+    if [[ -n "${netplan_file}" && -f "${netplan_file}" ]]; then
+      local iface_dns=""
+      
+      # Try using yq if available (most accurate)
+      if command -v yq >/dev/null 2>&1; then
+        # Try to get DNS from the specific interface
+        iface_dns=$(yq eval ".network.ethernets.\"${HOST_NIC}\".nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        if [[ -z "${iface_dns}" ]]; then
+          # Try dhcp4-overrides
+          iface_dns=$(yq eval ".network.ethernets.\"${HOST_NIC}\".dhcp4-overrides.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        fi
+        if [[ -z "${iface_dns}" ]]; then
+          # Try bridges
+          iface_dns=$(yq eval ".network.bridges.*.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        fi
+        if [[ -z "${iface_dns}" ]]; then
+          # Try any ethernet interface
+          iface_dns=$(yq eval ".network.ethernets.*.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        fi
+      else
+        # Fallback: simple grep/awk parsing (works without yq)
+        # Extract DNS IPs from nameservers.addresses sections
+        # Pattern: nameservers: ... addresses: [IP1, IP2] or addresses: - IP1 - IP2
+        local dns_list=""
+        
+        # Method 1: Look for addresses: [IP1, IP2, ...] format
+        dns_list=$(grep -A 5 "nameservers:" "${netplan_file}" 2>/dev/null | \
+          grep -E "addresses:\s*\[" -A 10 | \
+          grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | \
+          tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        
+        # Method 2: Look for addresses: - IP format (if Method 1 didn't find anything)
+        if [[ -z "${dns_list}" ]]; then
+          dns_list=$(grep -A 10 "nameservers:" "${netplan_file}" 2>/dev/null | \
+            grep -E "^\s+-\s+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | \
+            sed 's/.*-\s*\([0-9.]*\).*/\1/' | \
+            tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        fi
+        
+        # Method 3: Look for any IP addresses after nameservers: (more flexible)
+        if [[ -z "${dns_list}" ]]; then
+          dns_list=$(awk '/nameservers:/ {flag=1; next} 
+                         flag && /addresses:/ {flag=2; next}
+                         flag==2 && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {gsub(/[^0-9.]/,"",$0); if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $0; if (/^[[:space:]]*[a-zA-Z]/) flag=0}
+                         /^[[:space:]]*[a-zA-Z]+:/ && !/nameservers/ && !/addresses/ {flag=0}' "${netplan_file}" 2>/dev/null | \
+            tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        fi
+        
+        iface_dns="${dns_list}"
+      fi
+      
+      [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
+    fi
+  fi
+  
+  # Method 4: Try to get DNS from network interface configuration (ifupdown style)
+  if [[ -z "${cur_dns}" ]] && [[ -f /etc/network/interfaces ]]; then
+    # Try to find DNS from the interface that matches HOST_NIC or mgt
+    local iface_dns
+    iface_dns=$(awk '/^[[:space:]]*iface.*'"${HOST_NIC}"'/,/^[[:space:]]*iface/ {if (/^[[:space:]]*dns-nameservers/) {for (i=2; i<=NF; i++) printf "%s ", $i; exit}}' /etc/network/interfaces 2>/dev/null | sed 's/[[:space:]]*$//')
+    if [[ -z "${iface_dns}" ]]; then
+      # Try mgt interface
+      iface_dns=$(awk '/^[[:space:]]*iface.*mgt/,/^[[:space:]]*iface/ {if (/^[[:space:]]*dns-nameservers/) {for (i=2; i<=NF; i++) printf "%s ", $i; exit}}' /etc/network/interfaces 2>/dev/null | sed 's/[[:space:]]*$//')
+    fi
+    [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
+  fi
+  
+  # Method 5: Try /etc/resolv.conf (but skip if it's 127.0.0.53)
+  if [[ -z "${cur_dns}" ]]; then
+    local resolv_dns
+    resolv_dns=$(awk '/nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -v "^127.0.0" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    [[ -n "${resolv_dns}" ]] && cur_dns="${resolv_dns}"
+  fi
+  
+  # Fallback to default if still empty
   [[ -z "${cur_dns}" ]] && cur_dns="8.8.8.8"
+  
+  log "[STEP 03 NAT Mode] Detected DNS servers for ${HOST_NIC}: ${cur_dns}"
 
   # IP configuration Receive input
   local new_ip new_netmask new_gw new_dns
@@ -2586,15 +3245,31 @@ SUBSYSTEM==\"net\", ACTION==\"add\", KERNELS==\"${span_pci}\", NAME:=\"${span_ni
     done
   fi
 
+  # Host access NIC (hostmgmt) udev rule
+  local hostmgmt_udev_rule=""
+  if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+    local host_access_pci
+    host_access_pci=$(readlink -f "/sys/class/net/${HOST_ACCESS_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
+    if [[ -n "${host_access_pci}" ]]; then
+      hostmgmt_udev_rule="
+
+# Host direct management interface (no gateway) PCI-bus ${host_access_pci}
+SUBSYSTEM==\"net\", ACTION==\"add\", KERNELS==\"${host_access_pci}\", NAME:=\"hostmgmt\""
+      log "[STEP 03 NAT Mode] Host access NIC ${HOST_ACCESS_NIC} (PCI: ${host_access_pci}) will be renamed to hostmgmt"
+    else
+      log "WARNING: HOST_ACCESS_NIC ${HOST_ACCESS_NIC} PCI address could not be found. Skipping hostmgmt udev rule."
+    fi
+  fi
+
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] /etc/udev/rules.d/99-custom-ifnames.rules create"
-    log "[DRY-RUN] Add NAT mgt NIC + SPAN NIC name fixed rule"
+    log "[DRY-RUN] Add NAT mgt NIC + SPAN NIC name fixed rule + hostmgmt rule"
   else
     cat > /etc/udev/rules.d/99-custom-ifnames.rules <<EOF
 # XDR NAT Mode - Custom interface names
-SUBSYSTEM=="net", ACTION=="add", KERNELS=="${nat_pci}", NAME:="mgt"${span_udev_rules}
+SUBSYSTEM=="net", ACTION=="add", KERNELS=="${nat_pci}", NAME:="mgt"${hostmgmt_udev_rule}${span_udev_rules}
 EOF
-    log "udev rule file creation completed (mgt + SPAN NIC name fixed)"
+    log "udev rule file creation completed (mgt + hostmgmt + SPAN NIC name fixed)"
   fi
 
   #######################################
@@ -2625,6 +3300,45 @@ iface mgt inet static
     dns-nameservers ${new_dns}
 EOF
     log "/etc/network/interfaces configuration completed"
+  fi
+
+  #######################################
+  # 3-1) Create /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt, no gateway, fixed IP)
+  #######################################
+  if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+    log "[STEP 03 NAT Mode] Creating /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt: 192.168.0.100/24, no gateway)"
+
+    local iface_dir="/etc/network/interfaces.d"
+    local host_cfg="${iface_dir}/02-hostmgmt.cfg"
+    local host_bak="${host_cfg}.$(date +%Y%m%d-%H%M%S).bak"
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      mkdir -p "${iface_dir}"
+    fi
+
+    if [[ -f "${host_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
+      cp -a "${host_cfg}" "${host_bak}"
+      log "Backed up existing ${host_cfg}: ${host_bak}"
+    fi
+
+    local host_content
+    host_content=$(cat <<EOF
+# Host direct management interface (no gateway)
+auto hostmgmt
+iface hostmgmt inet static
+    address 192.168.0.100
+    netmask 255.255.255.0
+EOF
+)
+
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Will write the following content to ${host_cfg}:\n${host_content}"
+    else
+      printf "%s\n" "${host_content}" > "${host_cfg}"
+      log "Created ${host_cfg} (hostmgmt: 192.168.0.100/24, no gateway)"
+    fi
+  else
+    log "[STEP 03 NAT Mode] HOST_ACCESS_NIC not set, skipping hostmgmt interface configuration"
   fi
 
   #######################################
@@ -2666,11 +3380,13 @@ Network configuration:
 - NAT uplink NIC  : ${HOST_NIC} → mgt (${new_ip}/${new_netmask})
 - Gateway      : ${new_gw}
 - DNS          : ${new_dns}
-- Sensor VM      : Connected to virbr0 NAT bridge (192.168.122.0/24)
+- Sensor VM      : Connected to virbr0 NAT bridge (192.168.122.0/24)${HOST_ACCESS_NIC:+
+- Host access NIC : ${HOST_ACCESS_NIC} → hostmgmt (192.168.0.100/24, no gateway)}
 - SPAN NICs   : ${SPAN_NIC_LIST:-None} (PCI passthrough specific)${span_summary_nat}
 
 udev rule     : /etc/udev/rules.d/99-custom-ifnames.rules
-network configuration  : /etc/network/interfaces
+network configuration  : /etc/network/interfaces${HOST_ACCESS_NIC:+
+hostmgmt configuration : /etc/network/interfaces.d/02-hostmgmt.cfg}
 
 ※ Reboot is required due to network configuration changes.
   According to AUTO_REBOOT_AFTER_STEP_ID settings, auto reboot will occur after STEP completion.
@@ -2681,6 +3397,9 @@ EOF
   whiptail_msgbox "STEP 03 NAT Mode Completed" "${summary}" 20 80
 
   log "[STEP 03 NAT Mode] NAT network configuration completed. NAT configuration will be applied after reboot."
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 03] Network configuration completed successfully. Changes will be applied after reboot."
 
   return 0
 }
@@ -2688,7 +3407,13 @@ EOF
 
 
 step_04_kvm_libvirt() {
+  local STEP_ID="04_kvm_libvirt"
+  local STEP_NAME="04. KVM / Libvirt Installation and Basic Configuration"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 04] KVM / Libvirt Installation and Basic Configuration"
+  log "[STEP 04] This step will install and configure KVM/libvirt for VM management."
   load_config
 
   # Check Network mode
@@ -2768,6 +3493,7 @@ step_04_kvm_libvirt() {
       "qemu-utils"
       "virtinst"      # Additional (PDF guide requirement)
       "genisoimage"   # Additional (for Cloud-init ISO creation)
+      "ipset"         # Required for libvirt hooks DNAT (UI port filtering)
     )
 
   local pkg_count=0
@@ -2833,6 +3559,9 @@ step_04_kvm_libvirt() {
   <bridge name='virbr0' stp='on' delay='0'/>
   <ip address='192.168.122.1' netmask='255.255.255.0'>
   </ip>
+  <firewall>
+    <driver name='none'/>
+  </firewall>
 </network>
 EOF
     
@@ -2878,30 +3607,86 @@ EOF
   fi
 
   {
-    echo "STEP 04 execution summary"
-    echo "------------------"
-    echo "KVM acceleration Use possible: ${final_kvm_ok}"
-    echo "libvirtd service: ${final_libvirtd_ok}"
-    echo
-    echo "Sensor VM networking:"
-    echo "- br-data: DATA NIC L2 bridge"
-    echo "- br-span*: SPAN NIC L2 bridge (if bridge mode)"
-    echo "- SPAN NIC: PCI passthrough (pci modeif)"
-    echo
-    echo "※ User group changes will be applied after login/reboot."
-    echo "※ Virtualization function must be enabled in BIOS/UEFI."
+    echo "STEP 04 - KVM / Libvirt Installation Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • KVM availability: ${final_kvm_ok}"
+      echo "  • libvirtd service: ${final_libvirtd_ok}"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. KVM/libvirt packages would be installed:"
+      echo "     - qemu-kvm, libvirt-daemon-system, libvirt-clients"
+      echo "     - bridge-utils, virt-manager, cpu-checker"
+      echo "     - qemu-utils, virtinst, genisoimage"
+      echo
+      echo "  2. Current user would be added to libvirt group"
+      echo "  3. libvirtd and virtlogd services would be enabled and started"
+      echo
+      echo "  4. NAT Mode Network Configuration:"
+      echo "     - OpenXDR NAT network (virbr0/192.168.122.0/24) would be created"
+      echo "     - AIO and Sensor VMs will use virbr0 NAT bridge"
+      echo
+      echo "⚠️  IMPORTANT NOTES:"
+      echo "  • User group changes require logout/login or reboot to take effect"
+      echo "  • BIOS/UEFI must have virtualization (VT-x/VT-d) enabled"
+      echo "  • KVM acceleration requires hardware virtualization support"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 INSTALLATION STATUS:"
+      echo "  • KVM availability: ${final_kvm_ok}"
+      echo "  • libvirtd service: ${final_libvirtd_ok}"
+      echo
+      echo "📦 PACKAGES INSTALLED:"
+      echo "  • qemu-kvm, libvirt-daemon-system, libvirt-clients"
+      echo "  • bridge-utils, virt-manager, cpu-checker"
+      echo "  • qemu-utils, virtinst, genisoimage"
+      echo "  • ipset (required for libvirt hooks DNAT)"
+      echo
+      echo "👤 USER CONFIGURATION:"
+      echo "  • Current user added to libvirt group"
+      echo "    (Group changes require logout/login or reboot)"
+      echo
+      echo "🔧 SERVICE STATUS:"
+      echo "  • libvirtd: enabled and started"
+      echo "  • virtlogd: enabled and started"
+      echo
+      echo "🌐 NETWORK CONFIGURATION (NAT Mode):"
+      echo "  • OpenXDR NAT network: created and started"
+      echo "  • Network: virbr0 (192.168.122.0/24)"
+      echo "  • AIO VM will use virbr0 NAT bridge (192.168.122.2)"
+      echo "  • Sensor VM will use virbr0 NAT bridge (192.168.122.3)"
+      echo
+      echo "⚠️  IMPORTANT NOTES:"
+      echo "  • User group changes will be applied after next login/reboot"
+      echo "  • BIOS/UEFI must have virtualization (VT-x/VT-d) enabled"
+      echo "  • Verify KVM with: kvm-ok"
+      echo "  • Verify libvirt with: virsh list --all"
+    fi
   } > "${tmp_info}"
 
   show_textbox "STEP 04 Result Summary" "${tmp_info}"
 
   log "[STEP 04] KVM / Libvirt install and configuration completed"
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 04] KVM/libvirt installation and configuration completed successfully."
 
   return 0
 }
 
 
 step_05_kernel_tuning() {
+  local STEP_ID="05_kernel_tuning"
+  local STEP_NAME="05. Kernel Parameters / KSM / Swap Tuning"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 05] Kernel Parameters / KSM / Swap Tuning"
+  log "[STEP 05] This step will configure kernel parameters, disable KSM, and optionally disable swap."
   load_config
 
   local tmp_status="/tmp/xdr_step05_status.txt"
@@ -2991,7 +3776,7 @@ step_05_kernel_tuning() {
   log "[STEP 05] Kernel parameter tuning (/etc/sysctl.conf)"
 
   local sysctl_params="
-  # XDR Installer kernel tuning (PDF guide compliance)
+  # XDR AIO & Sensor Installer kernel tuning (PDF guide compliance)
   # [cite_start]Enable IPv4 packet forwarding [cite: 53-57]
   net.ipv4.ip_forward = 1
 
@@ -3105,19 +3890,104 @@ step_05_kernel_tuning() {
   # 5) Result Summary
   #######################################
   {
-    echo "STEP 05 execution summary"
-    echo "------------------"
-    echo "GRUB IOMMU configuration: Completed"
-    echo "Kernel parameter tuning: Completed"
-    echo "KSM disabled: Completed"
-    echo
-    echo "※ System reboot is required to apply all configurations."
-    echo "※ After this STEP completion, it will automatically reboot."
+    echo "STEP 05 - Kernel Tuning Configuration Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED CONFIGURATION:"
+      echo "  • GRUB IOMMU Configuration: Would be applied"
+      echo "  • Kernel parameter tuning: Would be applied"
+      echo "  • KSM disable: Would be applied"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. GRUB Configuration:"
+      echo "     - /etc/default/grub would be modified"
+      echo "     - IOMMU parameters (intel_iommu=on iommu=pt) would be added"
+      echo "     - update-grub would be executed"
+      echo
+      echo "  2. Kernel Parameters:"
+      echo "     - /etc/sysctl.conf would be updated"
+      echo "     - net.ipv4.ip_forward = 1"
+      echo "     - vm.min_free_kbytes = 1048576"
+      echo "     - sysctl -p would be executed"
+      echo
+      echo "  3. KSM Disable:"
+      echo "     - /etc/default/qemu-kvm would be created/updated"
+      echo "     - KSM_ENABLED=0 would be set"
+      echo
+      local swap_status=""
+      if swapon --show 2>/dev/null | grep -q .; then
+        swap_status="enabled"
+      else
+        swap_status="disabled"
+      fi
+      if [[ "${swap_status}" == "enabled" ]]; then
+        echo "  4. Swap Disable:"
+        echo "     - All swap would be disabled (swapoff -a)"
+        echo "     - /etc/fstab swap entries would be commented out"
+        echo "     - Swap files would be removed"
+        echo "     - systemd-swap service would be disabled"
+      else
+        echo "  4. Swap: Already disabled (no action needed)"
+      fi
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • System reboot is required to apply all configuration changes"
+      echo "  • GRUB changes will take effect after reboot"
+      echo "  • AUTO_REBOOT_AFTER_STEP_ID is configured"
+      echo "  • System will automatically reboot after STEP completion"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 CONFIGURATION APPLIED:"
+      echo "  • GRUB IOMMU Configuration: Completed"
+      echo "    - /etc/default/grub: IOMMU parameters added"
+      echo "    - update-grub: executed"
+      echo
+      echo "  • Kernel Parameter Tuning: Completed"
+      echo "    - /etc/sysctl.conf: updated"
+      echo "    - net.ipv4.ip_forward = 1"
+      echo "    - vm.min_free_kbytes = 1048576"
+      echo "    - sysctl -p: executed"
+      echo
+      echo "  • KSM Disable: Completed"
+      echo "    - /etc/default/qemu-kvm: KSM_ENABLED=0 configured"
+      echo
+      local swap_status=""
+      if swapon --show 2>/dev/null | grep -q .; then
+        swap_status="enabled"
+      else
+        swap_status="disabled"
+      fi
+      if [[ "${swap_status}" == "disabled" ]]; then
+        echo "  • Swap Disable: Completed"
+        echo "    - All swap disabled"
+        echo "    - /etc/fstab swap entries commented out"
+        echo "    - Swap files removed"
+        echo "    - systemd-swap service disabled"
+      else
+        echo "  • Swap: User chose to keep swap enabled"
+      fi
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • System reboot is required to apply all configuration changes"
+      echo "  • GRUB changes will take effect after reboot"
+      echo "  • AUTO_REBOOT_AFTER_STEP_ID is configured"
+      echo "  • System will automatically reboot after STEP completion"
+      echo
+      echo "💡 TIP: After reboot, verify IOMMU with:"
+      echo "   dmesg | grep -i iommu"
+      echo "   cat /proc/cmdline | grep iommu"
+    fi
   } > "${tmp_status}"
 
   show_textbox "STEP 05 Result Summary" "${tmp_status}"
 
   log "[STEP 05] kernel tuning configuration completed. Reboot is required."
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 05] Kernel tuning configuration completed successfully. Reboot is required for changes to take effect."
 
   return 0
 }
@@ -3127,24 +3997,15 @@ step_06_libvirt_hooks() {
   log "[STEP 06] libvirt Hooks Installation (/etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu)"
   load_config
 
-  # Check Network mode
-  local net_mode="${SENSOR_NET_MODE:-bridge}"
-  log "[STEP 06] Sensor network mode: ${net_mode}"
+  # Force NAT mode only
+  local net_mode="nat"
+  SENSOR_NET_MODE="nat"
+  log "[STEP 06] Sensor network mode: ${net_mode} (NAT only)"
   
-  # Execute branch by mode
-  if [[ "${net_mode}" == "bridge" ]]; then
-    log "[STEP 06] Bridge Mode - Install sensor specific hooks"
-    step_06_bridge_hooks
-    return $?
-  elif [[ "${net_mode}" == "nat" ]]; then
+  # Execute NAT mode only
     log "[STEP 06] NAT Mode - Installing OpenXDR NAT hooks"
     step_06_nat_hooks
     return $?
-  else
-    log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
-    whiptail_msgbox "Network Mode Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
-    return 1
-  fi
 }
 
 #######################################
@@ -3263,7 +4124,7 @@ EOF
 ########################
 # Maintain OOM recovery script only (NAT removed)
 ########################
-if [ "${1}" = "mds" ] || [ "${1}" = "mds2" ]; then
+if [ "${1}" = "mds" ]; then
   if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
     # save last known good pid
     /usr/bin/last_known_good_pid "${1}" > /dev/null 2>&1 &
@@ -3318,7 +4179,7 @@ EOF
   else
     sudo tee /usr/bin/check_vm_state >/dev/null <<'EOF'
 #!/bin/bash
-VM_LIST=(mds mds2)
+VM_LIST=(aio mds)
 RUN_DIR=/var/run/libvirt/qemu
 
 for VM in ${VM_LIST[@]}; do
@@ -3384,21 +4245,58 @@ EOF
   #######################################
   : > "${tmp_info}"
   {
-    echo "STEP 06 execution summary"
-    echo "----------------------"
-    echo
-    echo "# /etc/libvirt/hooks/network (first 30 lines)"
-    if [[ -f /etc/libvirt/hooks/network ]]; then
-      sed -n '1,30p' /etc/libvirt/hooks/network
+    echo "STEP 06 - Libvirt Hooks Installation Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • Hooks would be created/updated"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. /etc/libvirt/hooks/network would be created"
+      echo "     - NAT MASQUERADE configuration"
+      echo "  2. /etc/libvirt/hooks/qemu would be created"
+      echo "     - AIO DNAT port forwarding (SSH, UI, TCP, UDP)"
+      echo "     - Sensor DNAT port forwarding"
+      echo "     - OOM monitoring scripts"
+      echo "  3. OOM recovery scripts would be installed"
+      echo "     - /usr/bin/last_known_good_pid"
+      echo "     - /usr/bin/check_vm_state"
+      echo "  4. Cron job would be registered for VM state monitoring"
     else
-      echo "/etc/libvirt/hooks/network cannot be found."
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 INSTALLATION STATUS:"
+      echo
+      echo "📋 INSTALLED HOOKS:"
+    if [[ -f /etc/libvirt/hooks/network ]]; then
+        echo "  ✅ /etc/libvirt/hooks/network"
+        echo "     (First 30 lines shown below)"
+        sed -n '1,30p' /etc/libvirt/hooks/network | sed 's/^/     /'
+    else
+        echo "  ❌ /etc/libvirt/hooks/network: Not found"
     fi
     echo
-    echo "# /etc/libvirt/hooks/qemu (first 40 lines)"
     if [[ -f /etc/libvirt/hooks/qemu ]]; then
-      sed -n '1,40p' /etc/libvirt/hooks/qemu
-    else
-      echo "/etc/libvirt/hooks/qemu cannot be found."
+        echo "  ✅ /etc/libvirt/hooks/qemu"
+        echo "     (First 40 lines shown below)"
+        sed -n '1,40p' /etc/libvirt/hooks/qemu | sed 's/^/     /'
+      else
+        echo "  ❌ /etc/libvirt/hooks/qemu: Not found"
+      fi
+      echo
+      echo "🔧 OOM RECOVERY SCRIPTS:"
+      if [[ -f /usr/bin/last_known_good_pid ]]; then
+        echo "  ✅ /usr/bin/last_known_good_pid"
+      else
+        echo "  ❌ /usr/bin/last_known_good_pid: Not found"
+      fi
+      if [[ -f /usr/bin/check_vm_state ]]; then
+        echo "  ✅ /usr/bin/check_vm_state"
+      else
+        echo "  ❌ /usr/bin/check_vm_state: Not found"
+      fi
     fi
   } >> "${tmp_info}"
 
@@ -3413,7 +4311,13 @@ EOF
 # STEP 06 - NAT Mode (OpenXDR NAT hooks configuration)
 #######################################
 step_06_nat_hooks() {
+  local STEP_ID="06_libvirt_hooks"
+  local STEP_NAME="06. libvirt Hooks Installation"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 06 NAT Mode] OpenXDR NAT libvirt Hooks Installation"
+  log "[STEP 06] This step will install libvirt hooks for NAT/DNAT configuration and OOM monitoring."
 
   local tmp_info="${STATE_DIR}/xdr_step06_nat_info.txt"
   : > "${tmp_info}"
@@ -3427,18 +4331,24 @@ step_06_nat_hooks() {
     echo
     echo "Hooks to be installed:"
     echo "- /etc/libvirt/hooks/network (NAT MASQUERADE)"
-    echo "- /etc/libvirt/hooks/qemu (sensor DNAT + OOM monitoring)"
+    echo "- /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)"
     echo
-    echo "Sensor VM configuration:"
-    echo "- VM name: mds"
-    echo "- internal IP: 192.168.122.2"
-    echo "- NAT bridge: virbr0"
+    echo "VM network configuration:"
+    echo "- AIO VM name: aio"
+    echo "- AIO internal IP: 192.168.122.2"
+    echo "- Sensor VM name: mds"
+    echo "- Sensor internal IP: 192.168.122.3"
+    echo "- NAT bridge: virbr0 (192.168.122.0/24)"
     echo "- External interface: mgt"
+    echo
+    echo "DNAT port forwarding:"
+    echo "- AIO: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)"
+    echo "- Sensor: SSH(2223), sensor forwarder ports"
   } > "${tmp_info}"
 
   show_textbox "STEP 06 NAT Mode - Installation Overview" "${tmp_info}"
 
-  if ! whiptail_yesno "STEP 06 NAT Mode Execution Confirmation" "Install libvirt hooks for NAT Mode.\n\n- Apply OpenXDR NAT structure\n- Sensor VM(mds) DNAT configuration\n- OOM monitoring function\n\nDo you want to continue?" 15 70
+  if ! whiptail_yesno "STEP 06 NAT Mode Execution Confirmation" "Install libvirt hooks for NAT Mode.\n\n- Apply OpenXDR NAT structure\n- AIO VM (aio) DNAT configuration\n- Sensor VM (mds) DNAT configuration\n- OOM monitoring function\n\nDo you want to continue?" 16 70
   then
     log "User canceled STEP 06 NAT Mode execution."
     return 0
@@ -3513,7 +4423,7 @@ EOF
   local HOOK_QEMU="/etc/libvirt/hooks/qemu"
   local HOOK_QEMU_BAK="/etc/libvirt/hooks/qemu.backup.$(date +%Y%m%d-%H%M%S)"
 
-  log "[STEP 06 NAT Mode] Creating ${HOOK_QEMU} (sensor DNAT + OOM monitoring)"
+  log "[STEP 06 NAT Mode] Creating ${HOOK_QEMU} (AIO & Sensor DNAT + OOM monitoring)"
 
   if [[ -f "${HOOK_QEMU}" ]]; then
     if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -3527,30 +4437,84 @@ EOF
   local qemu_hook_content
   qemu_hook_content=$(cat <<'EOF'
 #!/bin/bash
-# XDR Sensor NAT Mode - QEMU Hook
-# Based on OpenXDR NAT configuration with sensor VM (mds) DNAT
+# Last Update: 2025-12-06 (AIO-Sensor unified)
+# AIO + Sensor (mds) NAT / forwarding configuration
 
-# UI exception list (sensor internal management IP)
-UI_EXC_LIST=(192.168.122.2)
+# UI exception list (internal management IP addresses of AIO, mds)
+UI_EXC_LIST=(192.168.122.2 192.168.122.3)
 IPSET_UI='ui'
 
-# If ipset ui doesn't exist, create it + add exception IPs
-IPSET_CONFIG=$(echo -n $(ipset list $IPSET_UI 2>/dev/null))
-if ! [[ $IPSET_CONFIG =~ $IPSET_UI ]]; then
-  ipset create $IPSET_UI hash:ip 2>/dev/null || true
-  for IP in ${UI_EXC_LIST[@]}; do
-    ipset add $IPSET_UI $IP 2>/dev/null || true
-  done
+# Create ipset ui if missing + add exception IPs
+# Note: ipset package must be installed (STEP 04)
+if command -v ipset >/dev/null 2>&1; then
+  IPSET_CONFIG=$(echo -n $(ipset list $IPSET_UI 2>/dev/null))
+  if ! [[ $IPSET_CONFIG =~ $IPSET_UI ]]; then
+    if ipset create $IPSET_UI hash:ip 2>/dev/null; then
+      for IP in ${UI_EXC_LIST[@]}; do
+        ipset add $IPSET_UI $IP 2>/dev/null || true
+      done
+    else
+      echo "ERROR: Failed to create ipset '$IPSET_UI'. UI port DNAT rules may not work correctly." >&2
+      echo "Please check: sudo ipset list" >&2
+    fi
+  fi
+else
+  echo "WARNING: ipset command not found. UI port DNAT rules may not work correctly." >&2
+  echo "Please install ipset package: sudo apt install -y ipset" >&2
+  echo "Then re-run: sudo /etc/libvirt/hooks/qemu aio reconnect" >&2
 fi
 
 ########################
-# mds (sensor) NAT / forwarding
+# aio NAT / forwarding
 ########################
-if [ "${1}" = "mds" ]; then
+if [ "${1}" = "aio" ]; then
   GUEST_IP=192.168.122.2
   HOST_SSH_PORT=2222
   GUEST_SSH_PORT=22
-  # Sensor related ports (OpenXDR datasensor based)
+  UI_PORTS=(80 443)
+  TCP_PORTS=(6640 6641 6642 6643 6644 6645 6646 6647 6648 8443 8888 8889)
+  UDP_PORTS=(162)
+  BRIDGE='virbr0'
+  MGT_INTF='mgt'
+
+  if [ "${2}" = "stopped" ] || [ "${2}" = "reconnect" ]; then
+    /sbin/iptables -D FORWARD -o $BRIDGE -d $GUEST_IP -j ACCEPT
+    /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $HOST_SSH_PORT -j DNAT --to $GUEST_IP:$GUEST_SSH_PORT
+    for PORT in ${TCP_PORTS[@]}; do
+      /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+    for PORT in ${UDP_PORTS[@]}; do
+      /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+    for PORT in ${UI_PORTS[@]}; do
+      /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+  fi
+
+  if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
+    /sbin/iptables -I FORWARD -o $BRIDGE -d $GUEST_IP -j ACCEPT
+    /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $HOST_SSH_PORT -j DNAT --to $GUEST_IP:$GUEST_SSH_PORT
+    for PORT in ${TCP_PORTS[@]}; do
+      /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+    for PORT in ${UDP_PORTS[@]}; do
+      /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+    for PORT in ${UI_PORTS[@]}; do
+      /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
+    done
+    # save last known good pid
+    /usr/bin/last_known_good_pid ${1} > /dev/null 2>&1 &
+  fi
+fi
+
+########################
+# mds NAT / forwarding
+########################
+if [ "${1}" = "mds" ]; then
+  GUEST_IP=192.168.122.3
+  HOST_SSH_PORT=2223
+  GUEST_SSH_PORT=22
   TCP_PORTS=(514 2055 5044 5123 5100:5200 5500:5800 5900)
   VXLAN_PORTS=(4789 8472)
   UDP_PORTS=(514 2055 5044 5100:5200 5500:5800 5900)
@@ -3558,36 +4522,33 @@ if [ "${1}" = "mds" ]; then
   MGT_INTF='mgt'
 
   if [ "${2}" = "stopped" ] || [ "${2}" = "reconnect" ]; then
-    /sbin/iptables -D FORWARD -o $BRIDGE -d $GUEST_IP -j ACCEPT 2>/dev/null || true
-    /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $HOST_SSH_PORT -j DNAT --to $GUEST_IP:$GUEST_SSH_PORT 2>/dev/null || true
-    
+    /sbin/iptables -D FORWARD -o $BRIDGE -d $GUEST_IP -j ACCEPT
+    /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $HOST_SSH_PORT -j DNAT --to $GUEST_IP:$GUEST_SSH_PORT
     for PORT in ${TCP_PORTS[@]}; do
       if [[ $PORT =~ ":" ]]; then
         DNAT_PORT=$(echo $PORT | tr -s ":" "-")
-        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$DNAT_PORT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$DNAT_PORT
       else
-        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
       fi
     done
 
     for PORT in ${UDP_PORTS[@]}; do
       if [[ $PORT =~ ":" ]]; then
         DNAT_PORT=$(echo $PORT | tr -s ":" "-")
-        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$DNAT_PORT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$DNAT_PORT
       else
-        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT 2>/dev/null || true
+        /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
       fi
     done
-    
     for PORT in ${VXLAN_PORTS[@]}; do
-      /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT 2>/dev/null || true
+      /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
     done
   fi
 
   if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
     /sbin/iptables -I FORWARD -o $BRIDGE -d $GUEST_IP -j ACCEPT
     /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp ! -s ${GUEST_IP} --dport $HOST_SSH_PORT -j DNAT --to $GUEST_IP:$GUEST_SSH_PORT
-    
     for PORT in ${TCP_PORTS[@]}; do
       if [[ $PORT =~ ":" ]]; then
         DNAT_PORT=$(echo $PORT | tr -s ":" "-")
@@ -3605,46 +4566,128 @@ if [ "${1}" = "mds" ]; then
         /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
       fi
     done
-    
     for PORT in ${VXLAN_PORTS[@]}; do
       /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p udp ! -s ${GUEST_IP} --dport $PORT -j DNAT --to $GUEST_IP:$PORT
     done
-    
-    # Start OOM monitoring script (same as Bridge Mode)
+    # save last known good pid
     /usr/bin/last_known_good_pid ${1} > /dev/null 2>&1 &
   fi
 fi
-
-
-########################
-# mds2 (sensor2) - NAT DNAT not applied, OOM monitoring only included
-########################
-if [ "${1}" = "mds2" ]; then
-  if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
-    /usr/bin/last_known_good_pid ${1} > /dev/null 2>&1 &
-  fi
-fi
-
-########################
-# OOM monitoring common logic
-########################
-# (Includes same function as OOM monitoring script in Bridge Mode)
 EOF
 )
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] Would write sensor DNAT + OOM monitoring content to ${HOOK_QEMU}"
+    log "[DRY-RUN] Would write AIO & Sensor DNAT + OOM monitoring content to ${HOOK_QEMU}"
   else
     printf "%s\n" "${qemu_hook_content}" | sudo tee "${HOOK_QEMU}" >/dev/null
     sudo chmod +x "${HOOK_QEMU}"
   fi
 
   #######################################
-  # 4) Install OOM monitoring scripts (common with Bridge Mode)
+  # 4) Install OOM recovery scripts (last_known_good_pid, check_vm_state)
   #######################################
-  log "[STEP 06 NAT Mode] Installing OOM monitoring script (/usr/bin/last_known_good_pid)"
-  # Reuse OOM monitoring scripts same as Bridge Mode
-  # (Same as OOM script part in existing step_06_bridge_hooks)
+  log "[STEP 06 NAT Mode] Installing OOM recovery scripts (last_known_good_pid, check_vm_state)"
+
+  local _DRY="${DRY_RUN:-0}"
+
+  # 1) Create /usr/bin/last_known_good_pid (per docs)
+  log "[STEP 06 NAT Mode] Creating /usr/bin/last_known_good_pid script"
+  if [[ "${_DRY}" -eq 1 ]]; then
+    log "[DRY-RUN] Would create /usr/bin/last_known_good_pid script"
+  else
+    local last_known_good_pid_content
+    last_known_good_pid_content=$(cat <<'EOF'
+#!/bin/bash
+VM_NAME=$1
+RUN_DIR=/var/run/libvirt/qemu
+RETRY=60 # timeout 5 minutes
+
+for i in $(seq 1 $RETRY); do
+    if [ -e ${RUN_DIR}/${VM_NAME}.pid ]; then
+        cp ${RUN_DIR}/${VM_NAME}.pid ${RUN_DIR}/${VM_NAME}.lkg
+        exit 0
+    else
+        sleep 5
+    fi
+done
+
+exit 1
+EOF
+)
+    printf "%s\n" "${last_known_good_pid_content}" | run_cmd "sudo tee /usr/bin/last_known_good_pid >/dev/null"
+    run_cmd "sudo chmod +x /usr/bin/last_known_good_pid"
+  fi
+
+  # 2) Create /usr/bin/check_vm_state (per docs)
+  log "[STEP 06 NAT Mode] Creating /usr/bin/check_vm_state script"
+  if [[ "${_DRY}" -eq 1 ]]; then
+    log "[DRY-RUN] Would create /usr/bin/check_vm_state script"
+  else
+    local check_vm_state_content
+    check_vm_state_content=$(cat <<'EOF'
+#!/bin/bash
+VM_LIST=(aio mds)
+RUN_DIR=/var/run/libvirt/qemu
+
+for VM in ${VM_LIST[@]}; do
+    # Detect if VM is down (.xml and .pid absent)
+    if [ ! -e ${RUN_DIR}/${VM}.xml -a ! -e ${RUN_DIR}/${VM}.pid ]; then
+        if [ -e ${RUN_DIR}/${VM}.lkg ]; then
+            LKG_PID=$(cat ${RUN_DIR}/${VM}.lkg)
+
+            # Check dmesg to see if OOM-killer killed that PID
+            if dmesg | grep "Out of memory: Kill process $LKG_PID" > /dev/null 2>&1; then
+                virsh start $VM
+            fi
+        fi
+    fi
+done
+
+exit 0
+EOF
+)
+    printf "%s\n" "${check_vm_state_content}" | run_cmd "sudo tee /usr/bin/check_vm_state >/dev/null"
+    run_cmd "sudo chmod +x /usr/bin/check_vm_state"
+  fi
+
+  # 3) Add cron (run check_vm_state every 5 minutes)
+  if [[ "${_DRY}" -eq 1 ]]; then
+    log "[DRY-RUN] Would add the following two lines to root crontab:"
+    log "  SHELL=/bin/bash"
+    log "  */5 * * * * /bin/bash /usr/bin/check_vm_state > /dev/null 2>&1"
+  else
+    # Preserve existing crontab; ensure SHELL and check_vm_state lines
+    local tmp_cron added_flag
+    tmp_cron="$(mktemp)"
+    added_flag="0"
+
+    # Dump existing crontab (create empty if none)
+    if ! sudo crontab -l 2>/dev/null > "${tmp_cron}"; then
+      : > "${tmp_cron}"
+    fi
+
+    # Add SHELL=/bin/bash if missing
+    if ! grep -q '^SHELL=' "${tmp_cron}"; then
+      echo "SHELL=/bin/bash" >> "${tmp_cron}"
+      added_flag="1"
+    fi
+
+    # Add check_vm_state line if missing
+    if ! grep -q 'check_vm_state' "${tmp_cron}"; then
+      echo "*/5 * * * * /bin/bash /usr/bin/check_vm_state > /dev/null 2>&1" >> "${tmp_cron}"
+      added_flag="1"
+    fi
+
+    # Apply updated crontab
+    run_cmd "sudo crontab ${tmp_cron}"
+    rm -f "${tmp_cron}"
+
+    if [[ "${added_flag}" = "1" ]]; then
+      log "[STEP 06 NAT Mode] Added/updated SHELL=/bin/bash and check_vm_state entries in root crontab."
+    else
+      log "[STEP 06 NAT Mode] root crontab already has SHELL=/bin/bash and check_vm_state entries."
+    fi
+  fi
 
   #######################################
   # 5) Completed message
@@ -3657,43 +4700,1253 @@ OpenXDR based NAT libvirt hooks have been installed.
 
 Installed hooks:
 - /etc/libvirt/hooks/network (NAT MASQUERADE)
-- /etc/libvirt/hooks/qemu (Sensor DNAT + OOM monitoring)
+- /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)
 
-Sensor VM network configuration:
-- VM name: mds
-- internal IP: 192.168.122.2 (fixed)
+VM network configuration:
+- AIO VM name: aio
+- AIO internal IP: 192.168.122.2
+- Sensor VM name: mds
+- Sensor internal IP: 192.168.122.3
 - NAT bridge: virbr0 (192.168.122.0/24)
 - External access: DNAT through mgt interface
 
-DNAT ports: SSH(2222), sensor forwarder ports
+AIO DNAT ports: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)
+Sensor DNAT ports: SSH(2223), sensor forwarder ports
 OOM monitoring: enabled
 
-※ libvirtd restart is required.
+📝 NEXT STEPS:
+  • libvirtd restart is required for hooks to take effect
+  • Proceed to STEP 07 (LVM Storage Configuration)
 EOF
 )
 
   whiptail_msgbox "STEP 06 NAT Mode Completed" "${summary}" 18 80
 
   log "[STEP 06 NAT Mode] NAT libvirt hooks installation completed"
+  
+  # Display DNAT verification commands
+  log "[STEP 06] DNAT verification commands:"
+  log "  • Check iptables DNAT rules: sudo iptables -t nat -L PREROUTING -v -n | grep -E '(443|2222|80)'"
+  log "  • Check FORWARD rules: sudo iptables -L FORWARD -v -n | grep virbr0"
+  log "  • Check mgt interface: ip link show mgt"
+  log "  • Check ipset: sudo ipset list ui"
+  log "  • Check libvirt hooks: ls -la /etc/libvirt/hooks/"
+  log "  • Manually trigger hook (if needed): sudo /etc/libvirt/hooks/qemu aio reconnect"
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 06] Libvirt hooks installation completed successfully. DNAT and OOM monitoring are configured."
 
   return 0
 }
 
 
-step_07_sensor_download() {
-  log "[STEP 07] Sensor LV Creation + Image/Script Download"
+step_07_lvm_storage() {
+  local STEP_ID="07_lvm_storage"
+  local STEP_NAME="07. LVM Storage Configuration (AIO)"
+  
+  log "[STEP 07] Start LVM storage configuration (AIO)"
+
+  load_config
+
+  # Auto-detect OS VG name
+  local root_dev
+  root_dev=$(findmnt -n -o SOURCE /)
+
+  local UBUNTU_VG
+  # Extract VG name containing root device via lvs (trim spaces)
+  UBUNTU_VG=$(sudo lvs --noheadings -o vg_name "${root_dev}" 2>/dev/null | awk '{print $1}')
+
+  # Fallback to default on detection failure
+  if [[ -z "${UBUNTU_VG}" ]]; then
+    log "[WARN] Could not detect OS VG name; using default (ubuntu-vg)."
+    UBUNTU_VG="ubuntu-vg"
+  else
+    log "[STEP 07] Detected OS VG name: ${UBUNTU_VG}"
+  fi
+
+  local AIO_ROOT_LV="lv_aio_root"
+  local ES_VG="vg_aio"
+  local ES_LV="lv_aio"
+
+  # Debug: Log DATA_SSD_LIST value after load_config
+  log "[STEP 07] DATA_SSD_LIST value after load_config: '${DATA_SSD_LIST:-<empty>}'"
+  
+  # Check if DATA_SSD_LIST is empty or contains only whitespace
+  # Also check if it's unset or empty string
+  local data_ssd_list_trimmed
+  data_ssd_list_trimmed="${DATA_SSD_LIST// /}"
+  data_ssd_list_trimmed="${data_ssd_list_trimmed//	/}"  # Remove tabs too
+  
+  if [[ -z "${DATA_SSD_LIST:-}" ]] || [[ -z "${data_ssd_list_trimmed}" ]]; then
+    log "[STEP 07] ERROR: DATA_SSD_LIST is empty or contains only whitespace"
+    log "[STEP 07] Current CONFIG_FILE: ${CONFIG_FILE}"
+    if [[ -f "${CONFIG_FILE}" ]]; then
+      log "[STEP 07] CONFIG_FILE exists, checking contents..."
+      local config_data_ssd
+      config_data_ssd=$(grep "^DATA_SSD_LIST=" "${CONFIG_FILE}" | cut -d'=' -f2- | tr -d '"' || echo "")
+      log "[STEP 07] DATA_SSD_LIST from CONFIG_FILE: '${config_data_ssd}'"
+      if [[ -n "${config_data_ssd}" ]]; then
+        log "[STEP 07] WARNING: DATA_SSD_LIST exists in CONFIG_FILE but was not loaded properly"
+        log "[STEP 07] Attempting to reload from CONFIG_FILE..."
+        # Try to reload the specific variable
+        eval "$(grep "^DATA_SSD_LIST=" "${CONFIG_FILE}")"
+        log "[STEP 07] DATA_SSD_LIST after manual reload: '${DATA_SSD_LIST:-<empty>}'"
+        # Re-check after manual reload
+        data_ssd_list_trimmed="${DATA_SSD_LIST// /}"
+        data_ssd_list_trimmed="${data_ssd_list_trimmed//	/}"
+        if [[ -z "${DATA_SSD_LIST:-}" ]] || [[ -z "${data_ssd_list_trimmed}" ]]; then
+          log "[STEP 07] ERROR: DATA_SSD_LIST still empty after manual reload"
+        else
+          log "[STEP 07] SUCCESS: DATA_SSD_LIST loaded after manual reload: ${DATA_SSD_LIST}"
+        fi
+      else
+        log "[STEP 07] DATA_SSD_LIST not found in CONFIG_FILE or is empty"
+      fi
+    else
+      log "[STEP 07] CONFIG_FILE does not exist: ${CONFIG_FILE}"
+    fi
+    
+    # Final check after potential manual reload
+    data_ssd_list_trimmed="${DATA_SSD_LIST// /}"
+    data_ssd_list_trimmed="${data_ssd_list_trimmed//	/}"
+    if [[ -z "${DATA_SSD_LIST:-}" ]] || [[ -z "${data_ssd_list_trimmed}" ]]; then
+      whiptail_msgbox "STEP 07 - data disks not set" "DATA_SSD_LIST is empty or not configured.\n\nPlease re-run STEP 01 to select data disks.\n\nCurrent value: '${DATA_SSD_LIST:-<empty>}'\n\nCONFIG_FILE: ${CONFIG_FILE}" 16 70
+      log "DATA_SSD_LIST empty; cannot proceed with STEP 07."
+      return 1
+    fi
+  fi
+  
+  log "[STEP 07] DATA_SSD_LIST is set: ${DATA_SSD_LIST}"
+
+  #######################################
+  # If LVM/mounts seem present, ask to skip
+  #######################################
+  local already_lvm=0
+
+  # ES_VG, UBUNTU_VG, AIO_ROOT_LV are predefined above
+  if vgs "${ES_VG}" >/dev/null 2>&1 && \
+     lvs "${UBUNTU_VG}/${AIO_ROOT_LV}" >/dev/null 2>&1; then
+    # Also check /stellar/aio mount
+    if mount | grep -qE "on /stellar/aio "; then
+      already_lvm=1
+    fi
+  fi
+
+  if [[ "${already_lvm}" -eq 1 ]]; then
+    if whiptail_yesno "STEP 07 - appears already configured" "vg_aio / lv_aio and ${UBUNTU_VG}/${AIO_ROOT_LV}\nplus /stellar/aio mount already exist.\n\nThis STEP recreates disk partitions and should not normally be rerun.\n\nSkip this STEP?"
+    then
+      log "User skipped STEP 07 because it appears already configured."
+      return 0
+    fi
+    log "User chose to rerun STEP 07 anyway. (WARNING: existing data may be destroyed)"
+  fi
+
+  #######################################
+  # Verify selected disks + destructive action warning
+  #######################################
+  local tmp_info="/tmp/xdr_step07_disks.txt"
+  : > "${tmp_info}"
+  echo "[Selected data disk list]" >> "${tmp_info}"
+  for d in ${DATA_SSD_LIST}; do
+    {
+      echo
+      echo "=== /dev/${d} ==="
+      lsblk "/dev/${d}" -o NAME,SIZE,TYPE,MOUNTPOINT
+    } >> "${tmp_info}" 2>&1
+  done
+
+  {
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 07: LVM Storage Configuration - Pre-Execution"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    echo "⚠️  DESTRUCTIVE OPERATION WARNING:"
+    echo "  • All existing partitions and data on the following disks"
+    echo "    will be PERMANENTLY DELETED:"
+    for d in ${DATA_SSD_LIST}; do
+      echo "    - /dev/${d}"
+    done
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Remove all existing LVM structures (PV/VG/LV)"
+    echo "  2. Wipe all filesystem signatures"
+    echo "  3. Create GPT partition table"
+    echo "  4. Create single partition on each disk"
+    echo "  5. Create Physical Volumes (PV)"
+    echo "  6. Create Volume Groups (VG):"
+    echo "     - vg_aio (for ES data storage)"
+    echo "     - ${UBUNTU_VG} (for AIO root volume)"
+    echo "     Note: Sensor root volume will be created in ${UBUNTU_VG} during STEP 10"
+    echo "  7. Create Logical Volumes (LV) for AIO:"
+    echo "     - lv_aio (ES data for AIO)"
+    echo "     - ${AIO_ROOT_LV} (AIO root, 545GB)"
+    echo "     Note: Sensor LV (lv_sensor_root_mds) will be created during STEP 10"
+    echo "  8. Format volumes with ext4"
+    echo "  9. Mount volume at /stellar/aio (AIO root)"
+    echo "     Note: Sensor mount (/var/lib/libvirt/images/mds) will be configured during STEP 10"
+    echo "  10. Add entry to /etc/fstab"
+    echo "  11. Set ownership to stellar:stellar"
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • This operation is IRREVERSIBLE"
+    echo "  • All data on selected disks will be lost"
+    echo "  • Ensure you have backups if needed"
+    echo "  • OS disk is automatically excluded from selection"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
+  } > "${tmp_info}"
+
+  show_textbox "STEP 07 - Pre-execution warning and actions" "${tmp_info}"
+
+  if ! whiptail_yesno "STEP 07 - WARNING" "All existing partitions/data on /dev/${DATA_SSD_LIST}\nwill be deleted and used exclusively for LVM.\n\nThis operation is IRREVERSIBLE.\n\nContinue?"
+  then
+    log "User canceled STEP 07 disk initialization."
+    return 0
+  fi
+
+  #######################################
+  # 0-5) Remove all existing LVM/VG/LV on selected disks
+  #######################################
+  log "[STEP 07] Removing existing LVM metadata (LV/VG/PV) from selected disks."
+
+  local disk pv vg_name pv_list_for_disk
+
+  for disk in ${DATA_SSD_LIST}; do
+    log "[STEP 07] Cleaning existing LVM structures on /dev/${disk}"
+
+    # List PVs on this disk (includes /dev/sdb, /dev/sdb1, etc.)
+    pv_list_for_disk=$(sudo pvs --noheadings -o pv_name 2>/dev/null \
+                         | awk "\$1 ~ /^\\/dev\\/${disk}([0-9]+)?\$/ {print \$1}")
+
+    for pv in ${pv_list_for_disk}; do
+      vg_name=$(sudo pvs --noheadings -o vg_name "${pv}" 2>/dev/null | awk '{print $1}')
+
+      if [[ -n "${vg_name}" && "${vg_name}" != "-" ]]; then
+        log "[STEP 07] PV ${pv} belongs to VG ${vg_name} → removing LV/VG"
+
+        # Remove all LVs in VG (ignore errors if repeated)
+        run_cmd "sudo lvremove -y ${vg_name} || true"
+
+        # Remove VG (ignore if already removed)
+        run_cmd "sudo vgremove -y ${vg_name} || true"
+      fi
+
+      # Remove PV metadata
+      run_cmd "sudo pvremove -y ${pv} || true"
+    done
+
+    # Wipe remaining filesystem/partition signatures on disk
+    log "[STEP 07] Running wipefs on /dev/${disk}"
+    run_cmd "sudo wipefs -a /dev/${disk} || true"
+  done
+
+  #######################################
+  # 1) Create GPT label + single partition on each disk
+  #######################################
+  log "[STEP 07] Create GPT label and partition"
+
+  local d
+  for d in ${DATA_SSD_LIST}; do
+    run_cmd "sudo parted -s /dev/${d} mklabel gpt"
+    run_cmd "sudo parted -s /dev/${d} mkpart primary ext4 1MiB 100%"
+  done
+
+  #######################################
+  # 2) Create PV / VG / LV (for ES data)
+  #######################################
+  log "[STEP 07] Create ES-only VG/LV (vg_aio / lv_aio)"
+
+  local pv_list=""
+  local stripe_count=0
+  for d in ${DATA_SSD_LIST}; do
+    pv_list+=" /dev/${d}1"
+    ((stripe_count++))
+  done
+
+  # pvcreate
+  run_cmd "sudo pvcreate${pv_list}"
+
+  # vgcreate vg_aio
+  run_cmd "sudo vgcreate ${ES_VG}${pv_list}"
+
+  # lvcreate --extents 100%FREE --stripes <N> --name lv_aio vg_aio
+  run_cmd "sudo lvcreate --extents 100%FREE --stripes ${stripe_count} --name ${ES_LV} ${ES_VG}"
+
+  #######################################
+  # 3) Create AIO Root LV (ubuntu-vg)
+  #######################################
+  log "[STEP 07] Create AIO Root LV (${UBUNTU_VG}/${AIO_ROOT_LV})"
+
+  if lvs "${UBUNTU_VG}/${AIO_ROOT_LV}" >/dev/null 2>&1; then
+    log "LV ${UBUNTU_VG}/${AIO_ROOT_LV} already exists → skip create"
+  else
+    run_cmd "sudo lvcreate -L 545G -n ${AIO_ROOT_LV} ${UBUNTU_VG}"
+  fi
+
+  #######################################
+  # 4) mkfs.ext4 (AIO Root + ES Data)
+  #######################################
+  log "[STEP 07] Format LVs (mkfs.ext4)"
+
+  local DEV_AIO_ROOT="/dev/${UBUNTU_VG}/${AIO_ROOT_LV}"
+  local DEV_ES_DATA="/dev/${ES_VG}/${ES_LV}"
+
+  if ! blkid "${DEV_AIO_ROOT}" >/dev/null 2>&1; then
+    run_cmd "sudo mkfs.ext4 -F ${DEV_AIO_ROOT}"
+  else
+    log "Filesystem already exists: ${DEV_AIO_ROOT} → skip mkfs"
+  fi
+
+  if ! blkid "${DEV_ES_DATA}" >/dev/null 2>&1; then
+    run_cmd "sudo mkfs.ext4 -F ${DEV_ES_DATA}"
+  else
+    log "Filesystem already exists: ${DEV_ES_DATA} → skip mkfs"
+  fi
+
+  #######################################
+  # 5) Create mount points
+  #######################################
+  log "[STEP 07] Create /stellar/aio directory"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] sudo mkdir -p /stellar/aio"
+  else
+    sudo mkdir -p /stellar/aio
+  fi
+
+  #######################################
+  # 6) Add entries to /etc/fstab (per docs)
+  #######################################
+  log "[STEP 07] Register /etc/fstab entry"
+
+  local FSTAB_AIO_LINE="${DEV_AIO_ROOT} /stellar/aio ext4 defaults,noatime 0 2"
+  append_fstab_if_missing "${FSTAB_AIO_LINE}" "/stellar/aio"
+
+  #######################################
+  # 7) Run mount -a and verify
+  #######################################
+  log "[STEP 07] Run mount -a and verify mount state"
+
+  run_cmd "sudo systemctl daemon-reload"
+  run_cmd "sudo mount -a"
+
+  local tmp_df="/tmp/xdr_step07_df.txt"
+  {
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 07: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+    fi
+    echo "📊 STORAGE STATUS:"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • LVM volumes: Would be created"
+      echo "  • Mount points: Would be configured"
+      echo "  • Filesystems: Would be formatted"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. LVM Volume Creation:"
+      echo "     - Physical Volumes (PV) would be created on selected disks"
+      echo "     - Volume Group (vg_aio) would be created"
+      echo "     - Logical Volume (lv_aio) would be created for ES data"
+      echo "     - AIO Root LV (${AIO_ROOT_LV}, 545GB) would be created in ${UBUNTU_VG}"
+      echo
+      echo "  2. Filesystem Creation:"
+      echo "     - ext4 filesystem would be created on lv_aio"
+      echo "     - ext4 filesystem would be created on ${AIO_ROOT_LV}"
+      echo
+      echo "  3. Mount Configuration:"
+      echo "     - /stellar/aio directory would be created"
+      echo "     - ${AIO_ROOT_LV} would be mounted to /stellar/aio"
+      echo "     - /etc/fstab entry would be added"
+      echo
+      echo "  4. Ownership Configuration:"
+      echo "     - /stellar ownership would be set to stellar:stellar"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 INSTALLATION STATUS:"
+      echo
+      echo "1️⃣  Mount Points:"
+      local mount_info
+      mount_info=$(df -h | egrep '/stellar/aio' 2>/dev/null || echo "  ⚠️  No /stellar/aio mount info found")
+      if [[ "${mount_info}" != *"No /stellar"* ]]; then
+        echo "${mount_info}" | sed 's/^/  /'
+      else
+        echo "  ${mount_info}"
+      fi
+      echo
+      echo "2️⃣  Logical Volumes:"
+      echo "  📋 Current LVM structure:"
+      lvs 2>/dev/null | sed 's/^/    /' || echo "    ⚠️  Unable to list logical volumes"
+      echo
+      echo "3️⃣  Disk Layout (lsblk):"
+      echo "  📋 Complete disk/partition/volume view:"
+      lsblk 2>/dev/null | sed 's/^/    /' || echo "    ⚠️  Unable to list block devices"
+      echo
+      echo "4️⃣  Directory Ownership:"
+      if [[ -d /stellar ]]; then
+        if id stellar >/dev/null 2>&1; then
+          local stellar_owner
+          stellar_owner=$(stat -c '%U:%G' /stellar 2>/dev/null || echo "unknown")
+          if [[ "${stellar_owner}" == "stellar:stellar" ]]; then
+            echo "  ✅ /stellar ownership: ${stellar_owner}"
+          else
+            echo "  ⚠️  /stellar ownership: ${stellar_owner} (expected: stellar:stellar)"
+            echo "  💡 Ownership should have been set to stellar:stellar during STEP 07 execution"
+            echo "  💡 If this persists, manually run: sudo chown -R stellar:stellar /stellar"
+          fi
+        else
+          echo "  ⚠️  'stellar' user not found"
+          echo "  💡 The 'stellar' user will be created during VM deployment (STEP 09)"
+        fi
+      else
+        echo "  ℹ️  /stellar directory does not exist yet"
+        echo "  💡 This should have been created during STEP 07 execution"
+      fi
+      echo
+      echo "📦 STORAGE CONFIGURATION:"
+      echo "  • Volume Group: vg_aio (ES data storage)"
+      echo "  • Logical Volume: lv_aio (ES data)"
+      echo "  • AIO Root LV: ${UBUNTU_VG}/${AIO_ROOT_LV} (545GB)"
+      echo "  • Mount Point: /stellar/aio"
+      echo "  • Filesystem: ext4"
+      echo "  • Auto-mount: Configured in /etc/fstab"
+    fi
+    echo
+    echo "💡 IMPORTANT NOTES:"
+    echo "  • LVM volumes are created and mounted at /stellar/aio"
+    echo "  • This mount point will be used for AIO VM storage"
+    echo "  • Ensure all volumes are properly mounted before proceeding"
+    echo
+    echo "📝 NEXT STEPS:"
+    echo "  • Proceed to STEP 08 (DP Download)"
+  } > "${tmp_df}" 2>&1
+
+  #######################################
+  # 8) Change ownership of /stellar (doc: chown -R stellar:stellar /stellar)
+  #######################################
+  log "[STEP 07] Set /stellar ownership to stellar:stellar (per docs)"
+
+  if id stellar >/dev/null 2>&1; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] sudo chown -R stellar:stellar /stellar"
+    else
+      sudo chown -R stellar:stellar /stellar
+      log "[STEP 07] /stellar ownership update complete"
+    fi
+  else
+    log "[WARN] 'stellar' user not found; skipping chown."
+  fi
+
+  #######################################
+  # 9) Show summary
+  #######################################
+  show_textbox "STEP 07 summary" "${tmp_df}"
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 07] LVM storage configuration completed successfully. AIO and Sensor storage are ready."
+
+  # STEP success → save_state called in run_step()
+}
+
+step_08_dp_download() {
+  local STEP_ID="08_dp_download"
+  local STEP_NAME="08. DP Download (AIO)"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 08] Download DP deploy script and image (virt_deploy_uvp_centos.sh + qcow2)"
+  log "[STEP 08] This step will download AIO deployment script and qcow2 image from ACPS."
+  load_config
+  local tmp_info="/tmp/xdr_step08_info.txt"
+
+  #######################################
+  # 0) Check configuration values
+  #######################################
+  local ver="${DP_VERSION:-6.2.0}"  # Default to 6.2.0 if not set
+  local acps_user="${ACPS_USERNAME:-}"
+  local acps_pass="${ACPS_PASSWORD:-}"
+  local acps_url="${ACPS_BASE_URL:-https://acps.stellarcyber.ai}"
+
+  # Check required values (DP_VERSION now has default, so only check ACPS credentials)
+  local missing=""
+  [[ -z "${acps_user}" ]] && missing+="\n - ACPS_USERNAME"
+  [[ -z "${acps_pass}" ]] && missing+="\n - ACPS_PASSWORD"
+
+  if [[ -n "${missing}" ]]; then
+    local msg="The following items are missing in config:${missing}\n\nSet them in Settings, then rerun."
+    log "[STEP 08] Missing config values: ${missing}"
+    whiptail_msgbox "STEP 08 - Missing config" "${msg}" 15 70
+    log "[STEP 08] Skipping STEP 08 due to missing config."
+    return 0
+  fi
+
+  # Normalize URL (trim trailing slash)
+  acps_url="${acps_url%/}"
+
+  #######################################
+  # 1) Prepare download directory
+  #######################################
+  local aio_img_dir="/stellar/aio/images"
+  log "[STEP 08] Download directory: ${aio_img_dir}"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] sudo mkdir -p ${aio_img_dir}"
+  else
+    sudo mkdir -p "${aio_img_dir}"
+  fi
+
+  #######################################
+  # 2) Define download targets/URLs
+  #######################################
+  local dp_script="virt_deploy_uvp_centos.sh"
+  local qcow2="aella-dataprocessor-${ver}.qcow2"
+  local sha1="${qcow2}.sha1"
+
+  local url_script="${acps_url}/release/${ver}/dataprocessor/${dp_script}"
+  local url_qcow2="${acps_url}/release/${ver}/dataprocessor/${qcow2}"
+  local url_sha1="${acps_url}/release/${ver}/dataprocessor/${sha1}"
+
+  log "[STEP 08] Configuration summary:"
+  log "  - DP_VERSION   = ${ver}"
+  log "  - ACPS_USERNAME= ${acps_user}"
+  log "  - ACPS_BASE_URL= ${acps_url}"
+  log "  - download path= ${aio_img_dir}"
+
+  #######################################
+  # 3-A) Optionally reuse existing >=1GB qcow2 in current dir
+  #######################################
+  local use_local_qcow=0
+  local local_qcow=""
+  local local_qcow_size_h=""
+
+  local search_dir="."
+
+  # Find newest *.qcow2 >= 1GB (1000M)
+  local_qcow="$(
+    find "${search_dir}" -maxdepth 1 -type f -name '*.qcow2' -size +1000M -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr \
+      | head -n1 \
+      | awk '{print $2}'
+  )"
+
+  if [[ -n "${local_qcow}" ]]; then
+    local_qcow_size_h="$(ls -lh "${local_qcow}" 2>/dev/null | awk '{print $5}')"
+
+    local msg
+    msg="Found a qcow2 (>=1GB) in current directory.\n\n"
+    msg+="  File: ${local_qcow}\n"
+    msg+="  Size: ${local_qcow_size_h}\n\n"
+    msg+="Use this file for VM deployment instead of downloading?\n\n"
+    msg+="[Yes] Use this file (copy to AIO image dir; skip/replace download)\n"
+    msg+="[No] Keep existing download process"
+
+    # Calculate dialog size dynamically and center message
+    if whiptail_yesno "STEP 08 - reuse local qcow2" "${msg}"; then
+      use_local_qcow=1
+      log "[STEP 08] User chose to use local qcow2 file (${local_qcow})."
+
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] sudo cp \"${local_qcow}\" \"${aio_img_dir}/${qcow2}\""
+      else
+        sudo mkdir -p "${aio_img_dir}"
+        sudo cp "${local_qcow}" "${aio_img_dir}/${qcow2}"
+        log "[STEP 08] Copied local qcow2 to ${aio_img_dir}/${qcow2}"
+      fi
+    else
+      log "[STEP 08] User kept normal flow; not using local qcow2."
+    fi
+  else
+    log "[STEP 08] No qcow2 >=1GB in current directory → use default download/existing files."
+  fi
+
+  #######################################
+  # 3-B) Clean up old version files (if different version exists)
+  #######################################
+  log "[STEP 08] Checking for old version files to remove..."
+  log "[STEP 08] Current version: ${ver}, Current qcow2: ${qcow2}, Current sha1: ${sha1}"
+  
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will check and remove old version files from ${aio_img_dir}"
+  else
+    # Find all qcow2 files and remove those that don't match current version
+    log "[STEP 08] Scanning for old version qcow2 files in ${aio_img_dir}..."
+    local file
+    while IFS= read -r -d '' file; do
+      local basename_file
+      basename_file=$(basename "${file}")
+      if [[ "${basename_file}" != "${qcow2}" ]]; then
+        log "[STEP 08] Removing old qcow2: ${file}"
+        sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+      else
+        log "[STEP 08] Keeping current version qcow2: ${basename_file}"
+      fi
+    done < <(find "${aio_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2" -print0 2>/dev/null || true)
+    
+    # Find all sha1 files and remove those that don't match current version
+    log "[STEP 08] Scanning for old version sha1 files in ${aio_img_dir}..."
+    while IFS= read -r -d '' file; do
+      local basename_file
+      basename_file=$(basename "${file}")
+      if [[ "${basename_file}" != "${sha1}" ]]; then
+        log "[STEP 08] Removing old sha1: ${file}"
+        sudo rm -f "${file}" || log "[WARN] Failed to remove ${file}"
+      else
+        log "[STEP 08] Keeping current version sha1: ${basename_file}"
+      fi
+    done < <(find "${aio_img_dir}" -maxdepth 1 -type f -name "aella-dataprocessor-*.qcow2.sha1" -print0 2>/dev/null || true)
+    
+    # Remove old virt_deploy_uvp_centos.sh if it exists (will be replaced with new version)
+    if [[ -f "${aio_img_dir}/${dp_script}" ]]; then
+      log "[STEP 08] Removing existing ${dp_script} (will be replaced with new version)"
+      sudo rm -f "${aio_img_dir}/${dp_script}" || log "[WARN] Failed to remove ${aio_img_dir}/${dp_script}"
+    fi
+    
+    log "[STEP 08] Old version files cleanup completed"
+  fi
+
+  #######################################
+  # 3-C) Check existing files (download only missing)
+  # Note: Only check script and sha1. qcow2 is handled by local file check above.
+  #######################################
+  local need_script=0
+  local need_qcow2=0
+  local need_sha1=0
+
+  # Script: always check if exists in download directory
+  if [[ -f "${aio_img_dir}/${dp_script}" ]]; then
+    log "[STEP 08] ${aio_img_dir}/${dp_script} already exists → skip download"
+  else
+    log "[STEP 08] ${aio_img_dir}/${dp_script} missing → will download"
+    need_script=1
+  fi
+
+  # qcow2: only need download if local qcow2 was not used
+  if [[ "${use_local_qcow}" -eq 1 ]]; then
+    log "[STEP 08] Using local qcow2 file → skip qcow2 download"
+    need_qcow2=0
+  else
+    # Don't check /stellar/aio/images - only check current directory (already done above)
+    log "[STEP 08] ${qcow2} missing → will download"
+    need_qcow2=1
+  fi
+
+  # sha1: always check if exists in download directory
+  if [[ -f "${aio_img_dir}/${sha1}" ]]; then
+    log "[STEP 08] ${aio_img_dir}/${sha1} already exists → skip download"
+  else
+    log "[STEP 08] ${aio_img_dir}/${sha1} missing → will download (used for sha1 verify if present)"
+    need_sha1=1
+  fi
+
+  # If all files are present (script exists, qcow2 from local or exists, sha1 exists), skip download
+  if [[ "${need_script}" -eq 0 && "${need_qcow2}" -eq 0 && "${need_sha1}" -eq 0 ]]; then
+    log "[STEP 08] All required files already present; no download needed."
+    if [[ "${use_local_qcow}" -eq 1 ]]; then
+      log "[STEP 08] Using local qcow2 file and existing script/sha1 files."
+    fi
+  fi
+
+  #######################################
+  # 4) Download files (curl with auth)
+  #######################################
+  log "[STEP 08] Starting download from ACPS..."
+
+  if [[ "${need_script}" -eq 1 ]]; then
+    log "[STEP 08] Downloading ${dp_script}..."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${dp_script}' '${url_script}'"
+    else
+      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${dp_script}" "${url_script}"; then
+        log "[STEP 08] ${dp_script} download completed"
+        run_cmd "sudo chmod +x ${aio_img_dir}/${dp_script}"
+      else
+        log "[ERROR] ${dp_script} download failed"
+        whiptail_msgbox "STEP 08 - Download Error" "Failed to download ${dp_script}.\n\nCheck network connection and ACPS credentials." 12 70
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ "${need_qcow2}" -eq 1 && "${use_local_qcow}" -eq 0 ]]; then
+    log "[STEP 08] Downloading ${qcow2} (this may take a while)..."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${qcow2}' '${url_qcow2}'"
+    else
+      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${qcow2}" "${url_qcow2}"; then
+        log "[STEP 08] ${qcow2} download completed"
+      else
+        log "[ERROR] ${qcow2} download failed"
+        whiptail_msgbox "STEP 08 - Download Error" "Failed to download ${qcow2}.\n\nCheck network connection and ACPS credentials." 12 70
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ "${need_sha1}" -eq 1 ]]; then
+    log "[STEP 08] Downloading ${sha1}..."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${sha1}' '${url_sha1}'"
+    else
+      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${sha1}" "${url_sha1}"; then
+        log "[STEP 08] ${sha1} download completed"
+      else
+        log "[WARN] ${sha1} download failed (non-critical)"
+      fi
+    fi
+  fi
+
+  #######################################
+  # 5) Verify SHA1 (if available)
+  #######################################
+  if [[ -f "${aio_img_dir}/${sha1}" && -f "${aio_img_dir}/${qcow2}" ]]; then
+    log "[STEP 08] Verifying SHA1 checksum..."
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] sha1sum -c ${aio_img_dir}/${sha1}"
+    else
+      (
+        cd "${aio_img_dir}" || exit 2
+
+        # Check if sha1 file has proper format (checksum + filename)
+        local sha1_content
+        sha1_content=$(cat "${sha1}" 2>/dev/null | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+        
+        # If sha1 file contains only checksum (no filename), create proper format
+        if [[ "${sha1_content}" =~ ^[0-9a-f]{40}$ ]]; then
+          # Only checksum found, add filename
+          log "[STEP 08] sha1 file contains only checksum, adding filename for proper format"
+          echo "${sha1_content}  ${qcow2}" > "${sha1}.tmp"
+          mv "${sha1}.tmp" "${sha1}"
+        elif [[ "${sha1_content}" =~ ^[0-9a-f]{40}[[:space:]]+ ]]; then
+          # Already has checksum + filename format, but may need filename update
+          local existing_checksum
+          existing_checksum=$(echo "${sha1_content}" | awk '{print $1}')
+          if [[ -n "${existing_checksum}" ]]; then
+            # Update filename if it doesn't match
+            if ! echo "${sha1_content}" | grep -q "${qcow2}"; then
+              log "[STEP 08] Updating sha1 file to include correct filename"
+              echo "${existing_checksum}  ${qcow2}" > "${sha1}.tmp"
+              mv "${sha1}.tmp" "${sha1}"
+            fi
+          fi
+        fi
+
+        # Now verify with sha1sum -c
+        if ! sha1sum -c "${sha1}"; then
+          log "[WARN] sha1sum verification failed."
+
+          if whiptail_yesno "STEP 08 - SHA1 verification failed" "SHA1 checksum verification failed.\n\nThe downloaded file may be corrupted.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 08" 14 80
+          then
+            log "[STEP 08] User chose to continue despite SHA1 failure."
+            exit 0   # allowed → subshell succeeds
+          else
+            log "[STEP 08] User stopped STEP 08 due to SHA1 failure."
+            exit 3   # user-abort code
+          fi
+        fi
+
+        # sha1sum succeeded
+        log "[STEP 08] SHA1 checksum verification passed"
+        exit 0
+      )
+
+      local sha_rc=$?
+      case "${sha_rc}" in
+        0)
+          # ok
+          ;;
+        2)
+          log "[STEP 08] Failed to access directory during SHA1 check (cd ${aio_img_dir})"
+          return 1
+          ;;
+        3)
+          log "[STEP 08] User aborted STEP 08 due to SHA1 failure"
+          return 1
+          ;;
+        *)
+          log "[STEP 08] Unknown error during SHA1 verification (code=${sha_rc})"
+          return 1
+          ;;
+      esac
+    fi
+  else
+    if [[ -f "${aio_img_dir}/${sha1}" ]]; then
+      log "[STEP 08] ${aio_img_dir}/${sha1} found but ${aio_img_dir}/${qcow2} missing; skipping SHA1 verification."
+    elif [[ -f "${aio_img_dir}/${qcow2}" ]]; then
+      log "[STEP 08] ${aio_img_dir}/${qcow2} found but ${aio_img_dir}/${sha1} missing; skipping SHA1 verification."
+    fi
+  fi
+
+  #######################################
+  # 6) Set ownership
+  #######################################
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] sudo chown -R stellar:stellar ${aio_img_dir}"
+  else
+    if id stellar >/dev/null 2>&1; then
+      sudo chown -R stellar:stellar "${aio_img_dir}"
+      log "[STEP 08] Set ownership to stellar:stellar"
+    else
+      log "[WARN] 'stellar' user not found; skipping chown."
+    fi
+  fi
+
+  #######################################
+  # 7) Summary
+  #######################################
+  {
+    echo "STEP 08 - DP Download Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual downloads were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • Download directory: ${aio_img_dir}"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. Download deployment script: ${dp_script}"
+      echo "  2. Download AIO image: ${qcow2}"
+      echo "  3. Download SHA1 checksum: ${sha1} (optional)"
+      echo "  4. Verify SHA1 checksum (if available)"
+      echo "  5. Set ownership to stellar:stellar"
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • Downloads require ACPS credentials (ACPS_USERNAME, ACPS_PASSWORD)"
+      echo "  • Download may take significant time depending on file size"
+      echo "  • Network connectivity to ACPS is required"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 DOWNLOAD STATUS:"
+      echo "  • Download directory: ${aio_img_dir}"
+      echo
+      echo "📦 FILES DOWNLOADED:"
+      if [[ -f "${aio_img_dir}/${dp_script}" ]]; then
+        echo "  ✅ ${dp_script}: OK"
+      else
+        echo "  ❌ ${dp_script}: MISSING"
+      fi
+      if [[ -f "${aio_img_dir}/${qcow2}" ]]; then
+        local qcow2_size
+        qcow2_size=$(ls -lh "${aio_img_dir}/${qcow2}" 2>/dev/null | awk '{print $5}')
+        echo "  ✅ ${qcow2}: OK (${qcow2_size})"
+      else
+        echo "  ❌ ${qcow2}: MISSING"
+      fi
+      if [[ -f "${aio_img_dir}/${sha1}" ]]; then
+        echo "  ✅ ${sha1}: OK"
+      else
+        echo "  ⚠️  ${sha1}: MISSING (optional)"
+      fi
+      echo
+      echo "👤 OWNERSHIP:"
+      if id stellar >/dev/null 2>&1; then
+        echo "  • ${aio_img_dir}: stellar:stellar"
+      else
+        echo "  • ⚠️  'stellar' user not found (ownership not set)"
+      fi
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • Files are ready for STEP 09 (AIO VM Deployment)"
+      echo "  • Ensure all files are present before proceeding"
+    fi
+  } > "${tmp_info}"
+
+  show_textbox "STEP 08 - DP Download Summary" "${tmp_info}"
+
+  log "[STEP 08] DP download completed"
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 08] AIO deployment script and image download completed successfully."
+  
+  return 0
+}
+
+step_09_aio_deploy() {
+    local STEP_ID="09_aio_deploy"
+
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 09. AIO VM deployment ====="
+
+    # Load configuration
+    if type load_config >/dev/null 2>&1; then
+        load_config
+    fi
+
+    # DRY_RUN default value guard
+    local _DRY_RUN="${DRY_RUN:-0}"
+
+    # Default configuration values
+    local AIO_HOSTNAME="${AIO_HOSTNAME:-aio}"
+    local AIO_CLUSTERSIZE="1"  # Fixed to 1 for AIO
+
+    local AIO_VCPUS="${AIO_VCPUS:-42}"
+    local AIO_MEMORY_GB="${AIO_MEMORY_GB:-136}"       # in GB
+    local AIO_DISK_GB="${AIO_DISK_GB:-500}"           # in GB
+
+    local AIO_INSTALL_DIR="${AIO_INSTALL_DIR:-/stellar/aio}"
+    local AIO_BRIDGE="${AIO_BRIDGE:-virbr0}"
+
+    local AIO_IP="${AIO_IP:-192.168.122.2}"
+    local AIO_NETMASK="${AIO_NETMASK:-255.255.255.0}"
+    local AIO_GW="${AIO_GW:-192.168.122.1}"
+    local AIO_DNS="${AIO_DNS:-8.8.8.8}"
+
+    # DP_VERSION is managed in config (default to 6.2.0 if not set)
+    local _DP_VERSION="${DP_VERSION:-6.2.0}"
+
+    # AIO image directory (same as STEP 08)
+    local AIO_IMAGE_DIR="${AIO_INSTALL_DIR}/images"
+
+    ############################################################
+    # Clean up all VM directories in /stellar/aio/images/ before deployment
+    ############################################################
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Will clean up all VM directories in ${AIO_IMAGE_DIR}/"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Cleaning up all existing VM directories in ${AIO_IMAGE_DIR}/..."
+        local vm_dir
+        while IFS= read -r -d '' vm_dir; do
+            if [[ -d "${vm_dir}" ]]; then
+                local dir_name
+                dir_name=$(basename "${vm_dir}")
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing VM directory: ${dir_name}/"
+                sudo rm -rf "${vm_dir}" 2>/dev/null || log "[WARN] Failed to remove ${vm_dir}"
+            fi
+        done < <(find "${AIO_IMAGE_DIR}" -maxdepth 1 -type d ! -path "${AIO_IMAGE_DIR}" -print0 2>/dev/null || true)
+        log "[STEP 09] VM directories cleanup completed"
+    fi
+
+    # mgmt interface – use STEP 01 selection if present, else assume mgt
+    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
+    local HOST_MGT_IP
+    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+    if [ -z "${HOST_MGT_IP}" ]; then
+        HOST_MGT_IP="$(whiptail_inputbox "STEP 09 - AIO deploy" "Enter host management interface IP (${MGT_NIC_NAME}).\nExample: 10.4.0.210" "" 12 80)"
+        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
+            whiptail_msgbox "STEP 09 - AIO deploy" "Host management IP not available.\nSkipping AIO deploy." 10 70
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] HOST_MGT_IP not available. Skipping."
+            return 0
+        fi
+    fi
+
+    # Locate virt_deploy_uvp_centos.sh
+    local DP_SCRIPT_PATH_CANDIDATES=()
+    [ -n "${DP_SCRIPT_PATH:-}" ] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
+
+    # STEP 08 standard location
+    DP_SCRIPT_PATH_CANDIDATES+=("${AIO_IMAGE_DIR}/virt_deploy_uvp_centos.sh")
+    DP_SCRIPT_PATH_CANDIDATES+=("${AIO_INSTALL_DIR}/virt_deploy_uvp_centos.sh")
+    DP_SCRIPT_PATH_CANDIDATES+=("./virt_deploy_uvp_centos.sh")
+
+    local DP_SCRIPT_PATH=""
+    local c
+    for c in "${DP_SCRIPT_PATH_CANDIDATES[@]}"; do
+        if [ -f "${c}" ]; then
+            DP_SCRIPT_PATH="${c}"
+            break
+        fi
+    done
+
+    if [ -z "${DP_SCRIPT_PATH}" ]; then
+        whiptail_msgbox "STEP 09 - AIO deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 08 (download script/image) first.\nSkipping this step." 14 80
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] virt_deploy_uvp_centos.sh not found. Skipping."
+        return 0
+    fi
+
+    # Check AIO image presence → if missing set nodownload=false
+    local QCOW2_PATH="${AIO_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
+    local AIO_NODOWNLOAD="true"
+
+    if [ ! -f "${QCOW2_PATH}" ]; then
+        AIO_NODOWNLOAD="false"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO qcow2 image not found at ${QCOW2_PATH}. Will run with --nodownload=false."
+    fi
+
+    # Ensure AIO LV is mounted on /stellar/aio
+    if ! mount | grep -q "on ${AIO_INSTALL_DIR} "; then
+        whiptail_msgbox "STEP 09 - AIO deploy" "${AIO_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] ${AIO_INSTALL_DIR} not mounted. Skipping."
+        return 0
+    fi
+
+    # AIO OTP: use from config or prompt/save once
+    local _AIO_OTP="${AIO_OTP:-}"
+    if [ -z "${_AIO_OTP}" ]; then
+        _AIO_OTP="$(whiptail_passwordbox "STEP 09 - AIO deploy" "Enter OTP for AIO (issued from Stellar Cyber)." "")"
+        if [ $? -ne 0 ] || [ -z "${_AIO_OTP}" ]; then
+            whiptail_msgbox "STEP 09 - AIO deploy" "No OTP provided. Skipping AIO deploy." 10 70
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO_OTP not provided. Skipping."
+            return 0
+        fi
+        AIO_OTP="${_AIO_OTP}"
+        if type save_config >/dev/null 2>&1; then
+            save_config
+        fi
+    fi
+
+    # If aio already exists, warn and allow destroy/cleanup
+    if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO deploy"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Existing VM detected, user kept it. Skipping."
+            return 0
+        fi
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Destroying and undefining existing ${AIO_HOSTNAME}..."
+
+        local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
+
+        if [ "${_DRY_RUN}" -eq 1 ]; then
+            echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.raw' || true"
+            echo "[DRY_RUN] rm -f '${AIO_VM_DIR}/${AIO_HOSTNAME}.log' || true"
+        else
+            virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+            virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+
+            if [ -d "${AIO_VM_DIR}" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Removing old AIO image files in ${AIO_VM_DIR}."
+                sudo rm -rf "${AIO_VM_DIR}"/* 2>/dev/null || true
+                sudo rmdir "${AIO_VM_DIR}" 2>/dev/null || true
+                log "[STEP 09] Old AIO image directory ${AIO_VM_DIR} cleaned up"
+            fi
+        fi
+    fi
+
+    ############################################################
+    # Prompt for AIO VM configuration (memory, vCPU, disk)
+    ############################################################
+    # 1) Memory
+    local _AIO_MEM_INPUT
+    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nCurrent default: ${AIO_MEMORY_GB} GB" "${AIO_MEMORY_GB}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_AIO_MEM_INPUT}" ]; then
+        if [[ "${_AIO_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_MEM_INPUT}" -gt 0 ]; then
+            AIO_MEMORY_GB="${_AIO_MEM_INPUT}"
+        else
+            whiptail_msgbox "STEP 09 - AIO memory" "Invalid memory value.\nUsing current default (${AIO_MEMORY_GB} GB)." 10 70
+        fi
+    fi
+
+    # 2) vCPU
+    local _AIO_VCPU_INPUT
+    _AIO_VCPU_INPUT="$(whiptail_inputbox "STEP 09 - AIO vCPU" "Enter number of vCPUs for AIO VM.\n\nCurrent default: ${AIO_VCPUS}" "${AIO_VCPUS}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_AIO_VCPU_INPUT}" ]; then
+        if [[ "${_AIO_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_VCPU_INPUT}" -gt 0 ]; then
+            AIO_VCPUS="${_AIO_VCPU_INPUT}"
+        else
+            whiptail_msgbox "STEP 09 - AIO vCPU" "Invalid vCPU value.\nUsing current default (${AIO_VCPUS})." 10 70
+        fi
+    fi
+
+    # 3) Disk size
+    local _AIO_DISK_INPUT
+    _AIO_DISK_INPUT="$(whiptail_inputbox "STEP 09 - AIO disk" "Enter disk size (GB) for AIO VM.\n\nCurrent default: ${AIO_DISK_GB} GB" "${AIO_DISK_GB}" 12 70)"
+
+    if [ $? -eq 0 ] && [ -n "${_AIO_DISK_INPUT}" ]; then
+        if [[ "${_AIO_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_DISK_INPUT}" -gt 0 ]; then
+            AIO_DISK_GB="${_AIO_DISK_INPUT}"
+        else
+            whiptail_msgbox "STEP 09 - AIO disk" "Invalid disk size value.\nUsing current default (${AIO_DISK_GB} GB)." 10 70
+        fi
+    fi
+
+    if type save_config >/dev/null 2>&1; then
+        save_config
+    fi
+
+    # Convert memory to MB
+    local AIO_MEMORY_MB=$(( AIO_MEMORY_GB * 1024 ))
+
+    # Build command to run virt_deploy_uvp_centos.sh
+    local CMD
+    CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
+--hostname=${AIO_HOSTNAME} \
+--cluster-size=${AIO_CLUSTERSIZE} \
+--release=${_DP_VERSION} \
+--local-ip=${HOST_MGT_IP} \
+--node-role=AIO \
+--bridge=${AIO_BRIDGE} \
+--CPUS=${AIO_VCPUS} \
+--MEM=${AIO_MEMORY_MB} \
+--DISKSIZE=${AIO_DISK_GB} \
+--nodownload=${AIO_NODOWNLOAD} \
+--installdir=${AIO_INSTALL_DIR} \
+--OTP=${_AIO_OTP} \
+--ip=${AIO_IP} \
+--netmask=${AIO_NETMASK} \
+--gw=${AIO_GW} \
+--dns=${AIO_DNS}"
+
+    # Final confirmation
+    local SUMMARY
+    SUMMARY="Deploy AIO VM with:
+
+  Hostname      : ${AIO_HOSTNAME}
+  Cluster size  : ${AIO_CLUSTERSIZE}
+  DP version    : ${_DP_VERSION}
+  Host MGT IP   : ${HOST_MGT_IP}
+  Bridge        : ${AIO_BRIDGE}
+  vCPU          : ${AIO_VCPUS}
+  Memory        : ${AIO_MEMORY_GB} GB (${AIO_MEMORY_MB} MB)
+  Disk size     : ${AIO_DISK_GB} GB
+  installdir    : ${AIO_INSTALL_DIR}
+  VM IP         : ${AIO_IP}
+  Netmask       : ${AIO_NETMASK}
+  Gateway       : ${AIO_GW}
+  DNS           : ${AIO_DNS}
+  nodownload    : ${AIO_NODOWNLOAD}
+  Script path   : ${DP_SCRIPT_PATH}
+
+Run virt_deploy_uvp_centos.sh with these settings?"
+
+    if ! whiptail_yesno "STEP 09 - AIO deploy" "${SUMMARY}"; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] User canceled AIO deploy."
+        return 0
+    fi
+
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Running AIO deploy command:"
+    echo "  ${CMD}"
+    echo
+
+    if [ "${_DRY_RUN}" -eq 1 ]; then
+        echo "[DRY_RUN] Command not executed (DRY_RUN=1)."
+        whiptail_msgbox "STEP 09 - AIO deploy (DRY RUN)" "DRY_RUN mode.\n\nCommand printed but not executed:\n\n${CMD}" 20 80
+        if type mark_step_done >/dev/null 2>&1; then
+            mark_step_done "${STEP_ID}"
+        fi
+        return 0
+    fi
+
+    # Actual execution
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Would execute: ${CMD}"
+        log "[DRY-RUN] AIO VM deployment skipped in DRY_RUN mode"
+    else
+        eval "${CMD}"
+        local deploy_rc=$?
+
+        if [ "${deploy_rc}" -eq 0 ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO VM deployment completed successfully."
+            
+            # Apply CPU affinity to NUMA0
+            if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
+                log "[STEP 09] Applying CPU affinity to NUMA0 for AIO VM"
+                local numa0_cpus
+                numa0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
+                if [[ -n "${numa0_cpus}" ]]; then
+                    virsh emulatorpin "${AIO_HOSTNAME}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
+                    local max_vcpus
+                    max_vcpus="$(virsh vcpucount "${AIO_HOSTNAME}" --maximum --config 2>/dev/null || echo 0)"
+                    for (( i=0; i<max_vcpus; i++ )); do
+                        virsh vcpupin "${AIO_HOSTNAME}" "${i}" "${numa0_cpus}" --config >/dev/null 2>&1 || true
+                    done
+                    log "[STEP 09] CPU affinity applied to NUMA0 (cpuset=${numa0_cpus})"
+                fi
+            fi
+            
+            # Create summary message
+            local tmp_summary="/tmp/step09_summary.txt"
+            {
+                echo "STEP 09 - AIO VM Deployment Summary"
+                echo "═══════════════════════════════════════════════════════════"
+                echo "✅ EXECUTION COMPLETED"
+                echo
+                echo "📊 DEPLOYMENT STATUS:"
+                local vm_state="unknown"
+                if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+                    vm_state=$(virsh domstate "${AIO_HOSTNAME}" 2>/dev/null || echo "unknown")
+                    echo "  • VM name: ${AIO_HOSTNAME}"
+                    echo "  • VM status: ${vm_state}"
+                    echo "    ✅ AIO VM created successfully"
+                else
+                    echo "  • VM name: ${AIO_HOSTNAME}"
+                    echo "  • VM status: Not found"
+                    echo "    ⚠️  VM creation may have failed"
+                fi
+                echo
+                echo "🖥️  VM CONFIGURATION:"
+                echo "  • Hostname: ${AIO_HOSTNAME}"
+                echo "  • Node role: AIO"
+                echo "  • Cluster size: ${AIO_CLUSTERSIZE}"
+                echo "  • vCPU: ${AIO_VCPUS}"
+                echo "  • Memory: ${AIO_MEMORY_GB}GB (${AIO_MEMORY_MB}MB)"
+                echo "  • Disk: ${AIO_DISK_GB}GB"
+                echo
+                echo "🌐 NETWORK CONFIGURATION:"
+                echo "  • Network mode: NAT"
+                echo "  • Bridge: ${AIO_BRIDGE}"
+                echo "  • IP address: ${AIO_IP}"
+                echo "  • Netmask: ${AIO_NETMASK}"
+                echo "  • Gateway: ${AIO_GW}"
+                echo "  • DNS: ${AIO_DNS}"
+                echo
+                echo "📦 STORAGE CONFIGURATION:"
+                echo "  • Install directory: ${AIO_INSTALL_DIR}"
+                echo "  • Image directory: ${AIO_IMAGE_DIR}"
+                echo
+                if [[ -n "${NUMA_NODES:-}" && "${NUMA_NODES}" -gt 1 ]]; then
+                    echo "⚙️  CPU AFFINITY:"
+                    echo "  • NUMA node: NUMA0"
+                    if [[ -n "${numa0_cpus:-}" ]]; then
+                        echo "  • CPU set: ${numa0_cpus}"
+                        echo "    ✅ CPU affinity configured successfully"
+                    fi
+                    echo
+                fi
+                echo "⚠️  IMPORTANT:"
+                echo "  • Initial boot may take time due to Cloud-Init operations"
+                echo "  • Check VM status with: virsh list --all"
+                echo "  • Access VM console with: virsh console ${AIO_HOSTNAME}"
+                echo "  • Proceed to STEP 10 for Sensor VM deployment"
+            } > "${tmp_summary}"
+            
+            show_textbox "STEP 09 - AIO VM Deployment Summary" "${tmp_summary}"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO VM deployment failed (rc=${deploy_rc})."
+            whiptail_msgbox "STEP 09 - AIO deploy" "AIO VM deployment failed.\n\nCheck logs for details." 12 70
+            return 1
+        fi
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - 09. AIO VM deployment ====="
+    log "[STEP 09] AIO VM deployment completed successfully."
+    return 0
+}
+
+step_10_sensor_lv_download() {
+  local STEP_ID="10_sensor_lv_download"
+  local STEP_NAME="10. Sensor LV Creation + Image/Script Download"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 10] Sensor LV Creation + Image/Script Download"
+  log "[STEP 10] This step will create sensor logical volume and download sensor image/script."
   load_config
 
   # Use user configuration (use STEP01 Total/distribution values)
   : "${LV_LOCATION:=ubuntu-vg}"
-  : "${SENSOR_VM_COUNT:=2}"
-  : "${SENSOR_TOTAL_LV_SIZE_GB:=${SENSOR_TOTAL_LV_SIZE_GB:-${LV_SIZE_GB:-500}}}"
+  : "${SENSOR_VM_COUNT:=1}"  # Fixed to 1 for single mds deployment
+  : "${SENSOR_TOTAL_LV_SIZE_GB:=${SENSOR_TOTAL_LV_SIZE_GB:-${LV_SIZE_GB:-200}}}"
   : "${SENSOR_LV_SIZE_GB_PER_VM:=$((SENSOR_TOTAL_LV_SIZE_GB / SENSOR_VM_COUNT))}"
 
   # Legacy compatible: LV_SIZE_GB is redefined as "Per VM"
   LV_SIZE_GB="${SENSOR_LV_SIZE_GB_PER_VM}"
 
-  log "[STEP 07] User configuration - LV location: ${LV_LOCATION}, Total: ${SENSOR_TOTAL_LV_SIZE_GB}GB, Per VM: ${SENSOR_LV_SIZE_GB_PER_VM}GB (VM=${SENSOR_VM_COUNT})"
+  log "[STEP 10] User configuration - LV location: ${LV_LOCATION}, Total: ${SENSOR_TOTAL_LV_SIZE_GB}GB, Per VM: ${SENSOR_LV_SIZE_GB_PER_VM}GB (VM=${SENSOR_VM_COUNT})"
 
   local tmp_status="/tmp/xdr_step09_status.txt"
 
@@ -3701,46 +5954,34 @@ step_07_sensor_download() {
   # 0) Current status check
   #######################################
   local lv_exists_mds="no"
-  local lv_exists_mds2="no"
   local mounted_mds="no"
-  local mounted_mds2="no"
 
   local UBUNTU_VG="ubuntu-vg"
   local LV_MDS="lv_sensor_root_mds"
-  local LV_MDS2="lv_sensor_root_mds2"
 
   local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
-  local lv_path_mds2="${UBUNTU_VG}/${LV_MDS2}"
 
   if lvs "${lv_path_mds}" >/dev/null 2>&1; then lv_exists_mds="yes"; fi
-  if lvs "${lv_path_mds2}" >/dev/null 2>&1; then lv_exists_mds2="yes"; fi
 
   if mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then mounted_mds="yes"; fi
-  if mountpoint -q /var/lib/libvirt/images/mds2 2>/dev/null; then mounted_mds2="yes"; fi
 
   {
     echo "Current Sensor LV status"
     echo "-------------------"
     echo "LV path(mds) : ${lv_path_mds}"
-    echo "LV path(mds2): ${lv_path_mds2}"
     echo "LV exists (mds) : ${lv_exists_mds}"
-    echo "LV exists (mds2): ${lv_exists_mds2}"
     echo "Mounted (mds)  : ${mounted_mds} (/var/lib/libvirt/images/mds)"
-    echo "Mounted (mds2) : ${mounted_mds2} (/var/lib/libvirt/images/mds2)"
     echo
     echo "User configuration:"
     echo "  - LV location: ${LV_LOCATION}"
-    echo "  - Total disk: ${SENSOR_TOTAL_LV_SIZE_GB}GB"
-    echo "  - Per VM disk: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
+    echo "  - Disk size: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
     echo
     echo "This STEP performs the following tasks:"
-    echo "  1) LV 2count create (${SENSOR_LV_SIZE_GB_PER_VM}GB x 2)"
+    echo "  1) LV create (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
     echo "     - ${lv_path_mds}"
-    echo "     - ${lv_path_mds2}"
     echo "  2) Create ext4 filesystem and mount"
     echo "     - /var/lib/libvirt/images/mds"
-    echo "     - /var/lib/libvirt/images/mds2"
-    echo "  3) Register auto mount in /etc/fstab (2 entries)"
+    echo "  3) Register auto mount in /etc/fstab"
 
     echo "  4) Download sensor image and deployment script"
     echo "     - virt_deploy_modular_ds.sh"
@@ -3752,8 +5993,8 @@ step_07_sensor_download() {
 
   # Continue with image download even if LV is already configured
   local skip_lv_creation="no"
-  if [[ "${lv_exists_mds}" == "yes" && "${lv_exists_mds2}" == "yes" && "${mounted_mds}" == "yes" && "${mounted_mds2}" == "yes" ]]; then
-    if whiptail_yesno "STEP 07 - LV Already configured" "2 LVs and mounts are already configured.\n\n- ${lv_path_mds}\n- ${lv_path_mds2}\n\nSkip LV create/mount and proceed with qcow2 image download only?" 14 90
+  if [[ "${lv_exists_mds}" == "yes" && "${mounted_mds}" == "yes" ]]; then
+    if whiptail_yesno "STEP 07 - LV Already configured" "LV and mount are already configured.\n\n- ${lv_path_mds}\n\nSkip LV create/mount and proceed with qcow2 image download only?" 14 90
     then
       skip_lv_creation="yes"
       log "LV is already configured, so skip LV create/mount and proceed with image download only"
@@ -3769,10 +6010,10 @@ step_07_sensor_download() {
   fi
 
   #######################################
-  # 1) LV create (Per VM 2count) - OpenXDR method (ubuntu-vg)
+  # 1) LV create (mds single) - OpenXDR method (ubuntu-vg)
   #######################################
   if [[ "${skip_lv_creation}" == "no" ]]; then
-    log "[STEP 07] Start creating/mounting 2 LVs per VM (each ${SENSOR_LV_SIZE_GB_PER_VM}GB)"
+    log "[STEP 07] Start creating/mounting LV for mds (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
 
     # mds LV
     if lvs "${lv_path_mds}" >/dev/null 2>&1; then
@@ -3782,17 +6023,8 @@ step_07_sensor_download() {
       run_cmd "sudo mkfs.ext4 -F /dev/${lv_path_mds}"
     fi
 
-    # mds2 LV
-    if lvs "${lv_path_mds2}" >/dev/null 2>&1; then
-      log "[STEP 07] LV ${lv_path_mds2} already exists → skip creation"
-    else
-      run_cmd "sudo lvcreate -L ${SENSOR_LV_SIZE_GB_PER_VM}G -n ${LV_MDS2} ${UBUNTU_VG}"
-      run_cmd "sudo mkfs.ext4 -F /dev/${lv_path_mds2}"
-    fi
-
-    # Safety check: Ensure mountpoints are not already mounted by different devices
+    # Safety check: Ensure mountpoint is not already mounted by different device
     local mount_mds="/var/lib/libvirt/images/mds"
-    local mount_mds2="/var/lib/libvirt/images/mds2"
     
     if mountpoint -q "${mount_mds}" 2>/dev/null; then
       local mounted_dev
@@ -3803,49 +6035,33 @@ step_07_sensor_download() {
         return 1
       fi
     fi
-    
-    if mountpoint -q "${mount_mds2}" 2>/dev/null; then
-      local mounted_dev2
-      mounted_dev2=$(findmnt -n -o SOURCE "${mount_mds2}" 2>/dev/null || echo "")
-      if [[ -n "${mounted_dev2}" && "${mounted_dev2}" != "/dev/${lv_path_mds2}" ]]; then
-        log "[ERROR] ${mount_mds2} is already mounted by ${mounted_dev2}, expected /dev/${lv_path_mds2}"
-        whiptail_msgbox "STEP 07 - Mount Conflict" "Mount point ${mount_mds2} is already mounted by a different device (${mounted_dev2}).\n\nPlease unmount it first or use a different mount point." 12 80
-        return 1
-      fi
-    fi
 
     # mount
-    run_cmd "sudo mkdir -p ${mount_mds} ${mount_mds2}"
+    run_cmd "sudo mkdir -p ${mount_mds}"
     if ! mountpoint -q "${mount_mds}" 2>/dev/null; then
       run_cmd "sudo mount /dev/${lv_path_mds} ${mount_mds}"
-    fi
-    if ! mountpoint -q "${mount_mds2}" 2>/dev/null; then
-      run_cmd "sudo mount /dev/${lv_path_mds2} ${mount_mds2}"
     fi
 
     # fstab
     append_fstab_if_missing "/dev/${lv_path_mds}  ${mount_mds}  ext4 defaults,noatime 0 2"  "${mount_mds}"
-    append_fstab_if_missing "/dev/${lv_path_mds2} ${mount_mds2} ext4 defaults,noatime 0 2"  "${mount_mds2}"
 
     run_cmd "sudo systemctl daemon-reload"
     run_cmd "sudo mount -a"
 
-    # Ownership: Only change ownership of mount points, not entire /var/lib/libvirt/images
-    log "[STEP 07] Change mount point ownership to stellar:stellar"
+    # Ownership: Only change ownership of mount point, not entire /var/lib/libvirt/images
+    log "[STEP 10] Change mount point ownership to stellar:stellar"
     if id stellar >/dev/null 2>&1; then
       run_cmd "sudo chown -R stellar:stellar ${mount_mds}"
-      run_cmd "sudo chown -R stellar:stellar ${mount_mds2}"
     else
       log "[WARN] 'stellar' user account not found, skipping chown."
     fi
   else
-    log "[STEP 07] LV create/mount already configured, skipping"
+    log "[STEP 10] LV create/mount already configured, skipping"
   fi
 
 
   # Store for use in STEP08/09
   save_config_var "SENSOR_LV_MDS"  "${lv_path_mds}"
-  save_config_var "SENSOR_LV_MDS2" "${lv_path_mds2}"
 
 
   #######################################
@@ -3891,13 +6107,13 @@ step_07_sensor_download() {
         log "[DRY-RUN] sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
       else
         sudo cp "${local_qcow}" "${SENSOR_IMAGE_DIR}/${qcow2_name}"
-        log "[STEP 07] Local qcow2 copied (replaced) to ${SENSOR_IMAGE_DIR}/${qcow2_name} completed"
+        log "[STEP 10] Local qcow2 copied (replaced) to ${SENSOR_IMAGE_DIR}/${qcow2_name} completed"
       fi
     else
-      log "[STEP 07] User chose not to use local qcow2 and maintain existing file/download procedure."
+      log "[STEP 10] User chose not to use local qcow2 and maintain existing file/download procedure."
     fi
   else
-    log "[STEP 07] No 1GB+ qcow2 file in current directory → use default download/existing file."
+    log "[STEP 10] No 1GB+ qcow2 file in current directory → use default download/existing file."
   fi
   
   #######################################
@@ -3907,14 +6123,14 @@ step_07_sensor_download() {
   local need_qcow2=0
   local script_name="virt_deploy_modular_ds.sh"
   
-  log "[STEP 07] ${script_name} is always download target"
+  log "[STEP 10] ${script_name} is always download target"
   
   # Always download unless local qcow2 was copied
   if [[ "${use_local_qcow}" -eq 0 ]]; then
-    log "[STEP 07] ${qcow2_name} download target"
+    log "[STEP 10] ${qcow2_name} download target"
     need_qcow2=1
   else
-    log "[STEP 07] Using local qcow2 file, skipping download"
+    log "[STEP 10] Using local qcow2 file, skipping download"
   fi
 
   #######################################
@@ -3934,19 +6150,19 @@ step_07_sensor_download() {
   else
     # Perform actual download
     if [[ "${need_qcow2}" -eq 0 ]]; then
-      log "[STEP 07] Download script only because local qcow2 is used."
+      log "[STEP 10] Download script only because local qcow2 is used."
     fi
     
     (
       cd "${SENSOR_IMAGE_DIR}" || exit 1
       
       # 1) Download deployment script (always)
-      log "[STEP 07] ${script_name} download started: ${script_url}"
+      log "[STEP 10] ${script_name} download started: ${script_url}"
       echo "=== Downloading deployment script ==="
       if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${script_url}" 2>&1 | tee -a "${LOG_FILE}"; then
         chmod +x "${script_name}"
         echo "=== Deployment script download completed ==="
-        log "[STEP 07] ${script_name} download completed"
+        log "[STEP 10] ${script_name} download completed"
       else
         log "[ERROR] ${script_name} download failed"
         exit 1
@@ -3954,12 +6170,12 @@ step_07_sensor_download() {
       
       # 2) qcow2 image download (large capacity, only if local qcow2 is not used)
       if [[ "${need_qcow2}" -eq 1 ]]; then
-        log "[STEP 07] ${qcow2_name} download started: ${image_url}"
+        log "[STEP 10] ${qcow2_name} download started: ${image_url}"
         echo "=== ${qcow2_name} downloading (large capacity file, may take a long time) ==="
         echo "File size may be very large, please wait..."
         if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${image_url}" 2>&1 | tee -a "${LOG_FILE}"; then
           echo "=== ${qcow2_name} download Completed ==="
-          log "[STEP 07] ${qcow2_name} download Completed"
+          log "[STEP 10] ${qcow2_name} download Completed"
         else
           log "[ERROR] ${qcow2_name} download failed"
           exit 1
@@ -3976,10 +6192,9 @@ step_07_sensor_download() {
   #######################################
   # 8) Configure ownership
   #######################################
-  log "[STEP 07] Configure mount point ownership (stellar:stellar)"
+  log "[STEP 10] Configure mount point ownership (stellar:stellar)"
   if id stellar >/dev/null 2>&1; then
     run_cmd "sudo chown -R stellar:stellar /var/lib/libvirt/images/mds"
-    run_cmd "sudo chown -R stellar:stellar /var/lib/libvirt/images/mds2"
   else
     log "[WARN] 'stellar' user account not found, skipping chown."
   fi
@@ -3988,47 +6203,31 @@ step_07_sensor_download() {
   # 9) Verify result
   #######################################
   local final_lv_mds="unknown"
-  local final_lv_mds2="unknown"
   local final_mount_mds="unknown"
-  local final_mount_mds2="unknown"
   local final_image="unknown"
 
   # (Safety) Reconstruct LV path here as well (set -u response)
   local UBUNTU_VG="ubuntu-vg"
   local LV_MDS="lv_sensor_root_mds"
-  local LV_MDS2="lv_sensor_root_mds2"
   local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
-  local lv_path_mds2="${UBUNTU_VG}/${LV_MDS2}"
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     final_lv_mds="(DRY-RUN mode)"
-    final_lv_mds2="(DRY-RUN mode)"
     final_mount_mds="(DRY-RUN mode)"
-    final_mount_mds2="(DRY-RUN mode)"
     final_image="(DRY-RUN mode)"
   else
-    # Re-check LV (2 entries)
+    # Re-check LV
     if lvs "${lv_path_mds}" >/dev/null 2>&1; then
       final_lv_mds="OK"
     else
       final_lv_mds="FAIL"
     fi
-    if lvs "${lv_path_mds2}" >/dev/null 2>&1; then
-      final_lv_mds2="OK"
-    else
-      final_lv_mds2="FAIL"
-    fi
 
-    # Re-check mount (2 entries)
+    # Re-check mount
     if mountpoint -q /var/lib/libvirt/images/mds; then
       final_mount_mds="OK"
     else
       final_mount_mds="FAIL"
-    fi
-    if mountpoint -q /var/lib/libvirt/images/mds2; then
-      final_mount_mds2="OK"
-    else
-      final_mount_mds2="FAIL"
     fi
 
     # Re-check image file
@@ -4040,82 +6239,119 @@ step_07_sensor_download() {
   fi
 
   {
-    echo "STEP 07 execution summary"
-    echo "------------------"
-    echo "LV(mds)  ${lv_path_mds}  : ${final_lv_mds}"
-    echo "LV(mds2) ${lv_path_mds2} : ${final_lv_mds2}"
-    echo "Mount (mds)  /var/lib/libvirt/images/mds  : ${final_mount_mds}"
-    echo "Mount (mds2) /var/lib/libvirt/images/mds2 : ${final_mount_mds2}"
-    echo "Sensor image: ${final_image}"
-    echo
-    echo "Download location: ${SENSOR_IMAGE_DIR}"
-
-    echo "Image file: ${qcow2_name}"
-    echo "Deployment script: virt_deploy_modular_ds.sh"
+    echo "STEP 10 - Sensor LV Creation + Image Download Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • lv_sensor_root LV (mds): ${final_lv_mds}"
+      echo "  • /var/lib/libvirt/images/mds mount: ${final_mount_mds}"
+      echo "  • Sensor image status: ${final_image}"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. LVM Volume Creation:"
+      echo "     - lv_sensor_root (${SENSOR_LV_SIZE_GB_PER_VM:-${SENSOR_LV_SIZE_GB:-200}}GB) would be created"
+      echo "     - ext4 filesystem would be created"
+      echo
+      echo "  2. Mount Configuration:"
+      echo "     - /var/lib/libvirt/images/mds directory would be created"
+      echo "     - LV would be mounted to /var/lib/libvirt/images/mds"
+      echo "     - /etc/fstab entry would be added"
+      echo
+      echo "  3. Image Download:"
+      echo "     - Download location: ${SENSOR_IMAGE_DIR}"
+      echo "     - Image file: ${qcow2_name}"
+      echo "     - Deployment script: virt_deploy_modular_ds.sh"
+      echo "     - Files would be downloaded from ACPS"
+      echo
+      echo "  4. Ownership Configuration:"
+      echo "     - /var/lib/libvirt/images/mds ownership would be set to stellar:stellar"
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • LV creation requires sufficient space in ubuntu-vg"
+      echo "  • Image download requires ACPS credentials"
+      echo "  • Download may take significant time depending on file size"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 INSTALLATION STATUS:"
+      echo "  • lv_sensor_root LV (mds): ${final_lv_mds}"
+      echo "  • /var/lib/libvirt/images/mds mount: ${final_mount_mds}"
+      echo "  • Sensor image status: ${final_image}"
+      echo
+      echo "📦 STORAGE CONFIGURATION:"
+      echo "  • LV Path: ${lv_path_mds}"
+      echo "  • LV Size: ${SENSOR_LV_SIZE_GB_PER_VM:-${SENSOR_LV_SIZE_GB:-200}}GB"
+      echo "  • Mount Point: /var/lib/libvirt/images/mds"
+      echo "  • Filesystem: ext4"
+      echo "  • Auto-mount: Configured in /etc/fstab"
+      echo
+      echo "📥 DOWNLOAD INFORMATION:"
+      echo "  • Download Location: ${SENSOR_IMAGE_DIR}"
+      echo "  • Image file: ${qcow2_name}"
+      echo "  • Deployment script: virt_deploy_modular_ds.sh"
+      if [[ "${final_image}" == "OK" ]]; then
+        local image_size=""
+        if [[ -f "${SENSOR_IMAGE_DIR}/${qcow2_name}" ]]; then
+          image_size=$(ls -lh "${SENSOR_IMAGE_DIR}/${qcow2_name}" 2>/dev/null | awk '{print $5}' || echo "unknown")
+        fi
+        echo "  • Image file size: ${image_size}"
+      fi
+      echo
+      echo "👤 OWNERSHIP:"
+      echo "  • /var/lib/libvirt/images/mds: stellar:stellar"
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • LV and mount are configured and ready for VM deployment"
+      echo "  • Image files are ready for STEP 11 (Sensor VM Deployment)"
+    fi
   } > "${tmp_status}"
 
-  show_textbox "STEP 07 Result Summary" "${tmp_status}"
+  show_textbox "STEP 10 Result Summary" "${tmp_status}"
 
-  log "[STEP 07] Sensor LV creation and image download completed"
+  log "[STEP 10] Sensor LV creation and image download completed"
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 10] Sensor LV creation and image download completed successfully."
 
   return 0
 }
 
 
-step_08_sensor_deploy() {
-  log "[STEP 08] Sensor VM Deployment"
+step_11_sensor_deploy() {
+  local STEP_ID="11_sensor_deploy"
+  local STEP_NAME="11. Sensor VM Deployment"
+  
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 11] Sensor VM Deployment"
+  log "[STEP 11] This step will deploy the Sensor VM (mds) using NAT network mode."
   load_config
 
-  # Check Network mode
-  local net_mode="${SENSOR_NET_MODE:-bridge}"
-  log "[STEP 08] Sensor network mode: ${net_mode}"
-
-  local tmp_status="${STATE_DIR}/xdr_step10_status.txt"
-
-  # [Prevent missing required variables and calculate default values]
-  : "${SENSOR_LV_MDS:=ubuntu-vg/lv_sensor_root_mds}"
-  : "${SENSOR_LV_MDS2:=ubuntu-vg/lv_sensor_root_mds2}"
-
-  if [[ -z "${SENSOR_VCPUS_PER_VM:-}" ]]; then
-    if [[ -n "${SENSOR_TOTAL_VCPUS:-}" ]]; then
-       SENSOR_VCPUS_PER_VM=$((SENSOR_TOTAL_VCPUS / 2))
-    elif [[ -n "${SENSOR_VCPUS:-}" ]]; then
-       SENSOR_VCPUS_PER_VM="${SENSOR_VCPUS}"
-    fi
-  fi
-
-  if [[ -z "${SENSOR_MEMORY_MB_PER_VM:-}" ]]; then
-    if [[ -n "${SENSOR_TOTAL_MEMORY_MB:-}" ]]; then
-       SENSOR_MEMORY_MB_PER_VM=$((SENSOR_TOTAL_MEMORY_MB / 2))
-    elif [[ -n "${SENSOR_MEMORY_MB:-}" ]]; then
-       SENSOR_MEMORY_MB_PER_VM="${SENSOR_MEMORY_MB}"
-    fi
-  fi
-
-  # Final verify configuration values
-  if [[ -z "${SENSOR_VCPUS_PER_VM:-}" || -z "${SENSOR_MEMORY_MB_PER_VM:-}" || -z "${SENSOR_LV_MDS:-}" || -z "${SENSOR_LV_MDS2:-}" ]]; then
-    whiptail_msgbox "STEP 08 - Configuration Error" "Per VM vCPU/memory or LV path configuration is missing.\n\nSTEP 01 (Total/distribution) and STEP 07 (create 2 LVs) must be completed first." 18 80
-    return 1
-  fi
+  # Determine network mode (force NAT)
+  local net_mode="nat"
+  SENSOR_NET_MODE="nat"
+  log "[STEP 11] Sensor network mode: ${net_mode} (NAT only)"
 
   #######################################
   # 0) Clean up existing VMs
   #######################################
-  local SENSOR_VMS=("mds" "mds2")
+  local SENSOR_VMS=("mds")
   local vm_exists="no"
-  if virsh list --all | grep -Eq "\s(mds|mds2)\s" 2>/dev/null; then
+  if virsh list --all | grep -Eq "\smds\s" 2>/dev/null; then
     vm_exists="yes"
   fi
 
   if [[ "${vm_exists}" == "yes" ]]; then
-    if ! whiptail_yesno "STEP 08 - Existing VM Found" "mds or mds2 VM already exists.\n\nDo you want to delete existing VMs and redeploy?" 12 80
+    if ! whiptail_yesno "STEP 11 - Existing VM Found" "mds VM already exists.\n\nDo you want to delete existing VM and redeploy?" 12 80
     then
       log "User canceled existing VM redeployment."
       return 0
     else
       for vm in "${SENSOR_VMS[@]}"; do
         if virsh dominfo "${vm}" >/dev/null 2>&1; then
-          log "[STEP 08] Delete existing ${vm} VM"
+          log "[STEP 11] Delete existing ${vm} VM"
           if virsh list --state-running | grep -q "\s${vm}\s" 2>/dev/null; then
             run_cmd "virsh destroy ${vm}"
           fi
@@ -4125,8 +6361,8 @@ step_08_sensor_deploy() {
     fi
   fi
 
-  if ! whiptail_yesno "STEP 08 Execution Confirmation" "Do you want to proceed with Sensor VM deployment for 2 VMs (mds, mds2)?"; then
-    log "User canceled STEP 08 execution."
+  if ! whiptail_yesno "STEP 11 Execution Confirmation" "Do you want to proceed with Sensor VM deployment for mds?"; then
+    log "User canceled STEP 11 execution."
     return 0
   fi
 
@@ -4135,25 +6371,24 @@ step_08_sensor_deploy() {
   #######################################
   local script_path="/var/lib/libvirt/images/mds/images/virt_deploy_modular_ds.sh"
   if [[ ! -f "${script_path}" && "${DRY_RUN}" -eq 0 ]]; then
-    whiptail_msgbox "STEP 08 - Script Not Found" "Deployment script not found:\n${script_path}"
+    whiptail_msgbox "STEP 11 - Script Not Found" "Deployment script not found:\n${script_path}"
     return 1
   fi
 
   #######################################
-  # 2) Sensor VM deployment loop (sequential deployment for 2 VMs)
+  # 2) Sensor VM deployment (mds single)
   #######################################
-  log "[STEP 08] Starting sensor VM sequential deployment for 2 VMs (mds -> mds2)"
+  log "[STEP 11] Starting sensor VM deployment for mds"
 
   local release="${SENSOR_VERSION}"
   local nodownload="1"
 
-  local cpus_mds="${SENSOR_VCPUS_MDS1:-${SENSOR_VCPUS_PER_VM:-${SENSOR_VCPUS}}}"
-  local cpus_mds2="${SENSOR_VCPUS_MDS2:-${SENSOR_VCPUS_PER_VM:-${SENSOR_VCPUS}}}"
-  local mem_mds="${SENSOR_MEMORY_MB_MDS1:-${SENSOR_MEMORY_MB_PER_VM:-${SENSOR_MEMORY_MB}}}"
-  local mem_mds2="${SENSOR_MEMORY_MB_MDS2:-${SENSOR_MEMORY_MB_PER_VM:-${SENSOR_MEMORY_MB}}}"
+  # Get vCPU and memory for mds (from STEP 01 configuration)
+  local cpus_mds="${SENSOR_VCPUS_PER_VM:-${SENSOR_VCPUS}}"
+  local mem_mds="${SENSOR_MEMORY_MB_PER_VM:-${SENSOR_MEMORY_MB}}"
 
   # Extract disk size number only (script internally adds G suffix)
-  local disk_raw="${SENSOR_LV_SIZE_GB_PER_VM:-${LV_SIZE_GB}}"
+  local disk_raw="${SENSOR_LV_SIZE_GB_PER_VM:-${SENSOR_LV_SIZE_GB:-500}}"
   local disk_num=$(echo "${disk_raw}" | tr -cd '0-9')
   [[ -z "${disk_num}" ]] && disk_num=100
   local disksize="${disk_num}"
@@ -4161,91 +6396,92 @@ step_08_sensor_deploy() {
   # common environment variables
   export disksize="${disksize}"
 
-  for hostname in "mds" "mds2"; do
-    log "[STEP 08] -------- ${hostname} deployment started (sequential) --------"
+  local hostname="mds"
+  log "[STEP 11] -------- ${hostname} deployment started --------"
     
     local installdir="/var/lib/libvirt/images/${hostname}"
     local cpus="${cpus_mds}"
     local memory="${mem_mds}"
-    [[ "${hostname}" == "mds2" ]] && cpus="${cpus_mds2}" && memory="${mem_mds2}"
 
-    # Configure environment variables inside loop to distinguish per VM
-    if [[ "${net_mode}" == "bridge" ]]; then
-      export BRIDGE="br-data"
-      export SENSOR_BRIDGE="br-data"
-      export NETWORK_MODE="bridge"
-      
-      # Per VM IP assignment (default value)
-      if [[ "${hostname}" == "mds" ]]; then
-          export LOCAL_IP="192.168.100.100"
-      else
-          export LOCAL_IP="192.168.100.101"
-      fi
-      
-      export NETMASK="255.255.255.0"
-      export GATEWAY="192.168.100.1"
-      
-      log "[STEP 08] ${hostname} (Bridge) environment variables: IP=${LOCAL_IP}, GW=${GATEWAY}"
-    else
-      # NAT mode
-      export BRIDGE="virbr0"
-      export SENSOR_BRIDGE="virbr0"
-      export NETWORK_MODE="nat"
-      
-      # NAT IP assignment (OpenXDR default)
-      if [[ "${hostname}" == "mds" ]]; then
-          export LOCAL_IP="192.168.122.2"
-      else
-          export LOCAL_IP="192.168.122.3"
-      fi
-      export NETMASK="255.255.255.0"
-      export GATEWAY="192.168.122.1"
-      
-      log "[STEP 08] ${hostname} (NAT) environment variables: IP=${LOCAL_IP}"
+  # Configure environment variables (NAT mode only)
+  export BRIDGE="virbr0"
+  export SENSOR_BRIDGE="virbr0"
+  export NETWORK_MODE="nat"
+  
+  # NAT IP assignment (mds uses 192.168.122.3)
+  # NOTE: DHCP is disabled per Ubuntu 24.04 deployment guide, so virbr0.status file will NOT be created
+  # Static IP (192.168.122.3) is used instead, so retrieve_ip_nat() will be skipped
+  export IP="192.168.122.3"
+  export LOCAL_IP="192.168.122.3"
+  export NETMASK="255.255.255.0"
+  export GATEWAY="192.168.122.1"
+  export DNS="8.8.8.8"
+  
+  log "[STEP 11] ${hostname} (NAT) environment variables: IP=${LOCAL_IP}"
+  
+  # NAT Mode: Ensure default network is started
+  if [[ "${DRY_RUN}" -ne 1 ]]; then
+    log "[STEP 11] NAT Mode - Ensuring default network is ready..."
+    if ! virsh net-list | grep -q "default.*active"; then
+      log "[STEP 11] Starting default libvirt network..."
+      virsh net-start default 2>/dev/null || true
+      sleep 2
     fi
-
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      local deploy_cmd="bash '${script_path}' -- --hostname='${hostname}' --release='${release}' --CPUS='${cpus}' --MEM='${memory}' --DISKSIZE='${disksize}' --installdir='${installdir}' --nodownload='${nodownload}' --bridge='${BRIDGE}'"
-      log "[DRY-RUN] ${hostname} deployment command:\n${deploy_cmd}"
+    
+    # Verify network is active
+    if virsh net-list | grep -q "default.*active"; then
+      log "[STEP 11] Default network is active (DHCP disabled, using static IP ${LOCAL_IP})"
     else
-      cd "/var/lib/libvirt/images/mds/images" || return 1
-      set +e
+      log "[WARNING] Default network could not be started"
+    fi
+  fi
 
-      # [Modified] Copy image file when deploying mds2 (required)
-      if [[ "${hostname}" != "mds" ]]; then
-         local src_img="/var/lib/libvirt/images/mds/images/aella-modular-ds-${release}.qcow2"
-         local dst_dir="/var/lib/libvirt/images/${hostname}/images"
-         local dst_img="${dst_dir}/aella-modular-ds-${release}.qcow2"
-         
-         if [[ -f "${src_img}" ]]; then
-            log "[STEP 08] Copying image for ${hostname} deployment..."
-            mkdir -p "${dst_dir}"
-            cp -n "${src_img}" "${dst_img}" # -n: prevent overwrite
-            log "[STEP 08] Image copy completed: ${dst_img}"
-         else
-            log "[ERROR] Source image not found: ${src_img}"
-            return 1
-         fi
-      fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    # For NAT mode, add --ip to specify static IP and skip retrieve_ip_nat() wait
+    local deploy_cmd="bash '${script_path}' -- --hostname='${hostname}' --release='${release}' --CPUS='${cpus}' --MEM='${memory}' --DISKSIZE='${disksize}' --installdir='${installdir}' --nodownload='${nodownload}' --bridge='${BRIDGE}' --ip='${LOCAL_IP}' --netmask='${NETMASK}' --gw='${GATEWAY}' --dns='${DNS}' --nointeract='true'"
+    log "[DRY-RUN] ${hostname} deployment command:\n${deploy_cmd}"
+  else
+    cd "/var/lib/libvirt/images/mds/images" || return 1
+    
+    # Verify script exists and is executable
+    if [[ ! -f "virt_deploy_modular_ds.sh" ]]; then
+      log "ERROR: Deployment script not found: virt_deploy_modular_ds.sh"
+      return 1
+    fi
+    
+    if [[ ! -x "virt_deploy_modular_ds.sh" ]]; then
+      log "[WARN] Deployment script is not executable. Adding execute permission..."
+      chmod +x virt_deploy_modular_ds.sh
+    fi
+    
+    set +e
       
-      cmd_line="bash virt_deploy_modular_ds.sh -- \
-        --hostname=\"${hostname}\" \
-        --release=\"${release}\" \
-        --CPUS=\"${cpus}\" \
-        --MEM=\"${memory}\" \
-        --DISKSIZE=\"${disksize}\" \
-        --installdir=\"${installdir}\" \
-        --nodownload=\"${nodownload}\" \
-        --bridge=\"${BRIDGE}\""
+    # NAT Mode: Add static IP parameters to skip retrieve_ip_nat() wait
+    # Add --nointeract=true to prevent interactive prompts
+    cmd_line="bash virt_deploy_modular_ds.sh -- \
+      --hostname=\"${hostname}\" \
+      --release=\"${release}\" \
+      --CPUS=\"${cpus}\" \
+      --MEM=\"${memory}\" \
+      --DISKSIZE=\"${disksize}\" \
+      --installdir=\"${installdir}\" \
+      --nodownload=\"${nodownload}\" \
+      --bridge=\"${BRIDGE}\" \
+      --ip=\"${LOCAL_IP}\" \
+      --netmask=\"${NETMASK}\" \
+      --gw=\"${GATEWAY}\" \
+      --dns=\"${DNS}\" \
+      --nointeract=\"true\""
 
-      log "[INFO] execution: ${cmd_line}"
-      log "[INFO] Wait 2 minutes (120 seconds) then automatically proceed to next step."
-      
-      # Configure timeout 120 seconds (2 minutes)
-      set +e
-      timeout 120s bash -c "${cmd_line}" 2>&1 | tee "${STATE_DIR}/deploy_${hostname}.log"
-      local rc=${PIPESTATUS[0]}
-      set -e
+    log "[INFO] execution: ${cmd_line}"
+    log "[INFO] Wait 2 minutes (120 seconds) then automatically proceed to next step."
+    log "[INFO] NAT Mode: Using static IP ${LOCAL_IP} (skips DHCP IP assignment wait and virbr0.status file check)"
+
+    # Configure timeout 120 seconds (2 minutes)
+    set +e
+    timeout 120s bash -c "${cmd_line}" 2>&1 | tee "${STATE_DIR}/deploy_${hostname}.log"
+    local rc=${PIPESTATUS[0]}
+    set -e
 
       # [Core] Exit code check and force success handling
       if [[ ${rc} -eq 0 ]]; then
@@ -4260,142 +6496,90 @@ step_08_sensor_deploy() {
             return 1
          fi
       fi
-      
-      # Wait briefly before next VM deployment
-      log "[STEP 08] ${hostname} deployment completed. Proceeding to next task in 5 seconds..."
-      sleep 5
     fi
-  done
 
-  #######################################
-  # 3) Create br-data and modify VM XML (connect br-data)
-  #######################################
-  log "[STEP 08] Add network interface to Sensor VM (SPAN_ATTACH_MODE: ${SPAN_ATTACH_MODE})"
+  log "[STEP 11] Sensor VM deployment completed"
   
-  if [[ "${DRY_RUN}" -eq 0 ]]; then
-    # br-data create
-    if ! ip link show br-data >/dev/null 2>&1; then
-      if [[ -n "${DATA_NIC:-}" ]]; then
-        ip link add name br-data type bridge
-        ip link set dev br-data up
-        ip link set dev "${DATA_NIC}" master br-data
-        echo 0 > /sys/class/net/br-data/bridge/stp_state
-        echo 0 > /sys/class/net/br-data/bridge/forward_delay
-        log "br-data create bridge Completed"
-      fi
-    fi
-
-    # SPAN create bridge
-    if [[ "${SPAN_ATTACH_MODE}" == "bridge" && -n "${SPAN_BRIDGE_LIST:-}" ]]; then
-      for bridge_name in ${SPAN_BRIDGE_LIST}; do
-        if ! ip link show "${bridge_name}" >/dev/null 2>&1; then
-          log "WARNING: SPAN bridge ${bridge_name} needs verification"
-        fi
-      done
-    fi
-
-    # XML modification loop
-    local SENSOR_VMS=("mds" "mds2")
-    for SENSOR_VM in "${SENSOR_VMS[@]}"; do
-      # Check VM existence
-      if ! virsh list --all | grep -q "\s${SENSOR_VM}\s"; then
-        continue
-      fi
-
-      # Stop VM
-      if virsh list --state-running | grep -q "\s${SENSOR_VM}\s"; then
-        virsh shutdown "${SENSOR_VM}"
-        sleep 5
-      fi
-
-      local vm_xml_new="${STATE_DIR}/${SENSOR_VM}_modified.xml"
-      virsh dumpxml "${SENSOR_VM}" > "${vm_xml_new}" 2>/dev/null
-
-      if [[ -f "${vm_xml_new}" && -s "${vm_xml_new}" ]]; then
-        if grep -q "<source bridge='br-data'/>" "${vm_xml_new}"; then
-          log "[INFO] ${SENSOR_VM}: br-data interface already exists."
-        else
-          log "[STEP 08] ${SENSOR_VM}: Add br-data bridge interface (XML patch)"
-          local br_data_interface="    <interface type='bridge'>
-      <source bridge='br-data'/>
-      <model type='virtio'/>
-    </interface>"
-          local tmp_xml="${vm_xml_new}.tmp"
-          awk -v interface="$br_data_interface" '
-            /<\/devices>/ { print interface }
-            { print }
-          ' "${vm_xml_new}" > "${tmp_xml}"
-          mv "${tmp_xml}" "${vm_xml_new}"
-          
-          virsh undefine "${SENSOR_VM}"
-          virsh define "${vm_xml_new}"
-        fi
-        virsh start "${SENSOR_VM}"
-      fi
-    done
-  fi
-
-  #######################################
-  # 4) Result report
-  #######################################
-  local final_vm="unknown"
-  local final_running="unknown"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    final_vm="(DRY-RUN mode)"
-    final_running="(DRY-RUN mode)"
-  else
-    # Check all 2 VMs
-    local count_exist=0
-    local count_run=0
-    for vm in "mds" "mds2"; do
-        if virsh list --all | grep -q "\s${vm}\s"; then
-            ((count_exist++))
-            if virsh list --state-running | grep -q "\s${vm}\s"; then
-                ((count_run++))
-            fi
-        fi
-    done
-    
-    if [[ ${count_exist} -eq 2 ]]; then
-        final_vm="OK (2/2)"
-        if [[ ${count_run} -eq 2 ]]; then
-            final_running="OK (2/2)"
-        else
-            final_running="Partial (${count_run}/2 running)"
-        fi
-    else
-        final_vm="Partial (${count_exist}/2 created)"
-        final_running="Unknown"
-    fi
-  fi
-
+  # Create summary message
+  local tmp_summary="/tmp/step11_summary.txt"
   {
-    echo "STEP 08 execution summary"
-    echo "------------------"
-    echo "VM create status: ${final_vm}"
-    echo "VM execution status: ${final_running}"
-    echo
-    echo "Network configuration:"
-    echo "- br-data bridge: Connected as L2-only bridge"
-    echo "- SPAN attachment mode: ${SPAN_ATTACH_MODE}"
-    echo
-    echo "※ You can check VM status with 'virsh list --all' command."
-    echo "※ It may take a few minutes for VM to boot normally."
-  } > "${tmp_status}"
-
-  show_textbox "STEP 08 Result Summary" "${tmp_status}"
-
-  log "[STEP 08] Sensor VM deployment completed"
+    echo "STEP 11 - Sensor VM Deployment Summary"
+    echo "═══════════════════════════════════════════════════════════"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual deployment was made"
+      echo
+      echo "📊 SIMULATED STATUS:"
+      echo "  • VM name: mds"
+      echo "  • VM status: Would be created"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. VM Deployment:"
+      echo "     - Sensor VM (mds) would be created"
+      echo "     - Hostname: mds"
+      echo "     - Network: NAT mode (virbr0, 192.168.122.3)"
+      echo "     - vCPU: ${cpus_mds}"
+      echo "     - Memory: ${mem_mds}MB"
+      echo "     - Disk: ${disksize}GB"
+      echo
+      echo "  2. Network Configuration:"
+      echo "     - Bridge: virbr0 (NAT)"
+      echo "     - IP: 192.168.122.3"
+      echo "     - Gateway: 192.168.122.1"
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • VM deployment requires sensor image and script from STEP 10"
+      echo "  • Initial boot may take time due to Cloud-Init operations"
+    else
+      echo "✅ EXECUTION COMPLETED"
+      echo
+      echo "📊 DEPLOYMENT STATUS:"
+      local vm_state="unknown"
+      if virsh dominfo mds >/dev/null 2>&1; then
+        vm_state=$(virsh domstate mds 2>/dev/null || echo "unknown")
+        echo "  • VM name: mds"
+        echo "  • VM status: ${vm_state}"
+        echo "    ✅ Sensor VM created successfully"
+      else
+        echo "  • VM name: mds"
+        echo "  • VM status: Not found"
+        echo "    ⚠️  VM creation may have failed"
+      fi
+      echo
+      echo "🖥️  VM CONFIGURATION:"
+      echo "  • Hostname: mds"
+      echo "  • vCPU: ${cpus_mds}"
+      echo "  • Memory: ${mem_mds}MB"
+      echo "  • Disk: ${disksize}GB"
+      echo
+      echo "🌐 NETWORK CONFIGURATION:"
+      echo "  • Network mode: NAT"
+      echo "  • Bridge: virbr0"
+      echo "  • IP address: 192.168.122.3"
+      echo "  • Gateway: 192.168.122.1"
+      echo "  • Netmask: 255.255.255.0"
+      echo
+      echo "⚠️  IMPORTANT:"
+      echo "  • Initial boot may take time due to Cloud-Init operations"
+      echo "  • Check VM status with: virsh list --all"
+      echo "  • Access VM console with: virsh console mds"
+      echo "  • Proceed to STEP 12 for PCI passthrough and CPU affinity"
+    fi
+  } > "${tmp_summary}"
+  
+  show_textbox "STEP 11 - Sensor VM Deployment Summary" "${tmp_summary}"
+  
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+  log "[STEP 11] Sensor VM deployment completed successfully."
+  
   return 0
 }
 
 
-step_09_sensor_passthrough() {
-    local STEP_ID="09_sensor_passthrough"
+step_12_sensor_passthrough() {
+    local STEP_ID="12_sensor_passthrough"
 
     echo
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 09. Sensor PCI Passthrough / CPU Affinity configuration and verify ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. Sensor PCI Passthrough / CPU Affinity configuration and verify ====="
 
     # config as de
     if type load_config >/dev/null 2>&1; then
@@ -4403,7 +6587,7 @@ step_09_sensor_passthrough() {
     fi
 
     local _DRY="${DRY_RUN:-0}"
-    local SENSOR_VMS=("mds" "mds2")
+    local SENSOR_VMS=("mds")
 
     ###########################################################################
     # Check NUMA count (use lscpu)
@@ -4414,36 +6598,31 @@ step_09_sensor_passthrough() {
     fi
     [[ -z "${numa_nodes}" ]] && numa_nodes=1
 
-    log "[STEP 09] NUMA node count: ${numa_nodes}"
+    log "[STEP 12] NUMA node count: ${numa_nodes}"
 
     ###########################################################################
     # common path
     ###########################################################################
     local SRC_BASE="/var/lib/libvirt/images"
-    local IMAGES_BASE="/var/lib/libvirt/images"   # mds=/var/lib/libvirt/images/mds, mds2=/var/lib/libvirt/images/mds2
+    local IMAGES_BASE="/var/lib/libvirt/images"   # mds=/var/lib/libvirt/images/mds
 
     ###########################################################################
     # Process each Sensor VM in SENSOR_VMS array
     ###########################################################################
     for SENSOR_VM in "${SENSOR_VMS[@]}"; do
-        log "[STEP 09] ----- Sensor VM processing start: ${SENSOR_VM} -----"
+        log "[STEP 12] ----- Sensor VM processing start: ${SENSOR_VM} -----"
 
         #######################################################################
-        # 0. Determine per VM mount point + check mount
+        # 0. Determine mount point + check mount
         #######################################################################
-        local DST_BASE=""   # /var/lib/libvirt/images/mds or /var/lib/libvirt/images/mds2
-        if [[ "${SENSOR_VM}" == "mds" ]]; then
-            DST_BASE="${IMAGES_BASE}/mds"
-        else
-            DST_BASE="${IMAGES_BASE}/mds2"
-        fi
+        local DST_BASE="${IMAGES_BASE}/mds"
 
         if [[ "${_DRY}" -eq 1 ]]; then
             log "[DRY-RUN] (${SENSOR_VM}) (MOUNTCHK) mountpoint -q ${DST_BASE}"
         else
             if ! mountpoint -q "${DST_BASE}" 2>/dev/null; then
-                whiptail_msgbox "STEP 09 - Mount Error" "${SENSOR_VM}: ${DST_BASE} is not mounted.\n\nPlease complete STEP 07 mount of ${DST_BASE} first." 12 70
-                log "[STEP 09] ERROR: ${SENSOR_VM}: ${DST_BASE} not mounted → skip this VM"
+                whiptail_msgbox "STEP 12 - Mount Error" "${SENSOR_VM}: ${DST_BASE} is not mounted.\n\nPlease complete STEP 10 mount of ${DST_BASE} first." 12 70
+                log "[STEP 12] ERROR: ${SENSOR_VM}: ${DST_BASE} not mounted → skip this VM"
                 continue
             fi
         fi
@@ -4452,7 +6631,7 @@ step_09_sensor_passthrough() {
         # 1. Check Sensor VM existence
         #######################################################################
         if ! virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
-            log "[STEP 09] WARNING: Sensor VM(${SENSOR_VM}) not found. Skip this VM."
+            log "[STEP 12] WARNING: Sensor VM(${SENSOR_VM}) not found. Skip this VM."
             continue
         fi
 
@@ -4470,7 +6649,7 @@ step_09_sensor_passthrough() {
         else
             # Safely stop if VM is running (for PCI passthrough configuration)
             if virsh list --name | grep -q "^${SENSOR_VM}$"; then
-                log "[STEP 09] ${SENSOR_VM}: Running → shutdown"
+                log "[STEP 12] ${SENSOR_VM}: Running → shutdown"
                 virsh shutdown "${SENSOR_VM}" >/dev/null 2>&1 || true
 
                 local t=0
@@ -4492,41 +6671,36 @@ step_09_sensor_passthrough() {
             # Since mountpoints are now directly under /var/lib/libvirt/images/mds*,
             # the image directory should be at ${DST_BASE}/${SENSOR_VM} or ${SRC_BASE}/${SENSOR_VM}
             if [[ ! -d "${VM_IMAGE_DIR}" && ! -d "${VM_IMAGE_DIR_ALT}" ]]; then
-                log "[STEP 09] ${SENSOR_VM}: WARN: Image directory not found at ${VM_IMAGE_DIR} or ${VM_IMAGE_DIR_ALT}"
-                log "[STEP 09] ${SENSOR_VM}: This may be normal if STEP 08 has not been executed yet"
+                log "[STEP 12] ${SENSOR_VM}: WARN: Image directory not found at ${VM_IMAGE_DIR} or ${VM_IMAGE_DIR_ALT}"
+                log "[STEP 12] ${SENSOR_VM}: This may be normal if STEP 11 has not been executed yet"
             else
-                log "[STEP 09] ${SENSOR_VM}: Image directory verified"
+                log "[STEP 12] ${SENSOR_VM}: Image directory verified"
             fi
 
             # Check if source files referenced by XML actually exist
-            log "[STEP 09] ${SENSOR_VM}: Check XML source file existence"
+            log "[STEP 12] ${SENSOR_VM}: Check XML source file existence"
             local missing=0
             while read -r f; do
                 [[ -z "${f}" ]] && continue
                 if [[ ! -e "${f}" ]]; then
-                    log "[STEP 09] ${SENSOR_VM}: ERROR: missing file: ${f}"
+                    log "[STEP 12] ${SENSOR_VM}: ERROR: missing file: ${f}"
                     missing=$((missing+1))
                 fi
             done < <(virsh dumpxml "${SENSOR_VM}" | awk -F"'" '/<source file=/{print $2}')
 
             if [[ "${missing}" -gt 0 ]]; then
-                whiptail_msgbox "STEP 09 - File Missing" "${SENSOR_VM}: ${missing} files referenced by VM XML are missing.\n\nPlease redeploy STEP 08 or check image file location." 12 70
-                log "[STEP 09] ${SENSOR_VM}: ERROR: XML source file missing count=${missing} → may not be able to start"
+                whiptail_msgbox "STEP 12 - File Missing" "${SENSOR_VM}: ${missing} files referenced by VM XML are missing.\n\nPlease redeploy STEP 11 or check image file location." 12 70
+                log "[STEP 12] ${SENSOR_VM}: ERROR: XML source file missing count=${missing} → may not be able to start"
             fi
         fi
 
         #######################################################################
-        # 2. Connect PCI Passthrough device (Action) - Per VM separation
+        # 2. Connect PCI Passthrough device (Action) - mds only
         #######################################################################
-        local VM_PCIS=""
-        if [[ "${SENSOR_VM}" == "mds" ]]; then
-            VM_PCIS="${SENSOR_SPAN_VF_PCIS_MDS1:-}"
-        else
-            VM_PCIS="${SENSOR_SPAN_VF_PCIS_MDS2:-}"
-        fi
+        local VM_PCIS="${SENSOR_SPAN_VF_PCIS_MDS:-}"
 
         if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${VM_PCIS}" ]]; then
-            log "[STEP 09] ${SENSOR_VM}: Starting PCI passthrough device connection (pcis=${VM_PCIS})"
+            log "[STEP 12] ${SENSOR_VM}: Starting PCI passthrough device connection (pcis=${VM_PCIS})"
 
             for pci_full in ${VM_PCIS}; do
                 if [[ "${pci_full}" =~ ^([0-9a-f]{4}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-9a-f])$ ]]; then
@@ -4548,7 +6722,22 @@ EOF
                     else
                         log "[ACTION] ${SENSOR_VM}: Connecting PCI device (${pci_full}) to VM..."
                         if [[ "${_DRY}" -eq 0 ]]; then
-                            if virsh attach-device "${SENSOR_VM}" "${pci_xml}" --config --live; then
+                            # Check if VM is running
+                            local vm_running=0
+                            if virsh list --state-running | grep -q "^${SENSOR_VM}$"; then
+                                vm_running=1
+                            fi
+                            
+                            # Use --live only if VM is running, otherwise use --config only
+                            local attach_opts="--config"
+                            if [[ "${vm_running}" -eq 1 ]]; then
+                                attach_opts="--config --live"
+                                log "[INFO] ${SENSOR_VM}: VM is running, using --live option"
+                            else
+                                log "[INFO] ${SENSOR_VM}: VM is not running, using --config only"
+                            fi
+                            
+                            if virsh attach-device "${SENSOR_VM}" "${pci_xml}" ${attach_opts}; then
                                 log "[SUCCESS] ${SENSOR_VM}: Device connection successful"
                             else
                                 log "[ERROR] ${SENSOR_VM}: Device connection failed (already in use or check IOMMU configuration)"
@@ -4568,49 +6757,33 @@ EOF
         #######################################################################
         # 3. Verify connection status (Verification)
         #######################################################################
-        log "[STEP 09] ${SENSOR_VM}: Final PCI Passthrough status check"
+        log "[STEP 12] ${SENSOR_VM}: Final PCI Passthrough status check"
 
         local hostdev_count=0
         if virsh dumpxml "${SENSOR_VM}" | grep -q "<hostdev.*type='pci'"; then
             hostdev_count=$(virsh dumpxml "${SENSOR_VM}" | grep -c "<hostdev.*type='pci'" || echo "0")
-            log "[STEP 09] ${SENSOR_VM}: ${hostdev_count} PCI hostdev devices connected"
+            log "[STEP 12] ${SENSOR_VM}: ${hostdev_count} PCI hostdev devices connected"
         else
             log "[WARN] ${SENSOR_VM}: No PCI hostdev devices found."
         fi
 
         #######################################################################
-        # 4. Apply CPU Affinity (multiple NUMA only) - Per VM separation
+        # 4. Apply CPU Affinity (multiple NUMA only) - mds uses NUMA1
         #######################################################################
         if [[ "${numa_nodes}" -gt 1 ]]; then
-            log "[STEP 09] ${SENSOR_VM}: CPU Affinity application start"
+            log "[STEP 12] ${SENSOR_VM}: CPU Affinity application start"
 
-            local cpuset_for_vm=""
-            if [[ "${SENSOR_VM}" == "mds" ]]; then
-                cpuset_for_vm="${SENSOR_CPUSET_MDS1:-}"
-            else
-                cpuset_for_vm="${SENSOR_CPUSET_MDS2:-}"
-            fi
+            local cpuset_for_vm="${SENSOR_CPUSET_MDS:-}"
 
             if [[ -z "${cpuset_for_vm}" ]]; then
-                local cpu_list_str
-                cpu_list_str="$(lscpu -p=CPU | grep -v '^#' | tr '\n' ' ' | xargs)"
-                if [[ -z "${cpu_list_str}" ]]; then
-                    log "[WARN] ${SENSOR_VM}: Cannot retrieve available CPU list, cannot apply Affinity."
-                    cpuset_for_vm=""
+                # Extract NUMA node1 CPU list for mds
+                local node1_cpus
+                node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
+                if [[ -n "${node1_cpus}" ]]; then
+                    cpuset_for_vm="${node1_cpus}"
                 else
-                    read -r -a cpu_arr <<< "${cpu_list_str}"
-                    local total_cpus="${#cpu_arr[@]}"
-                    if [[ "${total_cpus}" -lt 2 ]]; then
-                        log "[WARN] ${SENSOR_VM}: Too few CPUs, cannot do separate pinning → skip"
+                    log "[WARN] ${SENSOR_VM}: Cannot retrieve NUMA node1 CPU list, cannot apply Affinity."
                         cpuset_for_vm=""
-                    else
-                        local half=$(( (total_cpus + 1) / 2 ))
-                        if [[ "${SENSOR_VM}" == "mds" ]]; then
-                            cpuset_for_vm="$(printf "%s," "${cpu_arr[@]:0:${half}}" | sed 's/,$//')"
-                        else
-                            cpuset_for_vm="$(printf "%s," "${cpu_arr[@]:${half}}" | sed 's/,$//')"
-                        fi
-                    fi
                 fi
             fi
 
@@ -4631,49 +6804,373 @@ EOF
                 fi
             fi
         else
-            log "[STEP 09] ${SENSOR_VM}: Single NUMA node environment → skip CPU Affinity."
+            log "[STEP 12] ${SENSOR_VM}: Single NUMA node environment → skip CPU Affinity."
         fi
 
         #######################################################################
         # 4.5 Safe restart to apply configuration
         #######################################################################
-        restart_vm_safely "${SENSOR_VM}"
+        if ! restart_vm_safely "${SENSOR_VM}"; then
+            log "[WARN] ${SENSOR_VM}: VM restart failed, but continuing..."
+        fi
 
         #######################################################################
         # 5. Result report (Per VM)
         #######################################################################
-        local result_file="/tmp/step09_result_${SENSOR_VM}.txt"
-        {
-            echo "STEP 09 - Verification result (${SENSOR_VM})"
-            echo "==================="
-            echo "- VM status: $(virsh domstate ${SENSOR_VM} 2>/dev/null)"
-            echo "- Applied PCI list: ${VM_PCIS:-<empty>}"
-            echo "- PCI device connection count: ${hostdev_count}"
-            if [[ "${hostdev_count}" -gt 0 ]]; then
-                echo "  (Success: PCI Passthrough is working normally)"
-            else
-                echo "  (Failure: PCI device not connected. Please check STEP 01 configuration)"
+        # Get actual CPU affinity setting for display
+        local actual_cpuset=""
+        if [[ "${numa_nodes}" -gt 1 ]]; then
+            actual_cpuset="${cpuset_for_vm:-}"
+            if [[ -z "${actual_cpuset}" ]]; then
+                # Try to get from virsh if already configured
+                actual_cpuset=$(virsh emulatorpin "${SENSOR_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
             fi
+        fi
+        
+        local result_file="/tmp/step12_result_${SENSOR_VM}.txt"
+        {
+            echo "STEP 12 - PCI Passthrough / CPU Affinity Verification (${SENSOR_VM})"
+            echo "═══════════════════════════════════════════════════════════"
+            if [[ "${_DRY}" -eq 1 ]]; then
+                echo "🔍 DRY-RUN MODE: No actual changes were made"
+                echo
+                echo "📊 SIMULATED STATUS:"
+                echo "  • VM status: Would be checked"
+                echo "  • PCI passthrough: Would be configured"
+                echo "  • CPU affinity: Would be applied"
+                echo
+                echo "ℹ️  In real execution mode, the following would occur:"
+                echo "  1. PCI Passthrough Configuration:"
+                if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${VM_PCIS}" ]]; then
+                    echo "     - SPAN NIC PCI devices would be attached to ${SENSOR_VM}"
+                    echo "     - PCI devices: ${VM_PCIS}"
+                    echo "     - VM XML would be modified to include hostdev entries"
+                else
+                    echo "     - No PCI passthrough configured (SPAN_ATTACH_MODE=${SPAN_ATTACH_MODE:-<not set>})"
+                fi
+                echo
+                echo "  2. CPU Affinity Configuration:"
+                if [[ "${numa_nodes}" -gt 1 ]]; then
+                    echo "     - CPU pinning would be applied to NUMA1 CPUs"
+                    if [[ -n "${actual_cpuset}" ]]; then
+                        echo "     - CPU set: ${actual_cpuset}"
+                    fi
+                    echo "     - Emulator pinning would be configured"
+                else
+                    echo "     - Single NUMA node environment → CPU affinity would be skipped"
+                fi
+                echo
+                echo "  3. VM Restart:"
+                echo "     - ${SENSOR_VM} would be safely restarted to apply changes"
+            else
+                echo "✅ EXECUTION COMPLETED"
+                echo
+                echo "📊 CONFIGURATION STATUS:"
+                local vm_state
+                vm_state=$(virsh domstate ${SENSOR_VM} 2>/dev/null || echo "unknown")
+                echo "  • VM status: ${vm_state}"
+                echo
+                echo "🔌 PCI PASSTHROUGH:"
+                if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${VM_PCIS}" ]]; then
+                    echo "  • Applied PCI list: ${VM_PCIS}"
+                    echo "  • PCI device connection count: ${hostdev_count}"
+            if [[ "${hostdev_count}" -gt 0 ]]; then
+                        echo "    ✅ Success: PCI Passthrough is working normally"
+                    else
+                        echo "    ❌ Failure: PCI device not connected"
+                        echo "    💡 Please check STEP 01 configuration (SPAN NIC selection)"
+                    fi
+                else
+                    echo "  • PCI passthrough: Not configured"
+                    echo "    - SPAN_ATTACH_MODE: ${SPAN_ATTACH_MODE:-<not set>}"
+                    echo "    - PCI devices: ${VM_PCIS:-<empty>}"
+                fi
+                echo
+                echo "⚙️  CPU AFFINITY:"
+                if [[ "${numa_nodes}" -gt 1 ]]; then
+                    if [[ -n "${actual_cpuset}" ]]; then
+                        echo "  • CPU set: ${actual_cpuset}"
+                        echo "  • NUMA node: NUMA1"
+                        echo "    ✅ CPU affinity configured successfully"
+                    else
+                        echo "  • ⚠️  CPU affinity not configured (NUMA1 CPU detection failed)"
+                    fi
+                else
+                    echo "  • Single NUMA node environment → CPU affinity skipped"
+                fi
+            fi
+            echo
+            echo "⚠️  IMPORTANT:"
+            echo "  • PCI passthrough requires IOMMU to be enabled (configured in STEP 05)"
+            echo "  • VM must be stopped before PCI passthrough configuration"
+            echo "  • Verify PCI passthrough with: virsh dumpxml ${SENSOR_VM} | grep hostdev"
+            echo "  • Verify CPU affinity with: virsh vcpupin ${SENSOR_VM}"
         } > "${result_file}"
 
-        show_paged "STEP 09 result (${SENSOR_VM})" "${result_file}"
+        show_paged "STEP 12 result (${SENSOR_VM})" "${result_file}"
 
-        log "[STEP 09] ----- Sensor VM processing completed: ${SENSOR_VM} -----"
+        log "[STEP 12] ----- Sensor VM processing completed: ${SENSOR_VM} -----"
     done
+
+    ###########################################################################
+    # Process AIO VM CPU Affinity (if multiple NUMA nodes)
+    ###########################################################################
+    log "[STEP 12] ===== Starting AIO VM CPU Affinity processing ====="
+    log "[STEP 12] NUMA nodes count: ${numa_nodes}"
+    if [[ "${numa_nodes}" -gt 1 ]]; then
+        log "[STEP 12] ----- AIO VM CPU Affinity processing start: aio -----"
+        
+        local AIO_VM="aio"
+        
+        # Check AIO VM existence
+        if ! virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
+            log "[STEP 12] WARNING: AIO VM(${AIO_VM}) not found. Skip CPU affinity configuration."
+        else
+            log "[STEP 12] ${AIO_VM}: CPU Affinity application start"
+            
+            local cpuset_for_aio="${AIO_CPUSET:-}"
+            
+            if [[ -z "${cpuset_for_aio}" ]]; then
+                # Extract NUMA node0 CPU list for aio
+                local node0_cpus
+                node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
+                if [[ -n "${node0_cpus}" ]]; then
+                    cpuset_for_aio="${node0_cpus}"
+                else
+                    log "[WARN] ${AIO_VM}: Cannot retrieve NUMA node0 CPU list, cannot apply Affinity."
+                    cpuset_for_aio=""
+                fi
+            fi
+            
+            if [[ -z "${cpuset_for_aio}" ]]; then
+                log "[WARN] ${AIO_VM}: CPUSET is empty, so skip Affinity"
+            else
+                log "[ACTION] ${AIO_VM}: CPU Affinity configuration (cpuset=${cpuset_for_aio})"
+                
+                # Safely stop if VM is running (for CPU affinity configuration)
+                if virsh list --name | grep -q "^${AIO_VM}$"; then
+                    log "[STEP 12] ${AIO_VM}: Running → shutdown"
+                    virsh shutdown "${AIO_VM}" >/dev/null 2>&1 || true
+                    
+                    local t=0
+                    while virsh list --name | grep -q "^${AIO_VM}$"; do
+                        sleep 2
+                        t=$((t+2))
+                        if [[ $t -ge 120 ]]; then
+                            log "[WARN] ${AIO_VM}: shutdown timeout → destroy"
+                            virsh destroy "${AIO_VM}" >/dev/null 2>&1 || true
+                            break
+                        fi
+                    done
+                fi
+                
+                if [[ "${_DRY}" -eq 0 ]]; then
+                    virsh emulatorpin "${AIO_VM}" "${cpuset_for_aio}" --config >/dev/null 2>&1 || true
+                    
+                    local max_vcpus
+                    max_vcpus="$(virsh vcpucount "${AIO_VM}" --maximum --config 2>/dev/null || echo 0)"
+                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
+                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
+                    
+                    for (( i=0; i<max_vcpus; i++ )); do
+                        virsh vcpupin "${AIO_VM}" "${i}" "${cpuset_for_aio}" --config >/dev/null 2>&1 || true
+                    done
+                    log "[STEP 12] ${AIO_VM}: CPU Affinity applied to NUMA0 (cpuset=${cpuset_for_aio})"
+                else
+                    log "[DRY-RUN] ${AIO_VM}: emulatorpin / vcpupin cpuset=${cpuset_for_aio} (not executed)"
+                fi
+                
+                # Safe restart to apply configuration
+                restart_vm_safely "${AIO_VM}"
+                
+                # Get actual CPU affinity setting for display
+                local actual_cpuset_aio=""
+                actual_cpuset_aio=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
+                if [[ -z "${actual_cpuset_aio}" ]]; then
+                    actual_cpuset_aio="${cpuset_for_aio}"
+                fi
+            fi
+        fi
+        
+        #######################################################################
+        # AIO data disk (LV) attach (vg_aio/lv_aio → vdb, --config)
+        #######################################################################
+        local DATA_LV="/dev/mapper/vg_aio-lv_aio"
+        local data_disk_attached=0
+        local data_disk_status=""
+        
+        if [[ -e "${DATA_LV}" ]]; then
+            if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
+                if [[ "${_DRY}" -eq 1 ]]; then
+                    log "[DRY-RUN] virsh attach-disk ${AIO_VM} ${DATA_LV} vdb --config"
+                    data_disk_status="Would be attached"
+                else
+                    # Check if vdb exists and if it's the correct disk
+                    local vdb_exists=0
+                    local vdb_is_correct=0
+                    if virsh dumpxml "${AIO_VM}" | grep -q "target dev='vdb'"; then
+                        vdb_exists=1
+                        # Check if the vdb source matches our DATA_LV
+                        local vdb_source
+                        vdb_source=$(virsh dumpxml "${AIO_VM}" | grep -A 5 "target dev='vdb'" | grep -oP "source dev='\K[^']+" || echo "")
+                        if [[ "${vdb_source}" == "${DATA_LV}" ]]; then
+                            vdb_is_correct=1
+                            log "[STEP 12] ${AIO_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
+                            data_disk_attached=1
+                            data_disk_status="Already attached (correct disk)"
+                        else
+                            log "[STEP 12] ${AIO_VM} has vdb but it's not ${DATA_LV} (current: ${vdb_source:-<unknown>})"
+                            log "[STEP 12] Will attach ${DATA_LV} as vdb (this may replace existing vdb)"
+                        fi
+                    fi
+                    
+                    if [[ "${vdb_is_correct}" -eq 0 ]]; then
+                        if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+                            data_disk_attached=1
+                            data_disk_status="Attached successfully"
+                        else
+                            log "[WARN] ${AIO_VM} data disk(${DATA_LV}) attach failed"
+                            data_disk_status="Attach failed"
+                        fi
+                    fi
+                fi
+            else
+                log "[STEP 12] ${AIO_VM} VM not found → skipping AIO data disk attach"
+                data_disk_status="VM not found"
+            fi
+        else
+            log "[STEP 12] ${DATA_LV} does not exist, skipping AIO data disk attach"
+            data_disk_status="LV does not exist"
+        fi
+        
+        # Create summary for AIO VM (after data disk attachment)
+        local aio_result_file="/tmp/step12_result_aio.txt"
+        {
+            echo "STEP 12 - CPU Affinity & Data Disk Verification (${AIO_VM})"
+            echo "═══════════════════════════════════════════════════════════"
+            if [[ "${_DRY}" -eq 1 ]]; then
+                echo "🔍 DRY-RUN MODE: No actual changes were made"
+                echo
+                echo "📊 SIMULATED STATUS:"
+                echo "  • VM status: Would be checked"
+                echo "  • CPU affinity: Would be applied to NUMA0"
+                echo "  • Data disk: Would be attached as vdb"
+            else
+                echo "✅ EXECUTION COMPLETED"
+                echo
+                echo "📊 CONFIGURATION STATUS:"
+                local aio_state
+                aio_state=$(virsh dominfo "${AIO_VM}" 2>/dev/null | grep "^State:" | awk '{print $2}' || echo "unknown")
+                echo "  • VM status: ${aio_state}"
+                echo
+                echo "⚙️  CPU AFFINITY:"
+                if [[ "${numa_nodes}" -gt 1 ]]; then
+                    if [[ -n "${actual_cpuset_aio}" ]]; then
+                        echo "  • CPU set: ${actual_cpuset_aio}"
+                        echo "  • NUMA node: NUMA0"
+                        echo "    ✅ CPU affinity configured successfully"
+                    else
+                        echo "  • ⚠️  CPU affinity not configured (NUMA0 CPU detection failed)"
+                    fi
+                else
+                    echo "  • Single NUMA node environment → CPU affinity skipped"
+                fi
+                echo
+                echo "💾 DATA DISK:"
+                if [[ -e "${DATA_LV}" ]]; then
+                    if [[ "${data_disk_attached}" -eq 1 ]]; then
+                        echo "  • Data disk: ${DATA_LV}"
+                        echo "  • Attached as: vdb"
+                        echo "    ✅ Data disk attached successfully"
+                    else
+                        echo "  • Data disk: ${DATA_LV}"
+                        echo "  • Status: ${data_disk_status}"
+                        if [[ "${data_disk_status}" == "Attach failed" ]]; then
+                            echo "    ❌ Data disk attachment failed"
+                        elif [[ "${data_disk_status}" == "VM not found" ]]; then
+                            echo "    ⚠️  Data disk attachment skipped (VM not found)"
+                        else
+                            echo "    ⚠️  Data disk attachment skipped"
+                        fi
+                    fi
+                else
+                    echo "  • Data disk: ${DATA_LV}"
+                    echo "  • Status: ${data_disk_status}"
+                    echo "    ⚠️  Data disk LV does not exist"
+                fi
+            fi
+            echo
+            echo "⚠️  IMPORTANT:"
+            echo "  • CPU affinity requires multiple NUMA nodes"
+            echo "  • VM must be stopped before CPU affinity configuration"
+            echo "  • Verify CPU affinity with: virsh vcpupin ${AIO_VM}"
+            echo "  • Verify data disk with: virsh dumpxml ${AIO_VM} | grep -A 5 'target dev=\"vdb\"'"
+        } > "${aio_result_file}"
+        
+        show_paged "STEP 12 result (${AIO_VM})" "${aio_result_file}"
+        
+        log "[STEP 12] ----- AIO VM CPU Affinity processing completed: aio -----"
+    else
+        log "[STEP 12] Single NUMA node environment → skip AIO VM CPU Affinity."
+        
+        # Even in single NUMA, still attach data disk if available
+        local AIO_VM="aio"
+        local DATA_LV="/dev/mapper/vg_aio-lv_aio"
+        
+        if [[ -e "${DATA_LV}" ]]; then
+            if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
+                if [[ "${_DRY}" -eq 1 ]]; then
+                    log "[DRY-RUN] virsh attach-disk ${AIO_VM} ${DATA_LV} vdb --config"
+                else
+                    # Check if vdb exists and if it's the correct disk
+                    local vdb_exists=0
+                    local vdb_is_correct=0
+                    if virsh dumpxml "${AIO_VM}" | grep -q "target dev='vdb'"; then
+                        vdb_exists=1
+                        # Check if the vdb source matches our DATA_LV
+                        local vdb_source
+                        vdb_source=$(virsh dumpxml "${AIO_VM}" | grep -A 5 "target dev='vdb'" | grep -oP "source dev='\K[^']+" || echo "")
+                        if [[ "${vdb_source}" == "${DATA_LV}" ]]; then
+                            vdb_is_correct=1
+                            log "[STEP 12] ${AIO_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
+                        else
+                            log "[STEP 12] ${AIO_VM} has vdb but it's not ${DATA_LV} (current: ${vdb_source:-<unknown>})"
+                            log "[STEP 12] Will attach ${DATA_LV} as vdb (this may replace existing vdb)"
+                        fi
+                    fi
+                    
+                    if [[ "${vdb_is_correct}" -eq 0 ]]; then
+                        if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+                        else
+                            log "[WARN] ${AIO_VM} data disk(${DATA_LV}) attach failed"
+                        fi
+                    fi
+                fi
+            else
+                log "[STEP 12] ${AIO_VM} VM not found → skipping AIO data disk attach"
+            fi
+        else
+            log "[STEP 12] ${DATA_LV} does not exist, skipping AIO data disk attach"
+        fi
+    fi
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - 12. PCI Passthrough / CPU Affinity (Sensor + AIO) configuration and verify ====="
+    log "[STEP 12] Sensor PCI passthrough and CPU affinity configuration completed successfully."
+    log "[STEP 12] AIO VM CPU affinity configuration completed successfully."
 }
 
 ###############################################################################
 # STEP 10 – Install DP Appliance CLI package (use local file, no internet download)
 ###############################################################################
-step_10_install_dp_cli() {
-    local STEP_ID="10_install_dp_cli"
-    local STEP_NAME="10. Install DP Appliance CLI package"
+step_13_install_dp_cli() {
+    local STEP_ID="13_install_dp_cli"
+    local STEP_NAME="13. Install DP Appliance CLI package"
     local _DRY="${DRY_RUN:-0}"
     _DRY="${_DRY//\"/}"
 
@@ -4943,7 +7440,8 @@ EOF
         mark_step_done "${STEP_ID}"
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 13. Install DP Appliance CLI package ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
+    log "[STEP 13] DP Appliance CLI package installation completed successfully."
     echo
 }
 
@@ -4957,19 +7455,18 @@ menu_config() {
     load_config
 
     local choice
-    choice=$(whiptail --title "XDR Installer - configuration" \
+    choice=$(whiptail --title "XDR AIO & Sensor Installer - Configuration" \
                       --menu "Change configuration:" \
-                      22 90 10 \
+                      22 90 11 \
                       "1" "DRY_RUN mode: ${DRY_RUN} (1=simulation, 0=actual execution)" \
-                      "2" "Sensor version: ${SENSOR_VERSION}" \
-                      "3" "ACPS Username: ${ACPS_USERNAME}" \
-                      "4" "ACPS Password: (configured)" \
-                      "5" "ACPS URL: ${ACPS_BASE_URL}" \
-                      "6" "Auto Reboot: ${ENABLE_AUTO_REBOOT} (1=active, 0=inactive)" \
-                      "7" "SPAN attachment mode: ${SPAN_ATTACH_MODE} (pci/bridge)" \
-                      "8" "Sensor network mode: ${SENSOR_NET_MODE} (bridge/nat)" \
-                      "9" "View current setting" \
-                      "10" "go back" \
+                      "2" "DP version: ${DP_VERSION:-<not set>}" \
+                      "3" "Sensor version: ${SENSOR_VERSION}" \
+                      "4" "ACPS Username: ${ACPS_USERNAME}" \
+                      "5" "ACPS Password: $([ -n "${ACPS_PASSWORD:-}" ] && echo "(configured)" || echo "(not set)")" \
+                      "6" "ACPS URL: ${ACPS_BASE_URL}" \
+                      "7" "Auto Reboot: ${ENABLE_AUTO_REBOOT} (1=active, 0=inactive)" \
+                      "8" "SPAN attachment mode: ${SPAN_ATTACH_MODE} (pci only)" \
+                      "9" "go back" \
                       3>&1 1>&2 2>&3) || break
 
     case "${choice}" in
@@ -4984,103 +7481,74 @@ menu_config() {
         whiptail_msgbox "Configuration Changed" "DRY_RUN changed to ${new_dry_run}."
         ;;
       2)
-        local new_version
-        new_version=$(whiptail_inputbox "Sensor version configuration" "Please enter sensor version:" "${SENSOR_VERSION}")
-        if [[ -n "${new_version}" ]]; then
-          save_config_var "SENSOR_VERSION" "${new_version}"
-          whiptail_msgbox "Configuration Changed" "Sensor version changed to ${new_version}."
+        local new_dp_version
+        set +e
+        new_dp_version=$(whiptail_inputbox "DP Version Configuration" "Enter DP version (e.g., 6.2.0):" "${DP_VERSION:-}")
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_dp_version}" ]]; then
+          save_config_var "DP_VERSION" "${new_dp_version}"
+          whiptail_msgbox "Configuration Changed" "DP version has been set to ${new_dp_version}."
         fi
         ;;
       3)
-        local new_username
-        new_username=$(whiptail_inputbox "ACPS Username configuration" "Please enter ACPS username:" "${ACPS_USERNAME}")
-        if [[ -n "${new_username}" ]]; then
-          save_config_var "ACPS_USERNAME" "${new_username}"
-          whiptail_msgbox "Configuration Changed" "ACPS username changed."
+        local new_version
+        set +e
+        new_version=$(whiptail_inputbox "Sensor Version Configuration" "Enter sensor version:" "${SENSOR_VERSION}")
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_version}" ]]; then
+          save_config_var "SENSOR_VERSION" "${new_version}"
+          whiptail_msgbox "Configuration Changed" "Sensor version has been set to ${new_version}."
         fi
         ;;
       4)
-        local new_password
-        new_password=$(whiptail_passwordbox "ACPS Password configuration" "Please enter ACPS password:" "")
-        if [[ -n "${new_password}" ]]; then
-          save_config_var "ACPS_PASSWORD" "${new_password}"
-          whiptail_msgbox "Configuration Changed" "ACPS password changed."
+        local new_username
+        set +e
+        new_username=$(whiptail_inputbox "ACPS Username Configuration" "Enter ACPS username:" "${ACPS_USERNAME:-}")
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_username}" ]]; then
+          save_config_var "ACPS_USERNAME" "${new_username}"
+          whiptail_msgbox "Configuration Changed" "ACPS username has been changed."
         fi
         ;;
       5)
-        local new_url
-        new_url=$(whiptail_inputbox "ACPS URL configuration" "Please enter ACPS URL:" "${ACPS_BASE_URL}")
-        if [[ -n "${new_url}" ]]; then
-          save_config_var "ACPS_BASE_URL" "${new_url}"
-          whiptail_msgbox "Configuration Changed" "ACPS URL changed."
+        local new_password
+        set +e
+        new_password=$(whiptail_passwordbox "ACPS Password Configuration" "Enter ACPS password:" "")
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_password}" ]]; then
+          save_config_var "ACPS_PASSWORD" "${new_password}"
+          whiptail_msgbox "Configuration Changed" "ACPS password has been changed."
         fi
         ;;
       6)
-        local new_reboot
-        if [[ "${ENABLE_AUTO_REBOOT}" -eq 1 ]]; then
-          new_reboot=0
-        else
-          new_reboot=1
+        local new_url
+        set +e
+        new_url=$(whiptail_inputbox "ACPS URL Configuration" "Enter ACPS URL:" "${ACPS_BASE_URL}")
+        local input_rc=$?
+        set -e
+        if [[ ${input_rc} -eq 0 && -n "${new_url}" ]]; then
+          save_config_var "ACPS_BASE_URL" "${new_url}"
+          whiptail_msgbox "Configuration Changed" "ACPS URL has been set to ${new_url}."
         fi
-        save_config_var "ENABLE_AUTO_REBOOT" "${new_reboot}"
-        whiptail_msgbox "Configuration Changed" "Auto Reboot changed to ${new_reboot}."
         ;;
       7)
-        local new_mode
-        new_mode=$(whiptail --title "SPAN attachment mode selection" \
-                             --menu "Select method to connect SPAN NIC to Sensor VM:" \
-                             12 70 2 \
-                             "pci"    "PCI passthrough (PF direct assignment, host traffic is not used)" \
-                             "bridge" "L2 bridge virtio NIC" \
-                             3>&1 1>&2 2>&3)
-        if [[ -n "${new_mode}" ]]; then
-          save_config_var "SPAN_ATTACH_MODE" "${new_mode}"
-          whiptail_msgbox "Configuration Changed" "SPAN attachment mode changed to ${new_mode}."
+        local new_auto_reboot
+        if [[ "${ENABLE_AUTO_REBOOT}" -eq 1 ]]; then
+          new_auto_reboot=0
+        else
+          new_auto_reboot=1
         fi
+        save_config_var "ENABLE_AUTO_REBOOT" "${new_auto_reboot}"
+        whiptail_msgbox "Configuration Changed" "Auto Reboot has been set to ${new_auto_reboot}."
         ;;
       8)
-        local new_net_mode
-        new_net_mode=$(whiptail --title "Sensor network mode configuration" \
-                             --menu "Select sensor network mode:" \
-                             15 70 2 \
-                             "bridge" "Bridge Mode: L2 bridge based (default)" \
-                             "nat" "NAT Mode: virbr0 NAT network based" \
-                             3>&1 1>&2 2>&3)
-        if [[ -n "${new_net_mode}" ]]; then
-          save_config_var "SENSOR_NET_MODE" "${new_net_mode}"
-          whiptail_msgbox "Configuration Changed" "Sensor network mode changed to ${new_net_mode}.\n\nChanges will be applied starting from STEP 01. Please execute again."
-        fi
+        whiptail_msgbox "Configuration Info" "SPAN attachment mode is fixed to 'pci' (PCI passthrough only).\nBridge mode is not supported in this installer." 10 70
         ;;
       9)
-        local config_summary
-        config_summary=$(cat <<EOF
-Current XDR Installer configuration
-=======================
-
-Basic Configuration:
-- DRY_RUN: ${DRY_RUN}
-- Sensor version: ${SENSOR_VERSION}
-- Auto Reboot: ${ENABLE_AUTO_REBOOT}
-- Sensor network mode: ${SENSOR_NET_MODE}
-- SPAN attachment mode: ${SPAN_ATTACH_MODE}
-
-ACPS configuration:
-- Username: ${ACPS_USERNAME}
-- URL: ${ACPS_BASE_URL}
-
-Hardware configuration:
-- HOST NIC: ${HOST_NIC:-<Not configured>}
-- DATA NIC: ${DATA_NIC:-<Not configured>}
-- SPAN NICs: ${SPAN_NICS:-<Not configured>}
-- Sensor vCPU: ${SENSOR_VCPUS:-<Not configured>}
-- Sensor memory: ${SENSOR_MEMORY_MB:-<Not configured>}MB
-
-Configuration file: ${CONFIG_FILE}
-EOF
-)
-        show_paged "Current setting" <(echo "${config_summary}")
-        ;;
-      10)
         break
         ;;
     esac
@@ -5100,25 +7568,29 @@ menu_select_step_and_run() {
     for ((i=0; i<NUM_STEPS; i++)); do
       local step_id="${STEP_IDS[$i]}"
       local step_name="${STEP_NAMES[$i]}"
-      local status="wait"
+      local status="[wait]"
+      local step_num=$(printf "%02d" $((i+1)))
 
       if [[ "${LAST_COMPLETED_STEP}" == "${step_id}" ]]; then
-        status="Completed"
+        status="[✓]"
       elif [[ -n "${LAST_COMPLETED_STEP}" ]]; then
         local last_idx
         last_idx=$(get_step_index_by_id "${LAST_COMPLETED_STEP}")
         if [[ ${last_idx} -ge 0 && ${i} -le ${last_idx} ]]; then
-          status="Completed"
+          status="[✓]"
         fi
       fi
 
-      # Use STEP_IDS as menu tags instead of numeric indices
-      menu_items+=("${step_id}" "${step_name} [${status}]")
+      # Extract step name without number prefix for cleaner display
+      local display_name="${step_name#*. }"
+      
+      # Use step number as tag (instead of step_id) for cleaner display
+      # Display without step number prefix
+      menu_items+=("${step_num}" "${display_name} ${status}")
     done
-    menu_items+=("back" "go back")
 
     # Calculate menu size dynamically
-    local menu_item_count=$((NUM_STEPS + 1))
+    local menu_item_count=${NUM_STEPS}
     local menu_dims
     menu_dims=$(calc_menu_size "${menu_item_count}" 100 10)
     local menu_height menu_width menu_list_height
@@ -5129,7 +7601,7 @@ menu_select_step_and_run() {
     centered_msg=$(center_menu_message "Select step to execute:" "${menu_height}")
 
     local choice
-    choice=$(whiptail --title "XDR Installer - step selection" \
+    choice=$(whiptail --title "XDR AIO & Sensor Installer - Step Selection" \
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "${menu_items[@]}" \
@@ -5138,23 +7610,13 @@ menu_select_step_and_run() {
       break
     }
 
-    if [[ "${choice}" == "back" ]]; then
-      break
+    # Convert step number (e.g., "01") to step index (0-based)
+    local step_index=$((10#${choice} - 1))
+    if [[ ${step_index} -ge 0 && ${step_index} -lt ${NUM_STEPS} ]]; then
+      run_step "${step_index}"
     else
-      # Find the index of the selected step_id
-      local idx
-      local found=0
-      for ((idx=0; idx<NUM_STEPS; idx++)); do
-        if [[ "${STEP_IDS[$idx]}" == "${choice}" ]]; then
-          found=1
-          run_step "${idx}"
-          break
-        fi
-      done
-      if [[ ${found} -eq 0 ]]; then
-        log "ERROR: Selected step_id '${choice}' not found in STEP_IDS"
+      log "ERROR: Invalid step number '${choice}'"
         continue
-      fi
     fi
   done
 }
@@ -5171,22 +7633,20 @@ menu_auto_continue_from_state() {
   next_idx=$(get_next_step_index)
 
   if [[ ${next_idx} -ge ${NUM_STEPS} ]]; then
-    whiptail --title "XDR Installer - automatic execution" \
-             --msgbox "All steps have been completed!" 8 60
+    whiptail_msgbox "XDR AIO & Sensor Installer - Automatic Execution" "All steps have been completed!" 8 60
     return
   fi
 
   local next_step_name="${STEP_NAMES[$next_idx]}"
-  if ! whiptail --title "XDR Installer - automatic execution" \
-                --yesno "Do you want to automatically execute from next step?\n\nStart step: ${next_step_name}\n\nIf it fails in the middle, it will stop at that step." 12 80
+  local auto_exec_msg="Do you want to automatically execute from next step?\n\nStart step: ${next_step_name}\n\nIf it fails in the middle, it will stop at that step."
+  if ! whiptail_yesno "XDR AIO & Sensor Installer - Automatic Execution" "${auto_exec_msg}" 12 80
   then
     return
   fi
 
   for ((i=next_idx; i<NUM_STEPS; i++)); do
     if ! run_step "${i}"; then
-      whiptail --title "Automatic execution stopped" \
-               --msgbox "An error occurred during STEP ${STEP_IDS[$i]} execution.\n\nAutomatic execution stopped." 10 70
+      whiptail_msgbox "Automatic execution stopped" "An error occurred during STEP ${STEP_IDS[$i]} execution.\n\nAutomatic execution stopped." 10 70
       break
     fi
   done
@@ -5225,7 +7685,7 @@ main_menu() {
     centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
 
     # Run whiptail and capture both output and exit code
-    choice=$(whiptail --title "XDR Sensor Installer Main Menu" \
+    choice=$(whiptail --title "XDR AIO & Sensor Installer Main Menu" \
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "1" "Auto execute all steps (continue from next step based on current state)" \
@@ -5264,14 +7724,14 @@ main_menu() {
         ;;
       6)
         if [[ -f "${LOG_FILE}" ]]; then
-          show_textbox "XDR Installer Log" "${LOG_FILE}"
+          show_textbox "XDR AIO & Sensor Installer Log" "${LOG_FILE}"
         else
           whiptail_msgbox "Log Not Found" "Log file does not exist yet." 8 60
         fi
         ;;
       7)
-        if whiptail_yesno "Exit Confirmation" "Do you want to exit XDR Installer?" 8 60; then
-          log "XDR Installer exit"
+        if whiptail_yesno "Exit Confirmation" "Do you want to exit XDR AIO & Sensor Installer?" 8 60; then
+          log "XDR AIO & Sensor Installer exit"
           exit 0
         fi
         ;;
@@ -5361,7 +7821,17 @@ build_validation_summary() {
   fi
 
   # Check ifupdown package
-  if dpkg -l | grep -q "^ii[[:space:]]*ifupdown[[:space:]]"; then
+  # Use multiple methods to verify ifupdown is installed
+  local ifupdown_installed=0
+  if dpkg-query -W -f='${Status}' ifupdown 2>/dev/null | grep -q "install ok installed"; then
+    ifupdown_installed=1
+  elif dpkg -l 2>/dev/null | grep -qE "^ii[[:space:]]+ifupdown[[:space:]]"; then
+    ifupdown_installed=1
+  elif command -v ifup >/dev/null 2>&1 && command -v ifdown >/dev/null 2>&1; then
+    ifupdown_installed=1
+  fi
+  
+  if [[ "${ifupdown_installed}" -eq 1 ]]; then
     ok_msgs+=("ifupdown package installed")
   else
     warn_msgs+=("ifupdown package not installed.")
@@ -5475,7 +7945,7 @@ build_validation_summary() {
     warn_msgs+=("  → CHECK: Verify LVM volumes with 'sudo lvs'")
   fi
 
-  # Check lv_sensor_root_mds and lv_sensor_root_mds2 LVs
+  # Check lv_sensor_root_mds LV
   if lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1; then
     ok_msgs+=("lv_sensor_root_mds LV exists")
   else
@@ -5484,15 +7954,7 @@ build_validation_summary() {
     warn_msgs+=("  → CHECK: Verify with 'sudo lvs ubuntu-vg/lv_sensor_root_mds'")
   fi
 
-  if lvs ubuntu-vg/lv_sensor_root_mds2 >/dev/null 2>&1; then
-    ok_msgs+=("lv_sensor_root_mds2 LV exists")
-  else
-    warn_msgs+=("lv_sensor_root_mds2 LV not found.")
-    warn_msgs+=("  → ACTION: Re-run STEP 07 (Sensor LV Creation + Image/Script Download)")
-    warn_msgs+=("  → CHECK: Verify with 'sudo lvs ubuntu-vg/lv_sensor_root_mds2'")
-  fi
-
-  # Check mount points
+  # Check mount point
   if mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then
     ok_msgs+=("/var/lib/libvirt/images/mds mount point exists")
   else
@@ -5501,21 +7963,13 @@ build_validation_summary() {
     warn_msgs+=("  → CHECK: Verify mount with 'mountpoint /var/lib/libvirt/images/mds'")
   fi
 
-  if mountpoint -q /var/lib/libvirt/images/mds2 2>/dev/null; then
-    ok_msgs+=("/var/lib/libvirt/images/mds2 mount point exists")
-  else
-    warn_msgs+=("/var/lib/libvirt/images/mds2 mount point does not exist.")
-    warn_msgs+=("  → ACTION: Re-run STEP 07 (Sensor LV Creation + Image/Script Download)")
-    warn_msgs+=("  → CHECK: Verify mount with 'mountpoint /var/lib/libvirt/images/mds2'")
-  fi
-
   ###############################
   # STEP 08: Sensor VM Deployment
   ###############################
-  if virsh list --all 2>/dev/null | grep -qE '\s(mds|mds2)\s'; then
-    ok_msgs+=("Sensor VMs (mds, mds2) exist")
+  if virsh list --all 2>/dev/null | grep -qE '\smds\s'; then
+    ok_msgs+=("Sensor VM (mds) exists")
   else
-    warn_msgs+=("Sensor VMs (mds, mds2) not found.")
+    warn_msgs+=("Sensor VM (mds) not found.")
     warn_msgs+=("  → ACTION: Re-run STEP 08 (Sensor VM Deployment)")
     warn_msgs+=("  → CHECK: Verify VMs with 'virsh list --all'")
   fi
@@ -5531,27 +7985,11 @@ build_validation_summary() {
     warn_msgs+=("  → NOTE: SPAN NIC passthrough may not be applied without this")
   fi
 
-  if virsh dumpxml mds2 2>/dev/null | grep -q '<hostdev'; then
-    ok_msgs+=("mds2 VM has PCI passthrough (hostdev) configuration")
-  else
-    warn_msgs+=("mds2 VM XML does not have PCI passthrough (hostdev) configuration.")
-    warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
-    warn_msgs+=("  → NOTE: SPAN NIC passthrough may not be applied without this")
-  fi
-
   # Check CPU pinning (cputune)
   if virsh dumpxml mds 2>/dev/null | grep -q '<cputune>'; then
     ok_msgs+=("mds VM has CPU pinning (cputune) configuration")
   else
     warn_msgs+=("mds VM XML does not have CPU pinning (cputune) configuration.")
-    warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
-    warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
-  fi
-
-  if virsh dumpxml mds2 2>/dev/null | grep -q '<cputune>'; then
-    ok_msgs+=("mds2 VM has CPU pinning (cputune) configuration")
-  else
-    warn_msgs+=("mds2 VM XML does not have CPU pinning (cputune) configuration.")
     warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
     warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
   fi
@@ -5672,7 +8110,7 @@ menu_full_validation() {
 
   {
     echo "========================================"
-    echo " XDR Sensor Installer Full Configuration Verification"
+    echo " XDR AIO & Sensor Installer Full Configuration Verification"
     echo " Execution time: $(date '+%F %T')"
     echo
     echo " *** Press spacebar or down arrow key to see next message." 
@@ -5753,8 +8191,6 @@ menu_full_validation() {
     echo "\$ df -h /var/lib/libvirt/images/mds"
     df -h /var/lib/libvirt/images/mds 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds mount point not found."
     echo
-    echo "\$ df -h /var/lib/libvirt/images/mds2"
-    df -h /var/lib/libvirt/images/mds2 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds2 mount point not found."
     echo
 
     echo "\$ ls -la /var/lib/libvirt/images/"
@@ -5844,7 +8280,7 @@ menu_full_validation() {
 show_usage_help() {
   local msg
   msg=$'═══════════════════════════════════════════════════════════════
-        ⭐ Stellar Cyber XDR Sensor – KVM Installer Usage Guide ⭐
+        ⭐ Stellar Cyber XDR AIO & Sensor – KVM Installer Usage Guide ⭐
 ═══════════════════════════════════════════════════════════════
 
 
@@ -5888,7 +8324,7 @@ show_usage_help() {
 │    → Configure installation parameters:                      │
 │      • DRY_RUN: Simulation mode (default: 1)                 │
 │      • SENSOR_VERSION: Sensor version to install             │
-│      • SENSOR_NET_MODE: bridge or nat                         │
+│      • Network mode: NAT only (bridge mode not supported)      │
 │      • SPAN_ATTACH_MODE: pci or bridge                        │
 │      • ACPS credentials (username, password, URL)            │
 └─────────────────────────────────────────────────────────────┘
@@ -5948,10 +8384,13 @@ Step-by-Step Process:
 
 6. Final Steps:
    STEP 06 → Libvirt hooks installation
-   STEP 07 → Sensor LV creation + image/script download
-   STEP 08 → Sensor VM (mds) deployment
-   STEP 09 → PCI passthrough + CPU affinity (SPAN NIC)
-   STEP 10 → DP Appliance CLI installation
+   STEP 07 → LVM Storage Configuration (AIO)
+   STEP 08 → DP Download (AIO)
+   STEP 09 → AIO VM Deployment
+   STEP 10 → Sensor LV Creation + Image/Script Download
+   STEP 11 → Sensor VM (mds) Deployment
+   STEP 12 → PCI Passthrough + CPU Affinity (Sensor, SPAN NIC)
+   STEP 13 → DP Appliance CLI Installation
 
 7. Verification:
    • Select menu 4 to validate complete installation
@@ -5988,12 +8427,20 @@ Process:
 
 Common Use Cases:
 ────────────────────────────────────────────────────────────
-• Sensor VM Redeployment:
-  → Menu 2 → STEP 08 (Sensor VM deployment)
+• AIO VM Redeployment:
+  → Menu 2 → STEP 09 (AIO VM deployment)
   → VM resources (vCPU, memory) are automatically calculated
 
+• Sensor VM Redeployment:
+  → Menu 2 → STEP 11 (Sensor VM deployment)
+  → VM resources (vCPU, memory) are automatically calculated
+
+• Update AIO Image:
+  → Menu 2 → STEP 08 (DP Download for AIO)
+  → New image will be downloaded and deployed
+
 • Update Sensor Image:
-  → Menu 2 → STEP 07 (Sensor LV + image download)
+  → Menu 2 → STEP 10 (Sensor LV + image download)
   → New image will be downloaded and deployed
 
 • Network Configuration Change:
@@ -6001,12 +8448,12 @@ Common Use Cases:
   → Network mode changes require re-running from STEP 01
 
 • SPAN NIC Reconfiguration:
-  → Menu 2 → STEP 01 (SPAN NIC selection) → STEP 09 (PCI passthrough)
+  → Menu 2 → STEP 01 (SPAN NIC selection) → STEP 12 (PCI passthrough)
   → SPAN attachment mode can be changed in menu 3
 
-• Change Network Mode (bridge/nat):
-  → Menu 3 → Update SENSOR_NET_MODE
-  → Menu 2 → STEP 01 → STEP 08 (to apply new network mode)
+• Change Network Mode (NAT only):
+  → Menu 3 → Update SENSOR_NET_MODE (NAT mode only)
+  → Menu 2 → STEP 01 → STEP 11 (to apply new network mode)
 
 
 ═══════════════════════════════════════════════════════════════
@@ -6020,10 +8467,11 @@ Full System Validation:
 Validation Checks:
 ────────────────────────────────────────────────────────────
 ✓ KVM/Libvirt installation and service status
+✓ AIO VM (aio) deployment and running status
 ✓ Sensor VM (mds) deployment and running status
-✓ Network configuration (ifupdown conversion, NIC naming)
-✓ SPAN PCI Passthrough connection status
-✓ LVM storage configuration (ubuntu-vg)
+✓ Network configuration (ifupdown conversion, NIC naming, NAT mode)
+✓ SPAN PCI Passthrough connection status (mds only)
+✓ LVM storage configuration (AIO: vg_aio, Sensor: ubuntu-vg)
 ✓ Service status (libvirtd)
 
 Understanding Results:
@@ -6098,7 +8546,7 @@ DRY_RUN Mode:
 
 Network Mode Selection:
 ────────────────────────────────────────────────────────────
-• SENSOR_NET_MODE: bridge (default) or nat
+• Network mode: NAT only (bridge mode not supported)
   - Bridge: L2 bridge based (recommended for most cases)
   - NAT: virbr0 NAT network based
 • Changes require re-running STEP 01 and STEP 08
@@ -6137,7 +8585,7 @@ Log Files:
 
 • Always start with DRY_RUN=1 to preview changes
 • Review validation results (menu 4) before final deployment
-• Choose appropriate network mode (bridge/nat) based on your network
+• Network mode: NAT only (bridge mode not supported in this installer)
 • PCI passthrough for SPAN provides best performance
 • Ensure IOMMU is enabled in BIOS for PCI passthrough
 • Monitor disk space in ubuntu-vg throughout installation
@@ -6149,7 +8597,7 @@ Log Files:
   # Store temporary file content and display with show_textbox
   local tmp_help_file="/tmp/xdr_sensor_usage_help_$(date '+%Y%m%d-%H%M%S').txt"
   echo "${msg}" > "${tmp_help_file}"
-  show_textbox "XDR Sensor Installer Usage Guide" "${tmp_help_file}"
+  show_textbox "XDR AIO & Sensor Installer Usage Guide" "${tmp_help_file}"
   rm -f "${tmp_help_file}"
 }
 

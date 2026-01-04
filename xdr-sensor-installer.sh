@@ -1483,12 +1483,17 @@ step_02_hwe_kernel() {
   #######################################
   # 1) Current kernel / package status check
   #######################################
-  local cur_kernel hwe_installed
+  local cur_kernel hwe_installed hwe_status_detail
   cur_kernel=$(uname -r 2>/dev/null || echo "unknown")
-  if dpkg -l | grep -q "^ii  ${pkg_name}[[:space:]]"; then
+  
+  # Check HWE package installation status
+  # Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
+  hwe_installed="no"
+  hwe_status_detail="not installed"
+  
+  if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
     hwe_installed="yes"
-  else
-    hwe_installed="no"
+    hwe_status_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
   fi
 
   {
@@ -1500,7 +1505,13 @@ step_02_hwe_kernel() {
     fi
     echo "📊 CURRENT STATUS:"
     echo "  • Current kernel (uname -r): ${cur_kernel}"
-    echo "  • ${pkg_name} installation status: ${hwe_installed}"
+    echo "  • HWE kernel status: ${hwe_installed}"
+    if [[ "${hwe_installed}" == "yes" ]]; then
+      echo "    ✅ ${hwe_status_detail}"
+    else
+      echo "    ⚠️  ${hwe_status_detail}"
+      echo "    Expected package: ${pkg_name}"
+    fi
     echo
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       echo "📋 SIMULATED EXECUTION STEPS:"
@@ -1532,9 +1543,14 @@ step_02_hwe_kernel() {
   # ... cur_kernel, hwe_installed  after, unit textbox   add ...
 
   if [[ "${hwe_installed}" == "yes" ]]; then
-    if ! whiptail_yesno "STEP 02 - HWE Kernel Already Installed" "linux-generic-hwe-24.04 package is already installed.\n\nDo you want to skip this STEP?" 18 80
+    local skip_msg="HWE kernel is already detected on this system.\n\n"
+    skip_msg+="Status: ${hwe_status_detail}\n"
+    skip_msg+="Current kernel: ${cur_kernel}\n\n"
+    skip_msg+="Do you want to skip this STEP?\n\n"
+    skip_msg+="(Yes: Skip / No: Continue with package update and verification)"
+    if ! whiptail_yesno "STEP 02 - HWE Kernel Already Detected" "${skip_msg}" 18 80
     then
-      log "User chose to skip STEP 02 (already installed)."
+      log "User chose to skip STEP 02 entirely (HWE kernel already detected: ${hwe_status_detail})."
       save_state "02_hwe_kernel"
       return 0
     fi
@@ -1587,18 +1603,22 @@ step_02_hwe_kernel() {
   #######################################
   # 3) Installation after Status Summary
   #######################################
-  local new_kernel hwe_now
+  local new_kernel hwe_now hwe_now_detail
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     # DRY-RUN Mode - Use existing uname -r and installation status
     new_kernel="${cur_kernel}"
     hwe_now="${hwe_installed}"
+    hwe_now_detail="${hwe_status_detail}"
   else
     # Check current kernel and HWE package installation status
     new_kernel=$(uname -r 2>/dev/null || echo "unknown")
-    if dpkg -l | grep -q "^ii  ${pkg_name}[[:space:]]"; then
+    hwe_now="no"
+    hwe_now_detail="not installed"
+    
+    # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
+    if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
       hwe_now="yes"
-    else
-      hwe_now="no"
+      hwe_now_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
     fi
   fi
 
@@ -1611,7 +1631,13 @@ step_02_hwe_kernel() {
       echo "📊 SIMULATED STATUS:"
       echo "  • Previous kernel: ${cur_kernel}"
       echo "  • Current kernel:  ${cur_kernel} (unchanged in DRY-RUN)"
-      echo "  • HWE package status: ${hwe_now}"
+      echo "  • HWE kernel status: ${hwe_now}"
+      if [[ "${hwe_now}" == "yes" ]]; then
+        echo "    ✅ ${hwe_now_detail}"
+      else
+        echo "    ⚠️  ${hwe_now_detail}"
+        echo "    Expected package: ${pkg_name}"
+      fi
       echo
       echo "ℹ️  In real execution mode, the following would occur:"
       echo "  1. apt update and full-upgrade would be executed"
@@ -1624,13 +1650,15 @@ step_02_hwe_kernel() {
       echo "📊 KERNEL STATUS:"
       echo "  • Previous kernel: ${cur_kernel}"
       echo "  • Current kernel:  ${new_kernel}"
-      echo "  • HWE package status: ${hwe_now}"
-      echo
+      echo "  • HWE kernel status: ${hwe_now}"
       if [[ "${hwe_now}" == "yes" ]]; then
-        echo "✅ HWE kernel package is now installed"
+        echo "    ✅ ${hwe_now_detail}"
       else
-        echo "⚠️  HWE kernel package installation status: ${hwe_now}"
+        echo "    ⚠️  ${hwe_now_detail}"
+        echo "    Expected package: ${pkg_name}"
+        echo "    Note: HWE kernel will be active after reboot"
       fi
+      echo
     fi
     echo
     echo "📝 IMPORTANT NOTES:"

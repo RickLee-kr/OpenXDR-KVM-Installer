@@ -1138,12 +1138,17 @@ step_02_hwe_kernel() {
   #######################################
   # 0) Check current kernel / package status
   #######################################
-  local cur_kernel hwe_installed
+  local cur_kernel hwe_installed hwe_status_detail
   cur_kernel=$(uname -r 2>/dev/null || echo "unknown")
-  if dpkg -l | grep -q "^ii  ${pkg_name}[[:space:]]"; then
+  
+  # Check HWE package installation status
+  # Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
+  hwe_installed="no"
+  hwe_status_detail="not installed"
+  
+  if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
     hwe_installed="yes"
-  else
-    hwe_installed="no"
+    hwe_status_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
   fi
 
   {
@@ -1153,7 +1158,13 @@ step_02_hwe_kernel() {
     echo
     echo "📋 CURRENT STATUS:"
     echo "  • Current kernel version: ${cur_kernel}"
-    echo "  • HWE kernel package (${pkg_name}): ${hwe_installed}"
+    echo "  • HWE kernel status: ${hwe_installed}"
+    if [[ "${hwe_installed}" == "yes" ]]; then
+      echo "    ✅ ${hwe_status_detail}"
+    else
+      echo "    ⚠️  ${hwe_status_detail}"
+      echo "    Expected package: ${pkg_name}"
+    fi
     echo
     echo "🔧 ACTIONS TO BE PERFORMED:"
     echo "  1. Update package lists (apt update)"
@@ -1177,18 +1188,14 @@ step_02_hwe_kernel() {
   # After computing cur_kernel/hwe_installed, show summary textbox
 
   if [[ "${hwe_installed}" == "yes" ]]; then
-    # Calculate dialog size dynamically and center message
-    local dialog_dims
-    dialog_dims=$(calc_dialog_size 18 80)
-    local dialog_height dialog_width
-    read -r dialog_height dialog_width <<< "${dialog_dims}"
-    local centered_msg
-    centered_msg=$(center_message "linux-generic-hwe-24.04 is already installed. Skip STEP 02?")
-    
-    if ! whiptail --title "STEP 02 - HWE kernel already installed" \
-                  --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+    local skip_msg="HWE kernel is already detected on this system.\n\n"
+    skip_msg+="Status: ${hwe_status_detail}\n"
+    skip_msg+="Current kernel: ${cur_kernel}\n\n"
+    skip_msg+="Do you want to skip this STEP?\n\n"
+    skip_msg+="(Yes: Skip / No: Continue with package update and verification)"
+    if ! whiptail_yesno "STEP 02 - HWE Kernel Already Detected" "${skip_msg}" 18 80
     then
-      log "User skipped STEP 02 because HWE kernel is already installed."
+      log "User chose to skip STEP 02 entirely (HWE kernel already detected: ${hwe_status_detail})."
       save_state "02_hwe_kernel"
       return 0
     fi
@@ -1233,18 +1240,22 @@ step_02_hwe_kernel() {
   #######################################
   # 3) Post-installation status summary
   #######################################
-  local new_kernel hwe_now
+  local new_kernel hwe_now hwe_now_detail
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     # In DRY-RUN mode, no actual installation is performed, so use existing values for both uname -r and installation status
     new_kernel="${cur_kernel}"
     hwe_now="${hwe_installed}"
+    hwe_now_detail="${hwe_status_detail}"
   else
     # In actual execution mode, check current kernel version and HWE package installation status again
     new_kernel=$(uname -r 2>/dev/null || echo "unknown")
-    if dpkg -l | grep -q "^ii  ${pkg_name}[[:space:]]"; then
+    hwe_now="no"
+    hwe_now_detail="not installed"
+    
+    # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
+    if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
       hwe_now="yes"
-    else
-      hwe_now="no"
+      hwe_now_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
     fi
   fi
 

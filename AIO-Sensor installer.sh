@@ -2082,9 +2082,6 @@ step_01_hw_detect() {
       log "[STEP 01] ${nic} (mds SPAN NIC) -> Physical PCI: ${pci_addr}"
     done
 
-  else
-    # Bridge mode does not require PCI passthrough
-    log "[STEP 01] Bridge mode - PCI passthrough not required"
   fi
 
   SPAN_ATTACH_MODE="pci"
@@ -2110,11 +2107,8 @@ step_01_hw_detect() {
   ########################
   local summary
   local pci_label="SPAN NIC PCIs (PF Passthrough)"
-  if [[ "${SPAN_ATTACH_MODE}" == "bridge" ]]; then
-    pci_label="SPAN Interface (Bridge)"
-  fi
 
-  # NAT mode only - bridge mode summary removed
+  # NAT mode only
   if [[ "${net_mode}" == "nat" ]]; then
     summary=$(cat <<EOF
 [STEP 01 Result Summary - NAT Mode]
@@ -2421,556 +2415,6 @@ step_03_nic_ifupdown() {
     log "[STEP 03] NAT Mode - OpenXDR execute NAT configuration method"
     step_03_nat_mode 
     return $?
-}
-
-#######################################
-# STEP 03 - Bridge Mode (Existing sensor script structure)
-#######################################
-step_03_bridge_mode() {
-  log "[STEP 03 Bridge Mode] L2 bridge based network configuration"
-
-  # Check if HOST_NIC and DATA_NIC are set
-  if [[ -z "${HOST_NIC:-}" || -z "${DATA_NIC:-}" ]]; then
-    whiptail_msgbox "STEP 03 - NIC Not Configured" "HOST_NIC or DATA_NIC is not set.\n\nPlease select NICs in STEP 01 first." 12 70
-    log "HOST_NIC or DATA_NIC is empty, so STEP 03 Bridge Mode cannot proceed."
-    return 1
-  fi
-
-  #######################################
-  # 0) Check Current SPAN NIC/PCI information (SR-IOV application target)
-  #######################################
-  local tmp_pci="${STATE_DIR}/xdr_step03_pci.txt"
-  {
-    echo "Selected SPAN NIC and PCI information (SR-IOV applied)"
-    echo "--------------------------------------------"
-    echo "HOST_NIC  : ${HOST_NIC} (SR-IOV not applied)"
-    echo "DATA_NIC  : ${DATA_NIC} (SR-IOV not applied)"
-    echo
-    echo "SPAN NICs (PCI Passthrough application target):"
-    echo "  - mds (sensor) : ${SPAN_NICS_MDS:-<None>}"
-    echo
-
-    if [[ -z "${SPAN_NIC_LIST:-}" ]]; then
-      echo "  Warning: SPAN_NIC_LIST is not set."
-      echo "  Please select SPAN NICs in STEP 01 first."
-    else
-      local span_error=0 
-      for span_nic in ${SPAN_NIC_LIST}; do
-        local span_pci
-        span_pci=$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-        if [[ -n "${span_pci}" ]]; then
-          echo "  ${span_nic}  -> PCI: ${span_pci}"
-        else
-          echo "  ${span_nic}  -> PCI: information None (Error)"
-          span_error=1
-        fi
-      done
-      
-      if [[ ${span_error} -eq 1 ]]; then
-        echo
-        echo "※ Could not retrieve PCI information for some SPAN NICs."
-        echo "   Please check if you selected correct NICs in STEP 01."
-      fi
-    fi
-  } > "${tmp_pci}"
-
-  show_textbox "STEP 03 - NIC/PCI Verification" "${tmp_pci}"
-  
-  #######################################
-  # Already roughly determine if desired network configuration exists
-  #######################################
-  local maybe_done=0
-  local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
-  local iface_file="/etc/network/interfaces"
-
-  # Check HOST/DATA NIC default configuration
-  if [[ -f "${udev_file}" ]] && \
-     grep -q "NAME:=\"host\"" "${udev_file}" 2>/dev/null && \
-     grep -q "NAME:=\"data\"" "${udev_file}" 2>/dev/null; then
-    if [[ -f "${iface_file}" ]] && \
-       grep -q "^auto host" "${iface_file}" 2>/dev/null && \
-       grep -q "iface host inet static" "${iface_file}" 2>/dev/null && \
-       grep -q "^auto br-data" "${iface_file}" 2>/dev/null; then
-      maybe_done=1
-    fi
-  fi
-
-  if [[ "${maybe_done}" -eq 1 ]]; then
-    if whiptail_yesno "STEP 03 - Already configured thing same" "Looking at udev rules and /etc/network/interfaces, configuration seems to be already done.\n\nDo you want to skip this STEP?" 18 80
-    then
-      log "User chose to skip STEP 03 entirely (already configured)."
-      return 0
-    fi
-    log "User chose to force re-execute STEP 03."
-  fi
-
-  #######################################
-  # 1) Collect HOST IP configuration values (default values extracted from current setting)
-  #######################################
-  local cur_cidr cur_ip cur_prefix cur_gw cur_dns
-  cur_cidr=$(ip -4 -o addr show dev "${HOST_NIC}" 2>/dev/null | awk '{print $4}' | head -n1)
-  if [[ -n "${cur_cidr}" ]]; then
-    cur_ip="${cur_cidr%/*}"
-    cur_prefix="${cur_cidr#*/}"
-  else
-    cur_ip=""
-    cur_prefix="24"
-  fi
-  cur_gw=$(ip route show default 0.0.0.0/0 dev "${HOST_NIC}" 2>/dev/null | awk '{print $3}' | head -n1)
-  if [[ -z "${cur_gw}" ]]; then
-    cur_gw=$(ip route show default 0.0.0.0/0 | awk '{print $3}' | head -n1)
-  fi
-  # DNS default value
-  cur_dns="8.8.8.8 8.8.4.4"
-
-  # IP address
-  local new_ip
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    new_ip="${cur_ip}"
-    log "[DRY-RUN] HOST IP configuration: ${new_ip} (default value Use)"
-  else
-    new_ip=$(whiptail_inputbox "STEP 03 - HOST IP Configuration" \
-                      "Enter HOST interface IP address:\nExample: 10.4.0.210" \
-                      "${cur_ip}" \
-                      10 60) || return 0
-  fi
-
-  # prefix
-  local new_prefix
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    new_prefix="${cur_prefix}"
-    log "[DRY-RUN] HOST Prefix configuration: /${new_prefix} (default value Use)"
-  else
-    new_prefix=$(whiptail_inputbox "STEP 03 - HOST Prefix" \
-                          "Please enter subnet prefix (/value).\nExample: 24" \
-                          "${cur_prefix}" \
-                          10 60) || return 0
-  fi
-
-  # Gateway
-  local new_gw
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    new_gw="${cur_gw}"
-    log "[DRY-RUN] Gateway configuration: ${new_gw} (default value Use)"
-  else
-    new_gw=$(whiptail_inputbox "STEP 03 - Gateway" \
-                      "Please enter default gateway IP.\nExample: 10.4.0.254" \
-                      "${cur_gw}" \
-                      10 60) || return 0
-  fi
-
-  # DNS
-  local new_dns
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    new_dns="${cur_dns}"
-    log "[DRY-RUN] DNS configuration: ${new_dns} (default value Use)"
-  else
-    new_dns=$(whiptail_inputbox "STEP 03 - DNS" \
-                       "Please enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" \
-                       "${cur_dns}" \
-                       10 70) || return 0
-  fi
-
-  # DATA_NICIP configuration for is removed (L2-only bridge configuration)
-
-  # Simple prefix → netmask conversion (for HOST)
-  local netmask
-  case "${new_prefix}" in
-    8)  netmask="255.0.0.0" ;;
-    16) netmask="255.255.0.0" ;;
-    24) netmask="255.255.255.0" ;;
-    25) netmask="255.255.255.128" ;;
-    26) netmask="255.255.255.192" ;;
-    27) netmask="255.255.255.224" ;;
-    28) netmask="255.255.255.240" ;;
-    29) netmask="255.255.255.248" ;;
-    30) netmask="255.255.255.252" ;;
-    *)
-      netmask=$(whiptail_inputbox "STEP 03 - HOST Netmask direct input" \
-                         "Unknown HOST prefix: /${new_prefix}.\nPlease enter netmask directly.\nExample: 255.255.255.0" \
-                         "255.255.255.0" \
-                         10 70) || return 1
-      ;;
-  esac
-
-  # DATA netmask conversion removed (L2-only bridge)
-
-  #######################################
-  # 3) udev 99-custom-ifnames.rules create
-  #######################################
-  log "[STEP 03] /etc/udev/rules.d/99-custom-ifnames.rules create"
-
-  # HOST_NIC/DATA_NICGet PCI address of
-  local host_pci data_pci
-  host_pci=$(readlink -f "/sys/class/net/${HOST_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-  data_pci=$(readlink -f "/sys/class/net/${DATA_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-
-  if [[ -z "${host_pci}" || -z "${data_pci}" ]]; then
-    whiptail_msgbox "STEP 03 - udev rule error" "HOST_NIC(${HOST_NIC}) or DATA_NIC(${DATA_NIC})cannot retrieve PCI address of.\n\nudev skip rule creation." 12 70
-    log "HOST_NIC=${HOST_NIC}(${host_pci}), DATA_NIC=${DATA_NIC}(${data_pci}) → insufficient PCI information, udev skip rule creation"
-    return 1
-  fi
-
-  local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
-  local udev_bak="${udev_file}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ -f "${udev_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${udev_file}" "${udev_bak}"
-    log "Existing ${udev_file} backup: ${udev_bak}"
-  fi
-
-  # SPAN NICsAdditional udev rules for collecting PCI addresses and fixing names of
-  local span_udev_rules=""
-  if [[ -n "${SPAN_NIC_LIST:-}" ]]; then
-    for span_nic in ${SPAN_NIC_LIST}; do
-      local span_pci
-      span_pci=$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-      if [[ -n "${span_pci}" ]]; then
-        span_udev_rules="${span_udev_rules}
-
-# SPAN Interface ${span_nic} PCI-bus ${span_pci} (PF PCI passthrough specific, SR-IOV not used)
-ACTION==\"add\", SUBSYSTEM==\"net\", KERNELS==\"${span_pci}\", NAME:=\"${span_nic}\""
-      else
-        log "WARNING: SPAN NIC ${span_nic} PCI address could not be found."
-      fi
-    done
-  fi
-
-  local udev_content
-  udev_content=$(cat <<EOF
-# Host & Data Interface custom names (auto-generated)
-# HOST_NIC=${HOST_NIC}, PCI=${host_pci}
-ACTION=="add", SUBSYSTEM=="net", KERNELS=="${host_pci}", NAME:="host"
-
-# Data Interface PCI-bus ${data_pci}, SR-IOV not applied
-ACTION=="add", SUBSYSTEM=="net", KERNELS=="${data_pci}", NAME:="data"${span_udev_rules}
-EOF
-)
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${udev_file} will write the following content to:\n${udev_content}"
-  else
-    printf "%s\n" "${udev_content}" > "${udev_file}"
-  fi
-
-  # udev reload
-  run_cmd "sudo udevadm control --reload"
-  run_cmd "sudo udevadm trigger --type=devices --action=add"
-
-  #######################################
-  # 4) /etc/network/interfaces create
-  #######################################
-  log "[STEP 03] /etc/network/interfaces create"
-
-  local iface_file="/etc/network/interfaces"
-  local iface_bak="${iface_file}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ -f "${iface_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${iface_file}" "${iface_bak}"
-    log "Existing ${iface_file} backup: ${iface_bak}"
-  fi
-
-  local iface_content
-  iface_content=$(cat <<EOF
-source /etc/network/interfaces.d/*
-
-# The loopback network interface
-auto lo
-iface lo inet loopback
-
-# The host network interface (for management)
-auto host
-iface host inet static
-    address ${new_ip}
-    netmask ${netmask}
-    gateway ${new_gw}
-    dns-nameservers ${new_dns}
-EOF
-)
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${iface_file} will write the following content to:\n${iface_content}"
-  else
-    printf "%s\n" "${iface_content}" > "${iface_file}"
-  fi
-
-  #######################################
-  # 5) /etc/network/interfaces.d/00-data.cfg create (br-data L2 bridge)
-  #######################################
-  log "[STEP 03] /etc/network/interfaces.d/00-data.cfg create (br-data L2 bridge)"
-
-  local iface_dir="/etc/network/interfaces.d"
-  local data_cfg="${iface_dir}/00-data.cfg"
-  local data_bak="${data_cfg}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ "${DRY_RUN}" -eq 0 ]]; then
-    mkdir -p "${iface_dir}"
-  fi
-
-  if [[ -f "${data_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${data_cfg}" "${data_bak}"
-    log "Existing ${data_cfg} backup: ${data_bak}"
-  fi
-
-  local data_content
-  data_content="auto br-data
-iface br-data inet manual
-    bridge_ports data
-    bridge_stp off
-    bridge_fd 0"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${data_cfg} will write the following content to:\n${data_content}"
-  else
-    printf "%s\n" "${data_content}" > "${data_cfg}"
-  fi
-
-  #######################################
-  # 5-1) SPAN create bridge (SPAN_ATTACH_MODE=bridgeif)
-  #######################################
-  if [[ "${SPAN_ATTACH_MODE}" == "bridge" ]]; then
-    log "[STEP 03] SPAN L2 create bridge (SPAN_ATTACH_MODE=bridge)"
-    
-    if [[ -n "${SPAN_NIC_LIST:-}" ]]; then
-      local span_bridge_list=""
-      local span_index=0
-      
-      for span_nic in ${SPAN_NIC_LIST}; do
-        local bridge_name="br-span${span_index}"
-        local span_cfg="${iface_dir}/01-span${span_index}.cfg"
-        local span_bak="${span_cfg}.$(date +%Y%m%d-%H%M%S).bak"
-        
-        if [[ -f "${span_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
-          cp -a "${span_cfg}" "${span_bak}"
-          log "Existing ${span_cfg} backup: ${span_bak}"
-        fi
-        
-        local span_content
-        span_content="auto ${bridge_name}
-iface ${bridge_name} inet manual
-    bridge_ports ${span_nic}
-    bridge_stp off
-    bridge_fd 0"
-        
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-          log "[DRY-RUN] ${span_cfg} will write the following content to:\n${span_content}"
-        else
-          printf "%s\n" "${span_content}" > "${span_cfg}"
-        fi
-        
-        # Add bridge to list
-        span_bridge_list="${span_bridge_list} ${bridge_name}"
-        log "SPAN bridge ${bridge_name} -> ${span_nic} configuration completed"
-        
-        ((span_index++))
-      done
-      
-      # Store bridge list
-      SPAN_BRIDGE_LIST="${span_bridge_list# }"
-      save_config_var "SPAN_BRIDGE_LIST" "${SPAN_BRIDGE_LIST}"
-      log "SPAN bridge list stored: ${SPAN_BRIDGE_LIST}"
-    else
-      log "WARNING: SPAN_NIC_LIST is empty, so SPAN bridge cannot be created."
-    fi
-  else
-    log "[STEP 03] SPAN create bridge skip (SPAN_ATTACH_MODE=${SPAN_ATTACH_MODE})"
-  fi
-
-  #######################################
-  # 6) /etc/iproute2/rt_tables register rt_host in
-  #######################################
-  log "[STEP 03] /etc/iproute2/rt_tables register rt_host in"
-
-  local rt_file="/etc/iproute2/rt_tables"
-  if [[ ! -f "${rt_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    touch "${rt_file}"
-  fi
-
-  if grep -qE '^[[:space:]]*1[[:space:]]+rt_host' "${rt_file}" 2>/dev/null; then
-    log "rt_tables: 1 rt_host entry already exists."
-  else
-    local rt_line="1 rt_host"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] ${rt_file} at the end of '${rt_line}' will add"
-    else
-      echo "${rt_line}" >> "${rt_file}"
-      log "${rt_file} to '${rt_line}' Additional"
-    fi
-  fi
-
-  # rt_data add table
-  if grep -qE '^[[:space:]]*2[[:space:]]+rt_data' "${rt_file}" 2>/dev/null; then
-    log "rt_tables: 2 rt_data entry already exists."
-  else
-    local rt_data_line="2 rt_data"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] ${rt_file} at the end of '${rt_data_line}' will add"
-    else
-      echo "${rt_data_line}" >> "${rt_file}"
-      log "${rt_file} to '${rt_data_line}' Additional"
-    fi
-  fi
-
-  #######################################
-  # 7) Create advanced routing rule configuration script
-  #######################################
-  log "[STEP 03] Create advanced routing rule configuration script"
-
-  # Create routing rule script that will be executed after reboot
-  local routing_script="/etc/network/if-up.d/xdr-routing"
-  local routing_bak="${routing_script}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ -f "${routing_script}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${routing_script}" "${routing_bak}"
-    log "Existing ${routing_script} backup: ${routing_bak}"
-  fi
-
-  local routing_content
-  routing_content=$(cat <<EOF
-#!/bin/bash
-# XDR Sensor advanced routing rule (auto-generated)
-# Executed when interface comes up
-
-IFACE="\$1"
-
-case "\$IFACE" in
-  host)
-    # HOST network routing rule
-    ip route add default via ${new_gw} dev host table rt_host 2>/dev/null || true
-    ip rule add from ${new_ip}/32 table rt_host priority 100 2>/dev/null || true
-    ip rule add to ${new_ip}/32 table rt_host priority 100 2>/dev/null || true
-    ;;
-  data)
-EOF
-)
-
-  # DATA is L2-only bridge, so routing rule not required
-  routing_content="${routing_content}    # DATA(br-data) is L2-only bridge - no routing rule"
-
-  routing_content="${routing_content}
-    ;;
-esac"
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${routing_script} will write the following content to:\n${routing_content}"
-  else
-    printf "%s\n" "${routing_content}" | sudo tee "${routing_script}" >/dev/null
-    sudo chmod +x "${routing_script}"
-  fi
-
-  #######################################
-  # 8) Disable netplan + switch to ifupdown
-  #######################################
-  log "[STEP 03] Disable netplan and switch to ifupdown (applied after reboot)"
-
-  # Disable netplan configuration files
-  if compgen -G "/etc/netplan/*.yaml" > /dev/null; then
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] sudo mkdir -p /etc/netplan/disabled"
-      log "[DRY-RUN] sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/"
-    else
-      sudo mkdir -p /etc/netplan/disabled
-      sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/
-    fi
-  else
-    log "No netplan yaml files to disable (may have already been disabled)."
-  fi
-
-  #######################################
-  # 7-1) Disable systemd-networkd / netplan services + enable legacy networking
-  #######################################
-  log "[STEP 03] Disable systemd-networkd / netplan services and enable networking service"
-
-  # Disable systemd-networkd / netplan related services
-  run_cmd "sudo systemctl stop systemd-networkd || true"
-  run_cmd "sudo systemctl disable systemd-networkd || true"
-  run_cmd "sudo systemctl mask systemd-networkd || true"
-  run_cmd "sudo systemctl mask systemd-networkd-wait-online || true"
-  run_cmd "sudo systemctl mask netplan-* || true"
-
-  # Enable legacy networking service
-  run_cmd "sudo systemctl unmask networking || true"
-  run_cmd "sudo systemctl enable networking || true"
-
-  #######################################
-  # 9) Summary and reboot recommended
-  #######################################
-  local summary
-  # DATA IP configuration removed (L2-only bridge)
-  local summary_data_extra="
-  * br-data     : L2-only bridge (No IP)"
-
-  # Add SPAN bridge summary information
-  local summary_span_extra=""
-  if [[ "${SPAN_ATTACH_MODE}" == "bridge" && -n "${SPAN_BRIDGE_LIST:-}" ]]; then
-    summary_span_extra="
-
-- SPAN bridge (SPAN_ATTACH_MODE=bridge)"
-    for bridge_name in ${SPAN_BRIDGE_LIST}; do
-      # Find corresponding NIC by bridge index
-      local bridge_index="${bridge_name#br-span}"
-      local span_nic_array=(${SPAN_NIC_LIST})
-      if [[ "${bridge_index}" -lt "${#span_nic_array[@]}" ]]; then
-        local span_nic="${span_nic_array[${bridge_index}]}"
-        summary_span_extra="${summary_span_extra}
-  * ${bridge_name} -> ${span_nic} (L2-only)"
-      fi
-    done
-  elif [[ "${SPAN_ATTACH_MODE}" == "pci" ]]; then
-    summary_span_extra="
-
-- SPAN attachment mode: PCI passthrough (SPAN NIC PF directly assigned to Sensor VM)"
-  fi
-
-  # SPAN NIC PCI passthrough information Additional
-  local span_summary=""
-  if [[ -n "${SPAN_NIC_LIST:-}" ]]; then
-    span_summary="
-
-※ SPAN NIC PCI passthrough (PF direct attach):"
-    for span_nic in ${SPAN_NIC_LIST}; do
-      local span_pci
-      span_pci=$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-      if [[ -n "${span_pci}" ]]; then
-        span_summary="${span_summary}
-  * ${span_nic} -> PCI ${span_pci}"
-      fi
-    done
-  fi
-
-  summary=$(cat <<EOF
-[STEP 03 Result Summary]
-
-- udev rule file      : /etc/udev/rules.d/99-custom-ifnames.rules
-  * host  -> PCI ${host_pci}
-  * data  -> PCI ${data_pci}${span_summary}
-
-- /etc/network/interfaces
-  * host IP     : ${new_ip}/${new_prefix} (netmask ${netmask})
-  * gateway     : ${new_gw}
-  * dns         : ${new_dns}
-
-- /etc/network/interfaces.d/00-data.cfg${summary_data_extra}${summary_span_extra}
-
-- /etc/iproute2/rt_tables
-  * 1 rt_host, 2 rt_data Additional
-
-- /etc/network/if-up.d/xdr-routing
-  * advanced routing rule (automatically applied after reboot)
-
-- netplan disabled, switched to ifupdown + networking service
-
-※ Reboot is required due to network configuration changes.
-  According to AUTO_REBOOT_AFTER_STEP_ID settings, auto reboot will occur after STEP completion.
-  After reboot, NIC names (host, data, br-*) will be applied.
-EOF
-)
-
-  whiptail_msgbox "STEP 03 Completed" "${summary}" 25 80
-
-  log "[STEP 03] NIC ifupdown switch and network configuration completed. Network configuration will be automatically applied after reboot."
-
-  return 0
 }
 
 #######################################
@@ -3342,7 +2786,7 @@ EOF
   fi
 
   #######################################
-  # 4) Process SPAN NICs (same as Bridge Mode)
+  # 4) Process SPAN NICs
   #######################################
   if [[ -n "${SPAN_NIC_LIST:-}" ]]; then
     log "[STEP 03 NAT Mode] Maintain SPAN NICs default name (PF PCI passthrough specific)"
@@ -3416,9 +2860,10 @@ step_04_kvm_libvirt() {
   log "[STEP 04] This step will install and configure KVM/libvirt for VM management."
   load_config
 
-  # Check Network mode
-  local net_mode="${SENSOR_NET_MODE:-bridge}"
-  log "[STEP 04] Sensor network mode: ${net_mode}"
+  # Force NAT mode only
+  local net_mode="nat"
+  SENSOR_NET_MODE="nat"
+  log "[STEP 04] Sensor network mode: ${net_mode} (NAT only)"
 
   local tmp_info="${STATE_DIR}/xdr_step04_info.txt"
 
@@ -3450,11 +2895,7 @@ step_04_kvm_libvirt() {
     echo "  1) KVM / Libvirt related package installation"
     echo "  2) Add user to libvirt group"
     echo "  3) Enable libvirtd / virtlogd services"
-    if [[ "${net_mode}" == "bridge" ]]; then
-      echo "  4) Remove default libvirt network(virbr0) (L2 bridge mode)"
-    elif [[ "${net_mode}" == "nat" ]]; then
-      echo "  4) default libvirt network(virbr0) NAT configure (NAT mode)"
-    fi
+    echo "  4) default libvirt network(virbr0) NAT configure (NAT mode)"
     echo "  5) KVM acceleration and virtualization function verify"
   } > "${tmp_info}"
 
@@ -3525,20 +2966,10 @@ step_04_kvm_libvirt() {
   run_cmd "sudo systemctl enable --now virtlogd"
 
   #######################################
-  # 4) default libvirt network configuration (Branch by Network mode)
+  # 4) default libvirt network configuration (NAT mode only)
   #######################################
   
-  if [[ "${net_mode}" == "bridge" ]]; then
-    # Bridge Mode: Remove default network (use external bridge)
-    log "[STEP 04] Bridge Mode - Remove default libvirt network (use sensor external bridge)"
-    
-    # Completely remove existing default network
-    run_cmd "sudo virsh net-destroy default || true"
-    run_cmd "sudo virsh net-undefine default || true"
-    
-    log "Sensor VM will use br-data (DATA NIC) and br-span* (SPAN NIC) bridges."
-    
-  elif [[ "${net_mode}" == "nat" ]]; then
+  if [[ "${net_mode}" == "nat" ]]; then
     # NAT Mode: OpenXDR NAT network XML create
     log "[STEP 04] NAT Mode - OpenXDR NAT network XML create (virbr0/192.168.122.0/24)"
     
@@ -4006,305 +3437,6 @@ step_06_libvirt_hooks() {
     log "[STEP 06] NAT Mode - Installing OpenXDR NAT hooks"
     step_06_nat_hooks
     return $?
-}
-
-#######################################
-# STEP 06 - Bridge Mode (Existing sensor hooks)
-#######################################
-step_06_bridge_hooks() {
-  log "[STEP 06 Bridge Mode] Sensor specific libvirt Hooks Installation"
-
-  local tmp_info="/tmp/xdr_step08_info.txt"
-  : > "${tmp_info}"
-
-  #######################################
-  # 0) Current hooks status summary
-  #######################################
-  {
-    echo "/etc/libvirt/hooks directory and script status"
-    echo "-------------------------------------------"
-    echo
-    echo "# Directory existence check"
-    if [[ -d /etc/libvirt/hooks ]]; then
-      echo "/etc/libvirt/hooks directory exists."
-      echo
-      echo "# /etc/libvirt/hooks/network (first 20 lines if exists)"
-      if [[ -f /etc/libvirt/hooks/network ]]; then
-        sed -n '1,20p' /etc/libvirt/hooks/network
-      else
-        echo "(network script not found)"
-      fi
-      echo
-      echo "# /etc/libvirt/hooks/qemu (first 20 lines if exists)"
-      if [[ -f /etc/libvirt/hooks/qemu ]]; then
-        sed -n '1,20p' /etc/libvirt/hooks/qemu
-      else
-        echo "(qemu script not found)"
-      fi
-    else
-      echo "/etc/libvirt/hooks directory does not exist yet."
-    fi
-  } >> "${tmp_info}"
-
-  show_textbox "STEP 06 - Current hooks status" "${tmp_info}"
-
-  if ! whiptail_yesno "STEP 06 Execution Confirmation" "Scripts /etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu will be\ncompletely created/overwritten based on documentation.\n\nDo you want to continue?" 13 80
-  then
-    log "User canceled STEP 06 execution."
-    return 0
-  fi
-
-  #######################################
-  # 1) /etc/libvirt/hooks Create directory
-  #######################################
-  log "[STEP 06] Create /etc/libvirt/hooks directory (if not exists)"
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] sudo mkdir -p /etc/libvirt/hooks"
-  else
-    sudo mkdir -p /etc/libvirt/hooks
-  fi
-
-  #######################################
-  # 2) /etc/libvirt/hooks/network create (HOST_NIC based)
-  #######################################
-  local HOOK_NET="/etc/libvirt/hooks/network"
-  local HOOK_NET_BAK="/etc/libvirt/hooks/network.backup.$(date +%Y%m%d-%H%M%S)"
-
-  log "[STEP 06] ${HOOK_NET} create/update"
-
-  if [[ -f "${HOOK_NET}" ]]; then
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      sudo cp -a "${HOOK_NET}" "${HOOK_NET_BAK}"
-      log "Backed up existing ${HOOK_NET} to ${HOOK_NET_BAK}."
-    else
-      log "[DRY-RUN] Would backup existing ${HOOK_NET} to ${HOOK_NET_BAK}"
-    fi
-  fi
-
-  local net_hook_content
-  net_hook_content=$(cat <<'EOF'
-#!/bin/bash
-# Network hook - L2 bridge mode only (no IP routing)
-# All routing logic removed for L2-only configuration
-EOF
-)
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${HOOK_NET} will write the following content to:\n${net_hook_content}"
-  else
-    printf "%s\n" "${net_hook_content}" | sudo tee "${HOOK_NET}" >/dev/null
-  fi
-
-  run_cmd "sudo chmod +x ${HOOK_NET}"
-
-  #######################################
-  # 3) Create /etc/libvirt/hooks/qemu (for XDR Sensor)
-  #######################################
-  local HOOK_QEMU="/etc/libvirt/hooks/qemu"
-  local HOOK_QEMU_BAK="/etc/libvirt/hooks/qemu.backup.$(date +%Y%m%d-%H%M%S)"
-
-  log "[STEP 06] ${HOOK_QEMU} create/update (OOM restart script only, NAT removed)"
-
-  if [[ -f "${HOOK_QEMU}" ]]; then
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      sudo cp -a "${HOOK_QEMU}" "${HOOK_QEMU_BAK}"
-      log "Backed up existing ${HOOK_QEMU} to ${HOOK_QEMU_BAK}."
-    else
-      log "[DRY-RUN] Would backup existing ${HOOK_QEMU} to ${HOOK_QEMU_BAK}"
-    fi
-  fi
-
-  local qemu_hook_content
-
-  qemu_hook_content=$(cat <<'EOF'
-#!/bin/bash
-# Last Update: 2025-12-06 (Modified for XDR Sensor L2 bridge)
-# NAT/DNAT directly removed - Sensor VM directly configures IP
-
-########################
-# Maintain OOM recovery script only (NAT removed)
-########################
-if [ "${1}" = "mds" ]; then
-  if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
-    # save last known good pid
-    /usr/bin/last_known_good_pid "${1}" > /dev/null 2>&1 &
-  fi
-fi
-EOF
-)
-
-
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] ${HOOK_QEMU} will write the following content to:\n${qemu_hook_content}"
-  else
-    printf "%s\n" "${qemu_hook_content}" | sudo tee "${HOOK_QEMU}" >/dev/null
-  fi
-
-  run_cmd "sudo chmod +x ${HOOK_QEMU}"
-
-  ########################################
-  # 4) Install OOM recovery scripts (last_known_good_pid, check_vm_state)
-  ########################################
-  log "[STEP 06] Installing OOM recovery scripts (last_known_good_pid, check_vm_state)"
-
-  local _DRY="${DRY_RUN:-0}"
-
-  # 1) /usr/bin/last_known_good_pid create
-  if [[ "${_DRY}" -eq 1 ]]; then
-    log "[DRY-RUN] Create /usr/bin/last_known_good_pid script"
-  else
-    sudo tee /usr/bin/last_known_good_pid >/dev/null <<'EOF'
-#!/bin/bash
-VM_NAME=$1
-RUN_DIR=/var/run/libvirt/qemu
-RETRY=60 # timeout 5 minutes
-
-for i in $(seq 1 $RETRY); do
-    if [ -e ${RUN_DIR}/${VM_NAME}.pid ]; then
-        cp ${RUN_DIR}/${VM_NAME}.pid ${RUN_DIR}/${VM_NAME}.lkg
-        exit 0
-    else
-        sleep 5
-    fi
-done
-
-exit 1
-EOF
-    sudo chmod +x /usr/bin/last_known_good_pid
-  fi
-
-  # 2) Create /usr/bin/check_vm_state (for XDR Sensor)
-  if [[ "${_DRY}" -eq 1 ]]; then
-    log "[DRY-RUN] Create /usr/bin/check_vm_state script"
-  else
-    sudo tee /usr/bin/check_vm_state >/dev/null <<'EOF'
-#!/bin/bash
-VM_LIST=(aio mds)
-RUN_DIR=/var/run/libvirt/qemu
-
-for VM in ${VM_LIST[@]}; do
-    # Check if VM is in stopped state (when .xml file and .pid file are missing)
-    if [ ! -e ${RUN_DIR}/${VM}.xml -a ! -e ${RUN_DIR}/${VM}.pid ]; then
-        if [ -e ${RUN_DIR}/${VM}.lkg ]; then
-            LKG_PID=$(cat ${RUN_DIR}/${VM}.lkg)
-
-            # Check if OOM-killer in dmesg killed that PID
-            if dmesg | grep "Out of memory: Kill process $LKG_PID" > /dev/null 2>&1; then
-                virsh start $VM
-            fi
-        fi
-    fi
-done
-
-exit 0
-EOF
-    sudo chmod +x /usr/bin/check_vm_state
-  fi
-
-  # 3) Register cron (execute check_vm_state every 5 minutes)
-  if [[ "${_DRY}" -eq 1 ]]; then
-    log "[DRY-RUN] Would register following two lines to root crontab:"
-    log "  SHELL=/bin/bash"
-    log "  */5 * * * * /bin/bash /usr/bin/check_vm_state > /dev/null 2>&1"
-  else
-    # Maintain existing crontab while ensuring only SHELL and check_vm_state lines
-    local tmp_cron added_flag
-    tmp_cron="$(mktemp)"
-    added_flag="0"
-
-    # Dump existing crontab (create empty file if not exists)
-    if ! sudo crontab -l 2>/dev/null > "${tmp_cron}"; then
-      : > "${tmp_cron}"
-    fi
-
-    # Add if SHELL=/bin/bash doesn't exist
-    if ! grep -q '^SHELL=' "${tmp_cron}"; then
-      echo "SHELL=/bin/bash" >> "${tmp_cron}"
-      added_flag="1"
-    fi
-
-    # Add if check_vm_state line doesn't exist
-    if ! grep -q 'check_vm_state' "${tmp_cron}"; then
-      echo "*/5 * * * * /bin/bash /usr/bin/check_vm_state > /dev/null 2>&1" >> "${tmp_cron}"
-      added_flag="1"
-    fi
-
-    # Apply modified crontab
-    sudo crontab "${tmp_cron}"
-    rm -f "${tmp_cron}"
-
-    if [[ "${added_flag}" = "1" ]]; then
-      log "[STEP 06] Registered/updated SHELL=/bin/bash and check_vm_state entry in root crontab."
-    else
-      log "[STEP 06] SHELL=/bin/bash and check_vm_state entry already exist in root crontab."
-    fi
-  fi
-
-  #######################################
-  # 5) Final summary
-  #######################################
-  : > "${tmp_info}"
-  {
-    echo "STEP 06 - Libvirt Hooks Installation Summary"
-    echo "═══════════════════════════════════════════════════════════"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      echo "🔍 DRY-RUN MODE: No actual changes were made"
-      echo
-      echo "📊 SIMULATED STATUS:"
-      echo "  • Hooks would be created/updated"
-      echo
-      echo "ℹ️  In real execution mode, the following would occur:"
-      echo "  1. /etc/libvirt/hooks/network would be created"
-      echo "     - NAT MASQUERADE configuration"
-      echo "  2. /etc/libvirt/hooks/qemu would be created"
-      echo "     - AIO DNAT port forwarding (SSH, UI, TCP, UDP)"
-      echo "     - Sensor DNAT port forwarding"
-      echo "     - OOM monitoring scripts"
-      echo "  3. OOM recovery scripts would be installed"
-      echo "     - /usr/bin/last_known_good_pid"
-      echo "     - /usr/bin/check_vm_state"
-      echo "  4. Cron job would be registered for VM state monitoring"
-    else
-      echo "✅ EXECUTION COMPLETED"
-      echo
-      echo "📊 INSTALLATION STATUS:"
-      echo
-      echo "📋 INSTALLED HOOKS:"
-    if [[ -f /etc/libvirt/hooks/network ]]; then
-        echo "  ✅ /etc/libvirt/hooks/network"
-        echo "     (First 30 lines shown below)"
-        sed -n '1,30p' /etc/libvirt/hooks/network | sed 's/^/     /'
-    else
-        echo "  ❌ /etc/libvirt/hooks/network: Not found"
-    fi
-    echo
-    if [[ -f /etc/libvirt/hooks/qemu ]]; then
-        echo "  ✅ /etc/libvirt/hooks/qemu"
-        echo "     (First 40 lines shown below)"
-        sed -n '1,40p' /etc/libvirt/hooks/qemu | sed 's/^/     /'
-      else
-        echo "  ❌ /etc/libvirt/hooks/qemu: Not found"
-      fi
-      echo
-      echo "🔧 OOM RECOVERY SCRIPTS:"
-      if [[ -f /usr/bin/last_known_good_pid ]]; then
-        echo "  ✅ /usr/bin/last_known_good_pid"
-      else
-        echo "  ❌ /usr/bin/last_known_good_pid: Not found"
-      fi
-      if [[ -f /usr/bin/check_vm_state ]]; then
-        echo "  ✅ /usr/bin/check_vm_state"
-      else
-        echo "  ❌ /usr/bin/check_vm_state: Not found"
-      fi
-    fi
-  } >> "${tmp_info}"
-
-  show_textbox "STEP 06 - Result Summary" "${tmp_info}"
-
-  log "[STEP 06] libvirt Hooks Installation completed."
-
-  return 0
 }
 
 #######################################
@@ -7755,7 +6887,7 @@ build_validation_summary() {
   if type load_config >/dev/null 2>&1; then
     load_config 2>/dev/null || true
   fi
-  local net_mode="${SENSOR_NET_MODE:-bridge}"
+  local net_mode="${SENSOR_NET_MODE:-nat}"
 
   ###############################
   # STEP 02: HWE Kernel Installation
@@ -7800,24 +6932,13 @@ build_validation_summary() {
   ###############################
   # STEP 03: NIC/ifupdown Network Configuration
   ###############################
-  if [[ "${net_mode}" == "bridge" ]]; then
-    # Bridge mode: check for br-data bridge
-    if ip link show br-data >/dev/null 2>&1; then
-      ok_msgs+=("br-data bridge exists (Bridge mode)")
-    else
-      warn_msgs+=("br-data bridge does not exist (Bridge mode).")
-      warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC Name/ifupdown Switch and Network Configuration)")
-      warn_msgs+=("  → CHECK: Verify bridge with 'ip link show br-data'")
-    fi
-  elif [[ "${net_mode}" == "nat" ]]; then
-    # NAT mode: check for virbr0 (libvirt default network)
-    if ip link show virbr0 >/dev/null 2>&1; then
-      ok_msgs+=("virbr0 bridge exists (NAT mode)")
-    else
-      warn_msgs+=("virbr0 bridge does not exist (NAT mode).")
-      warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC Name/ifupdown Switch and Network Configuration)")
-      warn_msgs+=("  → CHECK: Verify libvirt network with 'virsh net-list --all'")
-    fi
+  # NAT mode: check for virbr0 (libvirt default network)
+  if ip link show virbr0 >/dev/null 2>&1; then
+    ok_msgs+=("virbr0 bridge exists (NAT mode)")
+  else
+    warn_msgs+=("virbr0 bridge does not exist (NAT mode).")
+    warn_msgs+=("  → ACTION: Re-run STEP 03 (NIC Name/ifupdown Switch and Network Configuration)")
+    warn_msgs+=("  → CHECK: Verify libvirt network with 'virsh net-list --all'")
   fi
 
   # Check ifupdown package
@@ -7924,13 +7045,11 @@ build_validation_summary() {
     warn_msgs+=("  → NOTE: VM automation features may not work without this")
   fi
 
-  if [[ "${net_mode}" == "bridge" ]]; then
-    if [[ -f /etc/libvirt/hooks/network ]]; then
-      ok_msgs+=("/etc/libvirt/hooks/network script exists (Bridge mode)")
-    else
-      warn_msgs+=("/etc/libvirt/hooks/network script does not exist (Bridge mode).")
-      warn_msgs+=("  → ACTION: Re-run STEP 06 (libvirt hooks Installation)")
-    fi
+  if [[ -f /etc/libvirt/hooks/network ]]; then
+    ok_msgs+=("/etc/libvirt/hooks/network script exists (NAT mode)")
+  else
+    warn_msgs+=("/etc/libvirt/hooks/network script does not exist (NAT mode).")
+    warn_msgs+=("  → ACTION: Re-run STEP 06 (libvirt hooks Installation)")
   fi
 
   ###############################
@@ -8325,7 +7444,7 @@ show_usage_help() {
 │      • DRY_RUN: Simulation mode (default: 1)                 │
 │      • SENSOR_VERSION: Sensor version to install             │
 │      • Network mode: NAT only (bridge mode not supported)      │
-│      • SPAN_ATTACH_MODE: pci or bridge                        │
+│      • SPAN_ATTACH_MODE: pci only (bridge mode not supported) │
 │      • ACPS credentials (username, password, URL)            │
 └─────────────────────────────────────────────────────────────┘
 
@@ -8519,7 +7638,6 @@ Server Specifications (Physical Server Recommended):
   - Management (Host/MGT): 1GbE or more (for SSH access)
   - SPAN (Data): For receiving mirroring traffic
     • PCI Passthrough mode recommended for best performance
-    • Bridge mode available as alternative
 
 BIOS Settings (Required):
 ────────────────────────────────────────────────────────────
@@ -8547,17 +7665,15 @@ DRY_RUN Mode:
 Network Mode Selection:
 ────────────────────────────────────────────────────────────
 • Network mode: NAT only (bridge mode not supported)
-  - Bridge: L2 bridge based (recommended for most cases)
   - NAT: virbr0 NAT network based
-• Changes require re-running STEP 01 and STEP 08
+• Changes require re-running STEP 01 and STEP 03
 
 SPAN Attachment Mode:
 ────────────────────────────────────────────────────────────
-• SPAN_ATTACH_MODE: pci (recommended) or bridge
+• SPAN_ATTACH_MODE: pci only (bridge mode not supported)
   - PCI: Direct PCI passthrough (best performance)
-  - Bridge: L2 bridge virtio NIC
 • PCI mode requires IOMMU enabled in BIOS
-• Changes require re-running STEP 01 and STEP 09
+• Changes require re-running STEP 01 and STEP 12
 
 Disk Space Management:
 ────────────────────────────────────────────────────────────

@@ -2048,7 +2048,7 @@ step_01_hw_detect() {
                       3>&1 1>&2 2>&3) || {
       log "User canceled HOST_ACCESS_NIC selection."
       HOST_ACCESS_NIC=""
-    })
+    }
     
     if [[ -n "${host_access_nic}" ]]; then
       # Remove quotes from whiptail output

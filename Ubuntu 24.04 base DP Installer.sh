@@ -285,6 +285,37 @@ whiptail_inputbox() {
   return 0
 }
 
+# Wrapper function for whiptail passwordbox with dynamic sizing, centering, and ESC handling
+whiptail_passwordbox() {
+  local title="$1"
+  local message="$2"
+  local default_value="${3:-}"
+  local min_height="${4:-10}"
+  local min_width="${5:-70}"
+  
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size "${min_height}" "${min_width}")
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  
+  # Center-align message
+  local centered_msg
+  centered_msg=$(center_message "${message}")
+  
+  # Show dialog and capture output
+  local result
+  result=$(whiptail --title "${title}" --passwordbox "${centered_msg}" "${dialog_height}" "${dialog_width}" "${default_value}" 3>&1 1>&2 2>&3)
+  local rc=$?
+  # Return empty string for ESC, actual value otherwise
+  if [[ ${rc} -ne 0 ]]; then
+    echo ""
+    return 1
+  fi
+  echo "${result}"
+  return 0
+}
+
 # Common whiptail textbox helper (scrollable)
 show_textbox() {
   local title="$1"
@@ -621,8 +652,16 @@ run_step() {
   local step_name="${STEP_NAMES[$idx]}"
 
   # Confirm STEP execution
+  # Calculate dialog size dynamically and center message
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 12 70)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "${step_name}\n\nDo you want to execute this step?")
+  
   if ! whiptail --title "XDR Installer - ${step_id}" \
-                --yesno "${step_name}\n\nDo you want to execute this step?" 12 70
+                --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
   then
     # User cancellation is considered "normal flow" (not an error)
     log "User canceled execution of STEP ${step_id}."
@@ -693,8 +732,7 @@ run_step() {
         if [[ "${step_id}" == "${reboot_step}" ]]; then
           log "AUTO_REBOOT_AFTER_STEP_ID=${AUTO_REBOOT_AFTER_STEP_ID} (current STEP=${step_id}) is included → performing auto-reboot."
 
-          whiptail --title "Auto Reboot" \
-                   --msgbox "STEP ${step_id} (${step_name}) has been completed successfully.\n\nThe system will automatically reboot." 12 70
+          whiptail_msgbox "Auto reboot" "STEP ${step_id} (${step_name}) completed successfully.\n\nThe system will reboot automatically." 12 70
 
           if [[ "${DRY_RUN}" -eq 1 ]]; then
             log "[DRY-RUN] Auto-reboot will not be performed."
@@ -712,8 +750,7 @@ run_step() {
     fi
   else
     log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
-    whiptail --title "STEP Failed - ${step_id}" \
-             --msgbox "An error occurred while executing STEP ${step_id} (${step_name}).\n\nPlease check the logs and re-run the STEP if necessary.\nThe installer can continue to run." 14 80
+    whiptail_msgbox "STEP failed - ${step_id}" "An error occurred while running STEP ${step_id} (${step_name}).\n\nCheck logs and rerun the STEP if needed.\nThe installer can continue to run." 14 80
   fi
 
   # ★ run_step always returns 0 so set -e doesn't trigger here
@@ -889,8 +926,7 @@ step_01_hw_detect() {
   # 0) Reuse existing values
   ########################
   if [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
-    if whiptail --title "STEP 01 - Reuse Existing Selection" \
-                --yesno "The following values are already set:\n\n- MGT_NIC: ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC: ${HOST_NIC}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nDo you want to reuse these values and skip STEP 01?\n\n(Selecting No will allow you to reselect NIC/disk.)" 19 80
+    if whiptail_yesno "STEP 01 - Reuse Existing Selection" "The following values are already set:\n\n- MGT_NIC: ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC: ${HOST_NIC}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nDo you want to reuse these values and skip STEP 01?\n\n(Selecting No will allow you to reselect NIC/disk.)" 19 80
     then
       log "User chose to reuse existing STEP 01 selection values. (Skipping STEP 01)"
 
@@ -915,8 +951,7 @@ step_01_hw_detect() {
   nics="$(list_nic_candidates || true)"
 
   if [[ -z "${nics}" ]]; then
-    whiptail --title "STEP 01 - NIC Detection Failed" \
-             --msgbox "Could not find available NICs.\n\nPlease check ip link results and modify the script if necessary." 12 70
+    whiptail_msgbox "STEP 01 - NIC detection failed" "No usable NICs found.\n\nCheck ip link output and adjust the script." 12 70
     log "No NIC candidates. Need to check ip link results."
     return 1
   fi
@@ -958,9 +993,20 @@ step_01_hw_detect() {
   # 2) Select mgt NIC
   ########################
   local mgt_nic
+  # Calculate menu size dynamically based on terminal size and number of NICs
+  local menu_dims
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  local msg_content="Select service (mgt) NIC.\nCurrent setting: ${MGT_NIC:-<none>}\n"
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
   mgt_nic=$(whiptail --title "STEP 01 - Select mgt NIC" \
-                     --menu "Select service (mgt) NIC.\nCurrent setting: ${MGT_NIC:-<none>}" \
-                     20 80 10 \
+                     --menu "${centered_msg}" \
+                     "${menu_height}" "${menu_width}" "${menu_list_height}" \
                      "${nic_list[@]}" \
                      3>&1 1>&2 2>&3) || {
     log "User canceled mgt NIC selection."
@@ -976,9 +1022,17 @@ step_01_hw_detect() {
   ########################
   # Selecting the same NIC as mgt NIC is not recommended, so inform via message
   local cltr0_nic
+  # Calculate menu size dynamically (reuse same calculation as mgt NIC)
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  local msg_content="Select cluster/SR-IOV (cltr0) NIC.\n\nIt is recommended to choose a different NIC from mgt NIC.\nCurrent setting: ${CLTR0_NIC:-<none>}\n"
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
   cltr0_nic=$(whiptail --title "STEP 01 - Select cltr0 NIC" \
-                       --menu "Select cluster/SR-IOV (cltr0) NIC.\n\nIt is recommended to choose a different NIC from mgt NIC.\nCurrent setting: ${CLTR0_NIC:-<none>}" \
-                       20 80 10 \
+                       --menu "${centered_msg}" \
+                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
                        "${nic_list[@]}" \
                        3>&1 1>&2 2>&3) || {
     log "User canceled cltr0 NIC selection."
@@ -986,8 +1040,7 @@ step_01_hw_detect() {
   }
 
   if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
-    if ! whiptail --title "Warning" \
-                  --yesno "mgt NIC and cltr0 NIC are the same.\nThis configuration is not recommended.\nDo you still want to continue?" 12 70
+    if ! whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are the same.\nThis configuration is not recommended.\nDo you still want to continue?" 12 70
     then
       log "User canceled same NIC usage configuration."
       return 1
@@ -1002,9 +1055,17 @@ step_01_hw_detect() {
   # 3-1) Select HOST access NIC (for direct KVM host access only)
   ########################
   local host_nic
+  # Calculate menu size dynamically (reuse same calculation as mgt/cltr0 NIC)
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  msg_content="Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_NIC:-<none>}\n"
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
   host_nic=$(whiptail --title "STEP 01 - Select Host Access NIC" \
-                      --menu "Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_NIC:-<none>}" \
-                      22 90 10 \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "${nic_list[@]}" \
                       3>&1 1>&2 2>&3) || {
     log "User canceled HOST_NIC selection."
@@ -1013,8 +1074,7 @@ step_01_hw_detect() {
 
   # Prevent duplicates (same NIC as mgt/cltr0 is not allowed)
   if [[ "${host_nic}" == "${MGT_NIC}" || "${host_nic}" == "${CLTR0_NIC}" ]]; then
-    whiptail --title "Error" \
-             --msgbox "HOST_NIC cannot be the same as MGT_NIC or CLTR0_NIC.\n\n- MGT_NIC : ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 12 80
+    whiptail_msgbox "Error" "HOST_NIC cannot be the same as MGT_NIC or CLTR0_NIC.\n\n- MGT_NIC : ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 12 80
     log "HOST_NIC duplicate selection: ${host_nic}"
     return 1
   fi
@@ -1037,8 +1097,7 @@ step_01_hw_detect() {
   all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
 
   if [[ -z "${all_disks}" ]]; then
-    whiptail --title "STEP 01 - Disk Detection Failed" \
-             --msgbox "Could not find physical disks in the system.\nPlease check the lsblk command." 12 70
+    whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
     return 1
   fi
 
@@ -1063,8 +1122,7 @@ step_01_hw_detect() {
 
   # If no data disk candidates found
   if [[ ${#disk_list[@]} -eq 0 ]]; then
-    whiptail --title "Warning" \
-             --msgbox "No additional disks available for data use.\n\nDetected OS disk:\n${root_info}" 12 70
+    whiptail_msgbox "Warning" "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
     return 1
   fi
 
@@ -1075,10 +1133,18 @@ step_01_hw_detect() {
   msg_guide+="==================================================\n\n"
   msg_guide+="Select data disks from the list below:"
 
+  # Calculate menu size dynamically for disk selection
+  local disk_count=$(( ${#disk_list[@]} / 3 ))  # Each disk has 3 elements (name, desc, flag)
+  menu_dims=$(calc_menu_size "${disk_count}" 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+  # Center-align the menu message based on terminal height
+  centered_msg=$(center_menu_message "${msg_guide}\n" "${menu_height}")
+
   local selected_disks
   selected_disks=$(whiptail --title "STEP 01 - Select Data Disks" \
-                            --checklist "${msg_guide}" \
-                            22 85 10 \
+                            --checklist "${centered_msg}" \
+                            "${menu_height}" "${menu_width}" "${menu_list_height}" \
                             "${disk_list[@]}" \
                             3>&1 1>&2 2>&3) || {
     log "User canceled disk selection."
@@ -1089,8 +1155,7 @@ step_01_hw_detect() {
   selected_disks=$(echo "${selected_disks}" | tr -d '"')
 
   if [[ -z "${selected_disks}" ]]; then
-    whiptail --title "Warning" \
-             --msgbox "No disks selected.\nLVM configuration cannot proceed in this state." 10 70
+    whiptail_msgbox "Warning" "No disks selected.\nCannot proceed with LVM configuration." 10 70
     log "No data disks selected."
     return 1
   fi
@@ -1104,19 +1169,32 @@ step_01_hw_detect() {
   ########################
   local summary
   summary=$(cat <<EOF
-[STEP 01 Result Summary]
+═══════════════════════════════════════════════════════════
+  STEP 01: Hardware Detection and Selection - Complete
+═══════════════════════════════════════════════════════════
 
-- mgt NIC      : ${MGT_NIC}
-- cltr0 NIC    : ${CLTR0_NIC}
-- host NIC     : ${HOST_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
-- Data Disks   : ${DATA_SSD_LIST}
+✅ SELECTED HARDWARE:
+  • Management NIC (mgt):     ${MGT_NIC}
+  • Cluster NIC (cltr0):      ${CLTR0_NIC}
+  • Host access NIC:          ${HOST_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
+  • Data disks (LVM):         ${DATA_SSD_LIST}
 
-Config file: ${CONFIG_FILE}
+📁 CONFIGURATION:
+  • Config file: ${CONFIG_FILE}
+  • Settings saved successfully
+
+💡 IMPORTANT NOTES:
+  • These selections will be used in subsequent steps
+  • STEP 03 will configure network using mgt NIC
+  • STEP 07 will configure LVM using selected data disks
+  • To change selections, re-run STEP 01
+
+📝 NEXT STEPS:
+  • Proceed to STEP 02 (HWE Kernel Installation)
 EOF
 )
 
-  whiptail --title "STEP 01 Complete" \
-           --msgbox "${summary}" 18 80
+  whiptail_msgbox "STEP 01 complete" "${summary}"
 
   # Save once more as a precaution
   if type save_config >/dev/null 2>&1; then
@@ -1357,8 +1435,7 @@ step_03_nic_ifupdown() {
   fi
 
   if [[ "${maybe_done}" -eq 1 ]]; then
-    if whiptail --title "STEP 03 - Already Configured" \
-                --yesno "Looking at udev rules and /etc/network/interfaces, hostmgmt settings, it appears to be already configured.\n\nDo you want to skip this STEP?" 18 80
+    if whiptail_yesno "STEP 03 - Already Configured" "Looking at udev rules and /etc/network/interfaces, hostmgmt settings, it appears to be already configured.\n\nDo you want to skip this STEP?" 18 80
     then
       log "User chose to skip STEP 03 entirely based on 'already configured' judgment."
       return 0
@@ -1387,31 +1464,19 @@ step_03_nic_ifupdown() {
 
   # IP Address
   local new_ip
-  new_ip=$(whiptail --title "STEP 03 - mgt IP Configuration" \
-                    --inputbox "Enter IP address for mgt interface.\nExample: 10.4.0.210" \
-                    10 60 "${cur_ip}" \
-                    3>&1 1>&2 2>&3) || return 0
+  new_ip=$(whiptail_inputbox "STEP 03 - mgt IP Configuration" "Enter IP address for mgt interface.\nExample: 10.4.0.210" "${cur_ip}" 10 60) || return 0
 
   # Prefix
   local new_prefix
-  new_prefix=$(whiptail --title "STEP 03 - mgt Prefix" \
-                        --inputbox "Enter subnet prefix (/value).\nExample: 24" \
-                        10 60 "${cur_prefix}" \
-                        3>&1 1>&2 2>&3) || return 0
+  new_prefix=$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix (/value).\nExample: 24" "${cur_prefix}" 10 60) || return 0
 
   # Gateway
   local new_gw
-  new_gw=$(whiptail --title "STEP 03 - Gateway" \
-                    --inputbox "Enter default gateway IP.\nExample: 10.4.0.254" \
-                    10 60 "${cur_gw}" \
-                    3>&1 1>&2 2>&3) || return 0
+  new_gw=$(whiptail_inputbox "STEP 03 - Gateway" "Enter default gateway IP.\nExample: 10.4.0.254" "${cur_gw}" 10 60) || return 0
 
   # DNS
   local new_dns
-  new_dns=$(whiptail --title "STEP 03 - DNS" \
-                     --inputbox "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" \
-                     10 70 "${cur_dns}" \
-                     3>&1 1>&2 2>&3) || return 0
+  new_dns=$(whiptail_inputbox "STEP 03 - DNS" "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" "${cur_dns}" 10 70) || return 0
 
   # Simple prefix → netmask conversion (only handles a few representative values)
   local netmask
@@ -1426,10 +1491,7 @@ step_03_nic_ifupdown() {
     29) netmask="255.255.255.248" ;;
     30) netmask="255.255.255.252" ;;
     *)
-      netmask=$(whiptail --title "STEP 03 - Enter Netmask Directly" \
-                         --inputbox "Unknown prefix: /${new_prefix}.\nPlease enter netmask directly.\nExample: 255.255.255.0" \
-                         10 70 "255.255.255.0" \
-                         3>&1 1>&2 2>&3) || return 1
+      netmask=$(whiptail_inputbox "STEP 03 - Enter Netmask Directly" "Unknown prefix: /${new_prefix}.\nPlease enter netmask directly.\nExample: 255.255.255.0" "255.255.255.0" 10 70) || return 1
       ;;
   esac
 
@@ -1639,38 +1701,56 @@ EOF
   #######################################
   local summary
   summary=$(cat <<EOF
-[STEP 03 Result Summary]
+═══════════════════════════════════════════════════════════
+  STEP 03: Network Configuration - Complete
+═══════════════════════════════════════════════════════════
 
-- udev rules file      : /etc/udev/rules.d/99-custom-ifnames.rules
-  * mgt      -> PCI ${mgt_pci}
-  * cltr0    -> PCI ${cltr0_pci}, sriov_numvfs=2
-  * hostmgmt -> PCI ${host_pci}
+✅ CONFIGURATION COMPLETED:
+  • udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
+    - mgt NIC → PCI ${mgt_pci} → renamed to "mgt"
+    - cltr0 NIC → PCI ${cltr0_pci} → renamed to "cltr0" (SR-IOV VFs=2)
+    - hostmgmt NIC → PCI ${host_pci} → renamed to "hostmgmt"
 
-- /etc/network/interfaces
-  * mgt IP      : ${new_ip}/${new_prefix} (netmask ${netmask})
-  * gateway     : ${new_gw}
-  * dns         : ${new_dns}
+  • Network interfaces: /etc/network/interfaces
+    - mgt IP:      ${new_ip}/${new_prefix} (netmask ${netmask})
+    - Gateway:     ${new_gw}
+    - DNS:         ${new_dns}
 
-- /etc/network/interfaces.d/02-hostmgmt.cfg
-  * hostmgmt IP : 192.168.0.100/24 (no gateway)
+  • hostmgmt interface: /etc/network/interfaces.d/02-hostmgmt.cfg
+    - hostmgmt IP: 192.168.0.100/24 (no gateway)
 
-- /etc/network/interfaces.d/00-cltr0.cfg
-  * cltr0 → manual mode
+  • cltr0 interface: /etc/network/interfaces.d/00-cltr0.cfg
+    - Mode: manual (for SR-IOV passthrough)
 
-- /etc/iproute2/rt_tables
-  * 1 rt_mgt added (if not present)
+  • Routing table: /etc/iproute2/rt_tables
+    - Added: 1 rt_mgt
 
-- netplan disabled, transitioned to ifupdown + networking service
+  • Network stack: netplan → ifupdown
+    - netplan disabled
+    - ifupdown enabled
 
-※ Network service may fail if restarted immediately.
-  This script is configured to automatically reboot the host twice:
-  once when STEP 03 (NIC/ifupdown transition) is completed and
-  once when STEP 05 (kernel tuning) is completed.
-  When DRY_RUN=0, the host will automatically reboot when each STEP completes successfully.
+⚠️  IMPORTANT NOTES:
+  • Network configuration changes require reboot to take effect
+  • Network services may fail if restarted immediately
+  • Automatic reboot will occur after this step completes
+    (if AUTO_REBOOT_AFTER_STEP_ID includes '03_nic_ifupdown')
+  • A second reboot will occur after STEP 05 completes
+    (if AUTO_REBOOT_AFTER_STEP_ID includes '05_kernel_tuning')
+
+🔧 TROUBLESHOOTING:
+  • If network fails after reboot:
+    1. Check /etc/network/interfaces syntax
+    2. Verify NIC PCI addresses match hardware
+    3. Check udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
+    4. Review logs: ${LOG_FILE}
+
+📝 NEXT STEPS:
+  • System will reboot automatically after this step (if configured)
+  • After reboot, proceed to STEP 04 (KVM/Libvirt Installation)
 EOF
 )
 
-  whiptail_msgbox "STEP 03 Complete" "${summary}"
+  whiptail_msgbox "STEP 03 complete" "${summary}"
 
   log "[STEP 03] NIC ifupdown transition and network configuration completed."
   log "[STEP 03] This STEP (03_nic_ifupdown) is included in auto-reboot targets."
@@ -1992,8 +2072,7 @@ step_05_kernel_tuning() {
 
   show_textbox "STEP 05 - Current Kernel/Swap Status" "${tmp_info}"
 
-  if ! whiptail --title "STEP 05 Execution Confirmation" \
-                 --yesno "Do you want to proceed with applying kernel parameters defined in documentation, disabling KSM, disabling Swap, and configuring IOMMU?\n\n(Yes: Continue / No: Cancel)" 15 80
+  if ! whiptail_yesno "STEP 05 Execution Confirmation" "Do you want to proceed with applying kernel parameters defined in documentation, disabling KSM, disabling Swap, and configuring IOMMU?\n\n(Yes: Continue / No: Cancel)" 15 80
   then
     log "User canceled STEP 05 execution."
     return 0
@@ -2187,8 +2266,7 @@ EOF
   local do_swapoff=0
   local do_zeroize=0
 
-  if whiptail --title "STEP 05 - Disable Swap" \
-              --yesno "According to documentation, disable Swap and\ncomment out /swap.img entry in /etc/fstab.\n\nDo you want to proceed with disabling Swap now?" 13 80
+  if whiptail_yesno "STEP 05 - Disable Swap" "According to documentation, disable Swap and\ncomment out /swap.img entry in /etc/fstab.\n\nDo you want to proceed with disabling Swap now?" 13 80
   then
     do_swapoff=1
   else
@@ -2229,8 +2307,7 @@ EOF
 
     # 3-3) Whether to Zeroize /swap.img (optional)
     if [[ -f /swap.img ]]; then
-      if whiptail --title "STEP 05 - swap.img Zeroize" \
-                  --yesno "/swap.img file exists.\nDocumentation recommends Zeroize (complete deletion) using dd + truncate.\n\nThis may take some time.\nDo you want to proceed with Zeroize now?" 15 80
+      if whiptail_yesno "STEP 05 - swap.img Zeroize" "/swap.img file exists.\nDocumentation recommends Zeroize (complete deletion) using dd + truncate.\n\nThis may take some time.\nDo you want to proceed with Zeroize now?" 15 80
       then
         do_zeroize=1
       else
@@ -2303,50 +2380,69 @@ step_06_ntpsec() {
   local iavf_url="https://github.com/intel/ethernet-linux-iavf/releases/download/v4.13.16/iavf-4.13.16.tar.gz"
 
   echo "=== Installing packages required for iavf driver build (apt-get) ==="
-  sudo apt-get update -y
-  sudo apt-get install -y build-essential linux-headers-$(uname -r) curl
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will run: sudo apt-get update -y"
+    log "[DRY-RUN] Will run: sudo apt-get install -y build-essential linux-headers-$(uname -r) curl"
+  else
+    run_cmd "sudo apt-get update -y"
+    run_cmd "sudo apt-get install -y build-essential linux-headers-$(uname -r) curl"
+  fi
 
   echo
   echo "=== Downloading iavf driver archive (curl progress will be shown below) ==="
-  (
-    cd /tmp || exit 1
-    curl -L -o iavf-4.13.16.tar.gz "${iavf_url}"
-  )
-  local rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    log "[ERROR] iavf driver download failed (rc=${rc})"
-    whiptail --title "STEP 06 - iavf Download Failed" \
-             --msgbox "Failed to download iavf driver (${iavf_url}).\n\nPlease check network or GitHub access and try again." 12 80
-    return 1
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will download iavf driver from ${iavf_url} to /tmp/iavf-4.13.16.tar.gz"
+    log "[DRY-RUN] Will extract archive to /tmp/iavf-4.13.16"
+  else
+    (
+      cd /tmp || exit 1
+      curl -L -o iavf-4.13.16.tar.gz "${iavf_url}"
+    )
+    local rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "[ERROR] iavf driver download failed (rc=${rc})"
+      whiptail_msgbox "STEP 06 - iavf download failed" "Failed to download iavf driver (${iavf_url}).\n\nPlease check network or GitHub access and try again." 12 80
+      return 1
+    fi
+    echo "=== iavf driver download completed ==="
+    log "[STEP 06] iavf driver download completed"
   fi
-  echo "=== iavf driver download completed ==="
-  log "[STEP 06] iavf driver download completed"
 
   echo
   echo "=== Building / installing iavf driver. This may take some time. ==="
-  (
-    cd /tmp || exit 1
-    tar xzf iavf-4.13.16.tar.gz
-    cd iavf-4.13.16/src || exit 1
-    make
-    sudo make install
-    sudo depmod -a
-  )
-  rc=$?
-  if [[ "${rc}" -ne 0 ]]; then
-    log "[ERROR] iavf driver build/installation failed (rc=${rc})"
-    whiptail --title "STEP 06 - iavf Build/Installation Failed" \
-             --msgbox "Failed to build or install iavf driver.\n\nPlease check /var/log/xdr-installer.log." 12 80
-    return 1
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will extract iavf-4.13.16.tar.gz to /tmp"
+    log "[DRY-RUN] Will build iavf driver (cd /tmp/iavf-4.13.16/src && make)"
+    log "[DRY-RUN] Will install iavf driver (sudo make install)"
+    log "[DRY-RUN] Will run depmod (sudo depmod -a)"
+  else
+    (
+      cd /tmp || exit 1
+      tar xzf iavf-4.13.16.tar.gz
+      cd iavf-4.13.16/src || exit 1
+      make
+      sudo make install
+      sudo depmod -a
+    )
+    rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+      log "[ERROR] iavf driver build/installation failed (rc=${rc})"
+      whiptail_msgbox "STEP 06 - iavf build/installation failed" "Failed to build or install iavf driver.\n\nPlease check /var/log/xdr-installer.log." 12 80
+      return 1
+    fi
+    echo "=== iavf driver build / installation completed ==="
+    log "[STEP 06] iavf driver build / installation completed"
   fi
-  echo "=== iavf driver build / installation completed ==="
-  log "[STEP 06] iavf driver build / installation completed"
 
   #######################################
   # 1) Verify/Apply SR-IOV VF driver (iavf/i40evf)
   #######################################
   log "[STEP 06] Attempting to load iavf/i40evf module"
-  sudo modprobe iavf 2>/dev/null || sudo modprobe i40evf 2>/dev/null || true
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will run: sudo modprobe iavf (or i40evf if iavf fails)"
+  else
+    sudo modprobe iavf 2>/dev/null || sudo modprobe i40evf 2>/dev/null || true
+  fi
 
   {
     echo "--------------------------------------"
@@ -2387,8 +2483,7 @@ step_06_ntpsec() {
 
   show_textbox "STEP 06 - SR-IOV Driver Installation / NTP Status" "${tmp_info}"
 
-  if ! whiptail --title "STEP 06 Execution Confirmation" \
-	             --yesno "After installing iavf(i40evf) driver on the host,\nNTPsec configuration will proceed.\n\nDo you want to continue?" 13 80
+  if ! whiptail_yesno "STEP 06 Execution Confirmation" "After installing iavf(i40evf) driver on the host,\nNTPsec configuration will proceed.\n\nDo you want to continue?" 13 80
   then
     log "User canceled STEP 06 execution."
     return 0
@@ -2566,8 +2661,7 @@ step_07_lvm_storage() {
   local ES_LV="lv_dl"
 
   if [[ -z "${DATA_SSD_LIST}" ]]; then
-    whiptail --title "STEP 07 - Data Disk Not Configured" \
-             --msgbox "DATA_SSD_LIST is not set.\n\nYou must first select data disks in STEP 01." 12 70
+    whiptail_msgbox "STEP 07 - data disks not set" "DATA_SSD_LIST is empty or not configured.\n\nPlease re-run STEP 01 to select data disks.\n\nCurrent value: '${DATA_SSD_LIST:-<empty>}'\n\nCONFIG_FILE: ${CONFIG_FILE}" 16 70
     log "DATA_SSD_LIST is empty, cannot proceed with STEP 07."
     return 1
   fi
@@ -2588,8 +2682,7 @@ step_07_lvm_storage() {
   fi
 
   if [[ "${already_lvm}" -eq 1 ]]; then
-    if whiptail --title "STEP 07 - Already Configured" \
-                --yesno "vg_dl / lv_dl and ${UBUNTU_VG}/${DL_ROOT_LV}, ${UBUNTU_VG}/${DA_ROOT_LV}\nand /stellar/dl, /stellar/da mounts already exist.\n\nThis STEP recreates disk partitions,\nso generally should not be run again.\n\nDo you want to skip this STEP?" 18 80
+    if whiptail_yesno "STEP 07 - Already Configured" "vg_dl / lv_dl and ${UBUNTU_VG}/${DL_ROOT_LV}, ${UBUNTU_VG}/${DA_ROOT_LV}\nand /stellar/dl, /stellar/da mounts already exist.\n\nThis STEP recreates disk partitions,\nso generally should not be run again.\n\nDo you want to skip this STEP?" 18 80
     then
       log "User chose to skip STEP 07 entirely based on 'already configured' judgment."
       return 0
@@ -2615,8 +2708,7 @@ step_07_lvm_storage() {
 
   show_textbox "STEP 07 - Disk Verification" "${tmp_info}"
 
-  if ! whiptail --title "STEP 07 - Warning" \
-                 --yesno "All existing partitions/data on the disks shown above (/dev/${DATA_SSD_LIST})\nwill be deleted and used exclusively for LVM.\n\nDo you want to continue?" 15 70
+  if ! whiptail_yesno "STEP 07 - Warning" "All existing partitions/data on the disks shown above (/dev/${DATA_SSD_LIST})\nwill be deleted and used exclusively for LVM.\n\nDo you want to continue?" 15 70
   then
     log "User canceled STEP 07 disk initialization."
     return 0
@@ -2845,8 +2937,7 @@ step_08_libvirt_hooks() {
 
   show_textbox "STEP 08 - Current hooks status" "${tmp_info}"
 
-  if ! whiptail --title "STEP 08 Execution Confirmation" \
-                 --yesno "The /etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu scripts will be\ncompletely created/overwritten based on the document.\n\nDo you want to continue?" 13 80
+  if ! whiptail_yesno "STEP 08 Execution Confirmation" "The /etc/libvirt/hooks/network, /etc/libvirt/hooks/qemu scripts will be\ncompletely created/overwritten based on the document.\n\nDo you want to continue?" 13 80
   then
     log "User canceled STEP 08 execution."
     return 0
@@ -3267,8 +3358,7 @@ step_09_dp_download() {
   if [[ -n "${missing}" ]]; then
     local msg="The following items are missing from the configuration:${missing}\n\nPlease set the values in the [Configuration] menu first and then re-run."
     log "[STEP 09] Missing configuration values: ${missing}"
-    whiptail --title "STEP 09 - Missing Configuration" \
-             --msgbox "${msg}" 15 70
+    whiptail_msgbox "STEP 09 - Missing Configuration" "${msg}" 15 70
     log "[STEP 09] Skipping STEP 09 due to missing configuration values."
     return 0
   fi
@@ -3558,8 +3648,7 @@ step_09_dp_download() {
         if ! sha1sum -c "${remote_sha1}"; then
           log "[WARN] sha1sum verification failed."
           
-          if whiptail --title "STEP 09 - sha1 Verification Failed" \
-                      --yesno "sha1 verification failed.\n\nFile may be corrupted.\nDo you want to proceed anyway?\n\n[Yes] Continue\n[No] Abort" 14 80
+          if whiptail_yesno "STEP 09 - sha1 Verification Failed" "sha1 verification failed.\n\nFile may be corrupted.\nDo you want to proceed anyway?\n\n[Yes] Continue\n[No] Abort" 14 80
           then
             log "[STEP 09] User ignored sha1 verification failure."
             exit 0
@@ -3691,9 +3780,17 @@ This can significantly impact the running cluster (DL / DA services).\n\
 Are you sure you want to proceed with redeployment?"
 
   if command -v whiptail >/dev/null 2>&1; then
+      # Calculate dialog size dynamically and center message
+      local dialog_dims
+      dialog_dims=$(calc_dialog_size 18 80)
+      local dialog_height dialog_width
+      read -r dialog_height dialog_width <<< "${dialog_dims}"
+      local centered_msg
+      centered_msg=$(center_message "${msg}")
+      
       if ! whiptail --title "${step_name} - ${vm_name} Redeployment Confirmation" \
                     --defaultno \
-                    --yesno "${msg}" 18 80; then
+                    --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"; then
           log "[${step_name}] ${vm_name} redeployment canceled by user."
           return 1
       fi
@@ -3730,13 +3827,9 @@ prompt_vm_memory() {
   local dl_input da_input
 
   if command -v whiptail >/dev/null 2>&1; then
-    dl_input=$(whiptail --title "DL VM Memory Configuration" \
-                         --inputbox "Enter DL VM memory capacity in GB.\n\n(Current default: ${default_dl} GB)" \
-                         12 60 "${default_dl}" 3>&1 1>&2 2>&3) || return 1
+    dl_input=$(whiptail_inputbox "DL VM Memory Configuration" "Enter DL VM memory capacity in GB.\n\n(Current default: ${default_dl} GB)" "${default_dl}" 12 60) || return 1
 
-    da_input=$(whiptail --title "DA VM Memory Configuration" \
-                         --inputbox "Enter DA VM memory capacity in GB.\n\n(Current default: ${default_da} GB)" \
-                         12 60 "${default_da}" 3>&1 1>&2 2>&3) || return 1
+    da_input=$(whiptail_inputbox "DA VM Memory Configuration" "Enter DA VM memory capacity in GB.\n\n(Current default: ${default_da} GB)" "${default_da}" 12 60) || return 1
   else
     echo "Configure DL / DA VM memory capacity in GB."
     read -r -p "DL VM Memory (GB) [Default: ${default_dl}]: " dl_input
@@ -3797,10 +3890,7 @@ step_10_dl_master_deploy() {
     local vm_name_input
 
     # 2. Display whiptail input box
-    vm_name_input=$(whiptail --title "STEP 10 - DL VM Name (Role) Configuration" \
-        --inputbox "Enter the hostname of the DL VM to deploy.\n\n(Example: dl-master, dl-worker1, dl-worker2 ...)\n\n※ Important: This name will be used as NVRAM filename (\${VM_NAME}_VARS.fd)." \
-        15 70 "${default_hostname}" \
-        3>&1 1>&2 2>&3) || return 0  # Exit step if cancel button is pressed
+    vm_name_input=$(whiptail_inputbox "STEP 10 - DL VM Name (Role) Configuration" "Enter the hostname of the DL VM to deploy.\n\n(Example: dl-master, dl-worker1, dl-worker2 ...)\n\n※ Important: This name will be used as NVRAM filename (\${VM_NAME}_VARS.fd)." "${default_hostname}" 15 70) || return 0  # Exit step if cancel button is pressed
 
     # 3. Validate input (use default if empty)
     if [[ -z "${vm_name_input}" ]]; then
@@ -3834,9 +3924,14 @@ step_10_dl_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail_msgbox "STEP 10 - DL Deployment" "DP_VERSION is not set.\nPlease set the DP version in the Configuration menu first and then re-run.\nThis step will be skipped."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] DP_VERSION not set, but continuing in DRY_RUN mode"
+            _DP_VERSION="dry-run-version"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 10 - DL Deployment" "DP_VERSION is not set.\nPlease set the DP version in the Configuration menu first and then re-run.\nThis step will be skipped."
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
+            return 0
+        fi
     fi
 
     # DL image directory (same as STEP 09)
@@ -3871,23 +3966,6 @@ step_10_dl_master_deploy() {
         log "[STEP 10] All VM directories and legacy files cleanup completed"
     fi
 
-    # mgmt interface - Use value selected in STEP 01 if present, otherwise assume mgt
-    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
-    local HOST_MGT_IP
-    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-
-    if [ -z "${HOST_MGT_IP}" ]; then
-        # If host mgt IP cannot be obtained automatically, prompt user for input
-        HOST_MGT_IP="$(whiptail --title "STEP 10 - DL Deployment" \
-            --inputbox "Enter the IP of the host management interface (${MGT_NIC_NAME}).\n(Example: 10.4.0.210)" 12 80 "" \
-            3>&1 1>&2 2>&3)"
-        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail_msgbox "STEP 10 - DL Deployment" "Cannot determine host management IP.\nSkipping DL-master deployment step."
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HOST_MGT_IP not available. Skipping."
-            return 0
-        fi
-    fi
-
     # Locate virt_deploy_uvp_centos.sh
     # - If path saved in STEP 09 (DP_SCRIPT_PATH) exists, use it first
     # - Otherwise search in order: /stellar/dl/images, /stellar/dl, current directory
@@ -3911,9 +3989,14 @@ step_10_dl_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail_msgbox "STEP 10 - DL Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first and then re-run.\nThis step will be skipped."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] virt_deploy_uvp_centos.sh not found, but continuing in DRY_RUN mode"
+            DP_SCRIPT_PATH="./virt_deploy_uvp_centos.sh"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 10 - DL Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first and then re-run.\nThis step will be skipped."
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
+            return 0
+        fi
     fi
 
     # Check if DL image file exists → nodownload=true if exists, false otherwise
@@ -3928,26 +4011,43 @@ step_10_dl_master_deploy() {
 
     # Check if DL LV is mounted at /stellar/dl
     if ! mount | grep -q "on ${DL_INSTALL_DIR} "; then
-        whiptail_msgbox "STEP 10 - DL Deployment" "${DL_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen re-run.\nThis step will be skipped."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] ${DL_INSTALL_DIR} is not mounted, but continuing in DRY_RUN mode"
+        else
+            whiptail_msgbox "STEP 10 - DL Deployment" "${DL_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen re-run.\nThis step will be skipped."
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
+            return 0
+        fi
     fi
 
     # DL OTP: Use from config file if present, otherwise prompt once and save
     local _DL_OTP="${DL_OTP:-}"
     if [ -z "${_DL_OTP}" ]; then
-        _DL_OTP="$(whiptail --title "STEP 10 - DL Deployment" \
-            --passwordbox "Enter OTP value for DL-master.\n(OTP issued from ACPS)" 12 70 "" \
-            3>&1 1>&2 2>&3)"
-        if [ $? -ne 0 ] || [ -z "${_DL_OTP}" ]; then
-            whiptail_msgbox "STEP 10 - DL Deployment" "OTP value not entered. Skipping DL-master deployment."
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
-            return 0
+        # Always prompt for OTP (both dry run and actual mode)
+        local otp_prompt_msg="Enter OTP value for DL-master.\n(OTP issued from ACPS)"
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            otp_prompt_msg="Enter OTP value for DL-master.\n(OTP issued from ACPS)\n\n(DRY-RUN mode: You can skip this, but OTP will be required for actual deployment.)"
         fi
-        DL_OTP="${_DL_OTP}"
-        # Save OTP (reflect in configuration)
-        if type save_config >/dev/null 2>&1; then
-            save_config
+        _DL_OTP="$(whiptail_passwordbox "STEP 10 - DL Deployment" "${otp_prompt_msg}" "" 12 70)"
+        if [ $? -ne 0 ] || [ -z "${_DL_OTP}" ]; then
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] DL_OTP not provided, but continuing in DRY_RUN mode with placeholder"
+                _DL_OTP="dry-run-otp"  # Use placeholder for dry run
+            else
+                whiptail_msgbox "STEP 10 - DL Deployment" "OTP value not entered. Skipping DL-master deployment."
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
+                return 0
+            fi
+        else
+            # User provided OTP - save it
+            DL_OTP="${_DL_OTP}"
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] DL_OTP provided by user (will be used in dry run command)"
+            fi
+            # Save OTP (reflect in configuration)
+            if type save_config >/dev/null 2>&1; then
+                save_config
+            fi
         fi
     fi
 
@@ -3976,10 +4076,7 @@ step_10_dl_master_deploy() {
     ############################################################
     # 1) Memory
     local _DL_MEM_INPUT
-    _DL_MEM_INPUT="$(whiptail --title "STEP 10 - DL Memory Configuration" \
-        --inputbox "Enter memory (GB) to allocate to DL-master VM.\n\nCurrent default: ${DL_MEMORY_GB} GB" \
-        12 70 "${DL_MEMORY_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DL_MEM_INPUT="$(whiptail_inputbox "STEP 10 - DL Memory Configuration" "Enter memory (GB) to allocate to DL-master VM.\n\nCurrent default: ${DL_MEMORY_GB} GB" "${DL_MEMORY_GB}" 12 70)"
 
     # If user presses Cancel, keep default; if OK, validate value then apply
     if [ $? -eq 0 ] && [ -n "${_DL_MEM_INPUT}" ]; then
@@ -3987,40 +4084,31 @@ step_10_dl_master_deploy() {
         if [[ "${_DL_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_MEM_INPUT}" -gt 0 ]; then
             DL_MEMORY_GB="${_DL_MEM_INPUT}"
         else
-            whiptail --title "STEP 10 - DL Memory Configuration" \
-                --msgbox "Entered memory value is invalid.\nUsing existing default (${DL_MEMORY_GB} GB)." 10 70
+            whiptail_msgbox "STEP 10 - DL Memory Configuration" "Entered memory value is invalid.\nUsing existing default (${DL_MEMORY_GB} GB)." 10 70
         fi
     fi
 
     # 2) vCPU
     local _DL_VCPU_INPUT
-    _DL_VCPU_INPUT="$(whiptail --title "STEP 10 - DL vCPU Configuration" \
-        --inputbox "Enter number of vCPUs for DL-master VM.\n\nCurrent default: ${DL_VCPUS}" \
-        12 70 "${DL_VCPUS}" \
-        3>&1 1>&2 2>&3)"
+    _DL_VCPU_INPUT="$(whiptail_inputbox "STEP 10 - DL vCPU Configuration" "Enter number of vCPUs for DL-master VM.\n\nCurrent default: ${DL_VCPUS}" "${DL_VCPUS}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DL_VCPU_INPUT}" ]; then
         if [[ "${_DL_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_VCPU_INPUT}" -gt 0 ]; then
             DL_VCPUS="${_DL_VCPU_INPUT}"
         else
-            whiptail --title "STEP 10 - DL vCPU Configuration" \
-                --msgbox "Entered vCPU value is invalid.\nUsing existing default (${DL_VCPUS})." 10 70
+            whiptail_msgbox "STEP 10 - DL vCPU Configuration" "Entered vCPU value is invalid.\nUsing existing default (${DL_VCPUS})." 10 70
         fi
     fi
 
     # 3) Disk size
     local _DL_DISK_INPUT
-    _DL_DISK_INPUT="$(whiptail --title "STEP 10 - DL Disk Configuration" \
-        --inputbox "Enter disk size (GB) for DL-master VM.\n\nCurrent default: ${DL_DISK_GB} GB" \
-        12 70 "${DL_DISK_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DL_DISK_INPUT="$(whiptail_inputbox "STEP 10 - DL Disk Configuration" "Enter disk size (GB) for DL-master VM.\n\nCurrent default: ${DL_DISK_GB} GB" "${DL_DISK_GB}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DL_DISK_INPUT}" ]; then
         if [[ "${_DL_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DL_DISK_INPUT}" -gt 0 ]; then
             DL_DISK_GB="${_DL_DISK_INPUT}"
         else
-            whiptail --title "STEP 10 - DL Disk Configuration" \
-                --msgbox "Entered disk size value is invalid.\nUsing existing default (${DL_DISK_GB} GB)." 10 70
+            whiptail_msgbox "STEP 10 - DL Disk Configuration" "Entered disk size value is invalid.\nUsing existing default (${DL_DISK_GB} GB)." 10 70
         fi
     fi
 
@@ -4042,7 +4130,6 @@ step_10_dl_master_deploy() {
 --hostname=${DL_HOSTNAME} \
 --cluster-size=${DL_CLUSTERSIZE} \
 --release=${_DP_VERSION} \
---local-ip=${HOST_MGT_IP} \
 --node-role=DL-master \
 --bridge=${DL_BRIDGE} \
 --CPUS=${DL_VCPUS} \
@@ -4063,7 +4150,6 @@ step_10_dl_master_deploy() {
   Hostname        : ${DL_HOSTNAME}
   Cluster Size    : ${DL_CLUSTERSIZE}
   DP Version      : ${_DP_VERSION}
-  Host MGT IP     : ${HOST_MGT_IP}
   Bridge          : ${DL_BRIDGE}
   vCPU            : ${DL_VCPUS}
   Memory          : ${DL_MEMORY_GB} GB (${DL_MEMORY_MB} MB)
@@ -4149,10 +4235,7 @@ step_11_da_master_deploy() {
     local default_hostname="${DA_HOSTNAME:-da-master}"
     local vm_name_input
 
-    vm_name_input=$(whiptail --title "STEP 11 - DA VM Name Configuration" \
-            --inputbox "Enter the hostname of the DA VM to deploy.\n\n(Example: da-master, da-worker1, da-worker2 ...)\n\n※ This name will also be used as NVRAM filename (\${VM_NAME}_VARS.fd)." \
-            15 70 "${default_hostname}" \
-            3>&1 1>&2 2>&3) || return 0
+    vm_name_input=$(whiptail_inputbox "STEP 11 - DA VM Name Configuration" "Enter the hostname of the DA VM to deploy.\n\n(Example: da-master, da-worker1, da-worker2 ...)\n\n※ This name will also be used as NVRAM filename (\${VM_NAME}_VARS.fd)." "${default_hostname}" 15 70) || return 0
 
     if [[ -z "${vm_name_input}" ]]; then
         vm_name_input="da-master"
@@ -4214,23 +4297,6 @@ step_11_da_master_deploy() {
         # Also remove legacy flat files (.raw/.log) that are not in directory layout
         sudo rm -f "${DA_IMAGE_DIR}"/*.raw "${DA_IMAGE_DIR}"/*.log >/dev/null 2>&1 || true
         log "[STEP 11] All VM directories and legacy files cleanup completed"
-    fi
-
-    # host mgt NIC / IP
-    : "${MGT_NIC:=mgt}"
-    local MGT_NIC_NAME="${MGT_NIC}"
-    local HOST_MGT_IP
-    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-
-    if [ -z "${HOST_MGT_IP}" ]; then
-        HOST_MGT_IP="$(whiptail --title "STEP 11 - DA Deployment" \
-            --inputbox "Enter the IP of the host management (mgt) interface (${MGT_NIC_NAME}).\n(Example: 10.4.0.210)" 12 80 "" \
-            3>&1 1>&2 2>&3)"
-        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail_msgbox "STEP 11 - DA Deployment" "Cannot determine host management IP.\nSkipping DA-master deployment step."
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] HOST_MGT_IP not available. Skipping."
-            return 0
-        fi
     fi
 
     # cm_fqdn (DL cluster IP, CM address)
@@ -4309,49 +4375,37 @@ step_11_da_master_deploy() {
     ############################################################
     # 1) Memory
     local _DA_MEM_INPUT
-    _DA_MEM_INPUT="$(whiptail --title "STEP 11 - DA Memory Configuration" \
-        --inputbox "Enter memory (GB) to allocate to DA-master VM.\n\nCurrent default: ${DA_MEMORY_GB} GB" \
-        12 70 "${DA_MEMORY_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DA_MEM_INPUT="$(whiptail_inputbox "STEP 11 - DA Memory Configuration" "Enter memory (GB) to allocate to DA-master VM.\n\nCurrent default: ${DA_MEMORY_GB} GB" "${DA_MEMORY_GB}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DA_MEM_INPUT}" ]; then
         if [[ "${_DA_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_MEM_INPUT}" -gt 0 ]; then
             DA_MEMORY_GB="${_DA_MEM_INPUT}"
         else
-            whiptail --title "STEP 11 - DA Memory Configuration" \
-                --msgbox "Entered memory value is invalid.\nUsing existing default (${DA_MEMORY_GB} GB)." 10 70
+            whiptail_msgbox "STEP 11 - DA Memory Configuration" "Entered memory value is invalid.\nUsing existing default (${DA_MEMORY_GB} GB)." 10 70
         fi
     fi
 
     # 2) vCPU
     local _DA_VCPU_INPUT
-    _DA_VCPU_INPUT="$(whiptail --title "STEP 11 - DA vCPU Configuration" \
-        --inputbox "Enter number of vCPUs for DA-master VM.\n\nCurrent default: ${DA_VCPUS}" \
-        12 70 "${DA_VCPUS}" \
-        3>&1 1>&2 2>&3)"
+    _DA_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - DA vCPU Configuration" "Enter number of vCPUs for DA-master VM.\n\nCurrent default: ${DA_VCPUS}" "${DA_VCPUS}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DA_VCPU_INPUT}" ]; then
         if [[ "${_DA_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_VCPU_INPUT}" -gt 0 ]; then
             DA_VCPUS="${_DA_VCPU_INPUT}"
         else
-            whiptail --title "STEP 11 - DA vCPU Configuration" \
-                --msgbox "Entered vCPU value is invalid.\nUsing existing default (${DA_VCPUS})." 10 70
+            whiptail_msgbox "STEP 11 - DA vCPU Configuration" "Entered vCPU value is invalid.\nUsing existing default (${DA_VCPUS})." 10 70
         fi
     fi
 
     # 3) Disk size
     local _DA_DISK_INPUT
-    _DA_DISK_INPUT="$(whiptail --title "STEP 11 - DA Disk Configuration" \
-        --inputbox "Enter disk size (GB) for DA-master VM.\n\nCurrent default: ${DA_DISK_GB} GB" \
-        12 70 "${DA_DISK_GB}" \
-        3>&1 1>&2 2>&3)"
+    _DA_DISK_INPUT="$(whiptail_inputbox "STEP 11 - DA Disk Configuration" "Enter disk size (GB) for DA-master VM.\n\nCurrent default: ${DA_DISK_GB} GB" "${DA_DISK_GB}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_DA_DISK_INPUT}" ]; then
         if [[ "${_DA_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_DA_DISK_INPUT}" -gt 0 ]; then
             DA_DISK_GB="${_DA_DISK_INPUT}"
         else
-            whiptail --title "STEP 11 - DA Disk Configuration" \
-                --msgbox "Entered disk size value is invalid.\nUsing existing default (${DA_DISK_GB} GB)." 10 70
+            whiptail_msgbox "STEP 11 - DA Disk Configuration" "Entered disk size value is invalid.\nUsing existing default (${DA_DISK_GB} GB)." 10 70
         fi
     fi
 
@@ -4374,7 +4428,6 @@ step_11_da_master_deploy() {
     CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
 --hostname=${DA_HOSTNAME} \
 --release=${_DP_VERSION} \
---local-ip=${HOST_MGT_IP} \
 --cm_fqdn=${CM_FQDN} \
 --node-role=${DA_NODE_ROLE} \
 --bridge=${DA_BRIDGE} \
@@ -4394,7 +4447,6 @@ step_11_da_master_deploy() {
 
   Hostname        : ${DA_HOSTNAME}
   DP Version      : ${_DP_VERSION}
-  Host MGT IP     : ${HOST_MGT_IP}
   CM FQDN (DL IP) : ${CM_FQDN}
   Bridge          : ${DA_BRIDGE}
   node_role       : ${DA_NODE_ROLE}
@@ -4830,27 +4882,530 @@ EOF
     # 7. DL Data Disk (LV) Attach (vg_dl/lv_dl → vdb, --config)
     ###########################################################################
     local DATA_LV="/dev/mapper/vg_dl-lv_dl"
+    
+    # Helper function to extract and normalize vdb source from VM XML
+    get_vdb_source() {
+        local vm_name="$1"
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        
+        if [[ -z "${vdb_xml}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Try multiple methods to extract source device
+        local source_dev=""
+        
+        # Method 1: Extract from source dev='...' pattern
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        
+        # Method 2: Extract from source file='...' pattern
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 3: Extract from any source= pattern (more flexible)
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source.*=" | sed -E "s/.*source[^=]*=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 4: Try with different quote styles
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source" | sed -E "s/.*source[^>]*>([^<]+)<.*/\1/" | head -1 || echo "")
+        fi
+        
+        echo "${source_dev}"
+    }
+    
+    # Helper function to normalize device paths for comparison
+    normalize_device_path() {
+        local path="$1"
+        if [[ -z "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # If path exists, resolve symlinks with readlink -f
+        if [[ -e "${path}" ]]; then
+            readlink -f "${path}" 2>/dev/null || echo "${path}"
+        else
+            echo "${path}"
+        fi
+    }
+    
+    # Helper function to get device major:minor numbers
+    get_device_majmin() {
+        local path="$1"
+        if [[ -z "${path}" ]] || [[ ! -e "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Use stat to get major:minor (format: hex:hex or dec:dec)
+        stat -Lc '%t:%T' "${path}" 2>/dev/null || echo ""
+    }
+    
+    # Helper function to compare two device paths (handles /dev/mapper/... vs /dev/dm-*)
+    compare_device_paths() {
+        local path1="$1"
+        local path2="$2"
+        
+        if [[ -z "${path1}" ]] || [[ -z "${path2}" ]]; then
+            return 1
+        fi
+        
+        # Try readlink -f canonicalization first
+        local canonical1 canonical2
+        canonical1=$(readlink -f "${path1}" 2>/dev/null || echo "")
+        canonical2=$(readlink -f "${path2}" 2>/dev/null || echo "")
+        
+        # If both canonicalizations succeeded, compare them
+        if [[ -n "${canonical1}" ]] && [[ -n "${canonical2}" ]]; then
+            if [[ "${canonical1}" == "${canonical2}" ]]; then
+                return 0
+            fi
+        fi
+        
+        # Fallback: compare major:minor numbers
+        local majmin1 majmin2
+        majmin1=$(get_device_majmin "${path1}")
+        majmin2=$(get_device_majmin "${path2}")
+        
+        if [[ -n "${majmin1}" ]] && [[ -n "${majmin2}" ]] && [[ "${majmin1}" == "${majmin2}" ]]; then
+            return 0
+        fi
+        
+        # Last resort: string comparison (for non-existent paths or files)
+        if [[ "${path1}" == "${path2}" ]]; then
+            return 0
+        fi
+        
+        return 1
+    }
+    
+    # Helper function to check VM state (running or shutoff)
+    get_vm_state() {
+        local vm_name="$1"
+        local state
+        state=$(virsh domstate "${vm_name}" 2>/dev/null | head -1 || echo "")
+        echo "${state}"
+    }
+    
+    # Helper function to check if vdb is correctly attached (config/persistent check)
+    check_vdb_attached_config() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        local current_source
+        
+        # Use --inactive to check persistent config
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        
+        if [[ -z "${vdb_xml}" ]]; then
+            return 1  # vdb not found in config
+        fi
+        
+        # Extract source from config XML
+        local source_dev=""
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Config matches
+        else
+            return 1  # Config does not match
+        fi
+    }
+    
+    # Helper function to check if vdb is correctly attached (live check)
+    check_vdb_attached_live() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        
+        # Use domblklist to check live state
+        local blklist_output
+        blklist_output=$(virsh domblklist "${vm_name}" --details 2>/dev/null || virsh domblklist "${vm_name}" 2>/dev/null || echo "")
+        
+        if [[ -z "${blklist_output}" ]]; then
+            return 1  # Cannot get live block list
+        fi
+        
+        # Check if vdb exists and points to expected LV
+        local vdb_line
+        vdb_line=$(echo "${blklist_output}" | grep -E "vdb\s+" || echo "")
+        
+        if [[ -z "${vdb_line}" ]]; then
+            return 1  # vdb not found in live state
+        fi
+        
+        # Extract source from domblklist output
+        local source_dev
+        source_dev=$(echo "${vdb_line}" | awk '{print $NF}' || echo "")
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Live matches
+        else
+            return 1  # Live does not match
+        fi
+    }
 
     if [[ -e "${DATA_LV}" ]]; then
         if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
             if [[ "${_DRY}" -eq 1 ]]; then
-                log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
+                log "[DRY-RUN] Check VM state and attach ${DATA_LV} as vdb to ${DL_VM} (live+config or config-only)"
             else
-                if virsh dumpxml "${DL_VM}" | grep -q "target dev='vdb'"; then
-                    log "[STEP 12] ${DL_VM} already has vdb → Skipping data disk attach"
+                # Get VM state
+                local vm_state
+                vm_state=$(get_vm_state "${DL_VM}")
+                local dl_running=0
+                if [[ "${vm_state}" == *"running"* ]]; then
+                    dl_running=1
+                fi
+                
+                log "[STEP 12] ${DL_VM} state: ${vm_state}"
+                
+                # Check if vdb is already correctly attached (both config and live if running)
+                local config_ok=0 live_ok=0
+                if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                    config_ok=1
+                fi
+                
+                if [[ ${dl_running} -eq 1 ]]; then
+                    if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                        live_ok=1
+                    fi
                 else
-                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
-                        log "[STEP 12] ${DL_VM} data disk (${DATA_LV}) attached as vdb (--config) completed"
+                    # Shutoff state: live check not applicable
+                    live_ok=1
+                fi
+                
+                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=${live_ok}"
+                
+                # Determine if attachment is needed
+                local needs_attach=1
+                if [[ ${dl_running} -eq 1 ]]; then
+                    # Running: both config and live must be OK
+                    if [[ ${config_ok} -eq 1 ]] && [[ ${live_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                else
+                    # Shutoff: only config needs to be OK
+                    if [[ ${config_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                fi
+                
+                if [[ ${needs_attach} -eq 0 ]]; then
+                    log "[STEP 12] ${DL_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
+                else
+                    # Check if vdb exists but with different device
+                    local current_vdb_source
+                    current_vdb_source=$(get_vdb_source "${DL_VM}")
+                    if [[ -n "${current_vdb_source}" ]]; then
+                        log "[STEP 12] ${DL_VM} has vdb but it's not ${DATA_LV} (current: ${current_vdb_source})"
+                        log "[STEP 12] Will detach current vdb and attach ${DATA_LV} as vdb"
+                        
+                        # Detach existing vdb based on VM state
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            log "[STEP 12] Detaching vdb (live+config) from ${DL_VM}..."
+                            virsh detach-disk "${DL_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                        else
+                            log "[STEP 12] Detaching vdb (config-only) from ${DL_VM}..."
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        sleep 1
+                    fi
+                    
+                    # Attempt to attach the data disk
+                    local attach_mode=""
+                    local is_block_device=0
+                    local is_file=0
+                    
+                    # Detect device type
+                    if [[ -b "${DATA_LV}" ]]; then
+                        is_block_device=1
+                        log "[STEP 12] ${DATA_LV} is a block device, will use raw driver (no qcow2 subdriver)"
+                    elif [[ -f "${DATA_LV}" ]]; then
+                        is_file=1
+                        log "[STEP 12] ${DATA_LV} is a file"
+                    fi
+                    
+                    if [[ ${dl_running} -eq 1 ]]; then
+                        attach_mode="live+config"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${DL_VM} (attach mode: ${attach_mode})..."
+                        
+                        # Try --persistent first (if supported)
+                        local attach_success=0
+                        local config_attach_success=0
+                        local attach_cmd=""
+                        
+                        # Build attach command based on device type
+                        if [[ ${is_block_device} -eq 1 ]]; then
+                            # Block device: use --subdriver raw (or omit subdriver, let libvirt auto-detect)
+                            attach_cmd="virsh attach-disk \"${DL_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        else
+                            # File: use default (libvirt will detect format)
+                            attach_cmd="virsh attach-disk \"${DL_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        fi
+                        
+                        if eval "${attach_cmd}" >/dev/null 2>&1; then
+                            attach_success=1
+                            config_attach_success=1  # --persistent includes config
+                            log "[STEP 12] Attach with --persistent succeeded"
+                        else
+                            # Fallback: attach live first, then config
+                            log "[STEP 12] --persistent not available or failed, using live+config two-step"
+                            
+                            if [[ ${is_block_device} -eq 1 ]]; then
+                                # Block device: no subdriver specified (raw is default for block devices)
+                                if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            else
+                                # File: default behavior
+                                if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            fi
+                        fi
+                        
+                        if [[ ${attach_success} -eq 0 ]]; then
+                            log "[WARN] ${DL_VM} data disk attach command failed, will verify actual status"
+                        fi
                     else
-                        log "[WARN] ${DL_VM} data disk (${DATA_LV}) attach failed"
+                        attach_mode="config-only"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${DL_VM} (attach mode: ${attach_mode})..."
+                        
+                        # For block devices, libvirt will auto-detect raw, no need to specify
+                        local config_attach_success=0
+                        if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                            config_attach_success=1
+                        else
+                            log "[WARN] ${DL_VM} data disk attach command failed, will verify actual status"
+                        fi
+                    fi
+                    
+                    # Verification with retry
+                    sleep 1
+                    local verification_passed=0
+                    local verify_count=0
+                    local max_verify_attempts=3
+                    local final_config_ok=0 final_live_ok=0
+                    
+                    while [[ ${verify_count} -lt ${max_verify_attempts} ]]; do
+                        verify_count=$((verify_count + 1))
+                        
+                        # Check config
+                        if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        else
+                            final_config_ok=0
+                        fi
+                        
+                        # Check live (only if running)
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            else
+                                final_live_ok=0
+                            fi
+                        else
+                            final_live_ok=1  # Not applicable for shutoff
+                        fi
+                        
+                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        
+                        # Determine success based on VM state
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is required
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                # If live is OK, check config with retry window (up to 5 seconds)
+                                if [[ ${final_config_ok} -eq 1 ]]; then
+                                    verification_passed=1
+                                    break
+                                elif [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                                    # Continue retrying for config
+                                    sleep 1
+                                    continue
+                                else
+                                    # After max attempts, if live is OK and config attach command succeeded, 
+                                    # treat as success (will be marked as "persistence pending" in final reporting)
+                                    if [[ ${config_attach_success} -eq 1 ]]; then
+                                        verification_passed=1
+                                        break
+                                    fi
+                                fi
+                            fi
+                        else
+                            # For shutoff: only config needs to be OK
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                                break
+                            fi
+                        fi
+                        
+                        if [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                            sleep 1
+                        fi
+                    done
+                    
+                    # Extended retry for config_ok (up to 5 seconds total)
+                    if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]] && [[ ${verification_passed} -eq 0 ]]; then
+                        local config_retry_count=0
+                        local max_config_retries=5
+                        while [[ ${config_retry_count} -lt ${max_config_retries} ]]; do
+                            config_retry_count=$((config_retry_count + 1))
+                            sleep 1
+                            if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                                final_config_ok=1
+                                verification_passed=1
+                                log "[STEP 12] Config verification succeeded after extended retry (${config_retry_count}s)"
+                                break
+                            fi
+                        done
+                    fi
+                    
+                    # Final recovery attempt if verification failed
+                    if [[ ${verification_passed} -eq 0 ]]; then
+                        log "[WARN] Verification failed after ${max_verify_attempts} attempts, performing final recovery..."
+                        
+                        # One more detach/attach cycle
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            virsh detach-disk "${DL_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            # Block device: no subdriver specified (raw is default)
+                            if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --persistent >/dev/null 2>&1; then
+                                log "[STEP 12] Final recovery: --persistent attach succeeded"
+                            else
+                                virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1 || true
+                                virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                            fi
+                        else
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        
+                        sleep 2
+                        
+                        # Final verification after recovery
+                        final_config_ok=0
+                        final_live_ok=0
+                        if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        fi
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            fi
+                        else
+                            final_live_ok=1
+                        fi
+                        
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is sufficient
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        else
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        fi
+                    fi
+                    
+                    # Final status reporting
+                    if [[ ${verification_passed} -eq 1 ]]; then
+                        # Check if we have a partial success case (live OK but config not OK for running VM)
+                        if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                        else
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (${attach_mode}) completed and verified"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        fi
+                    else
+                        # Only report as failed if live is also not OK (for running VM)
+                        if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 0 ]]; then
+                            log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                            log "[DEBUG] Live block list:"
+                            virsh domblklist "${DL_VM}" --details 2>/dev/null | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                        elif [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            # This should not happen due to verification_passed logic, but handle it anyway
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                        else
+                            log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                        fi
                     fi
                 fi
             fi
         else
-            log "[STEP 12] ${DL_VM} VM not found → Skipping DL data disk attach"
+            log "[STEP 12] ${DL_VM} VM not found → skipping DL data disk attach"
         fi
     else
-        log "[STEP 12] ${DATA_LV} does not exist, skipping DL data disk attach."
+        log "[STEP 12] ${DATA_LV} does not exist, skipping DL data disk attach"
     fi
 
     ###########################################################################
@@ -4947,8 +5502,7 @@ step_13_install_dp_cli() {
         load_config || true
     fi
 
-    if ! whiptail --title "STEP 13 Execution Confirmation" \
-                  --yesno "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
+    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI package (dp_cli) on the host\nand apply it to the stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
         log "User canceled STEP 13 execution."
         return 0
@@ -5286,9 +5840,7 @@ menu_config() {
 
         local pass_msg
         pass_msg=$(center_message "Enter ACPS password.\n(This value will be saved in the config file and automatically used in STEP 09)")
-        pass=$(whiptail --title "ACPS Password Configuration" \
-                        --passwordbox "${pass_msg}" 12 70 "${ACPS_PASSWORD}" \
-                        3>&1 1>&2 2>&3) || continue
+        pass=$(whiptail_passwordbox "ACPS Password Configuration" "${pass_msg}" "${ACPS_PASSWORD}" 12 70) || continue
         if [[ -z "${pass}" ]]; then
           continue
         fi

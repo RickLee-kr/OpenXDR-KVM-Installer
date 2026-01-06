@@ -4243,9 +4243,14 @@ step_10_dl_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail_msgbox "STEP 10 - DL deploy" "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] DP_VERSION not set, but continuing in DRY_RUN mode"
+            _DP_VERSION="dry-run-version"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 10 - DL deploy" "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
+            return 0
+        fi
     fi
 
     # DL image directory (same as STEP 09)
@@ -4272,21 +4277,6 @@ step_10_dl_master_deploy() {
         log "[STEP 10] VM directories cleanup completed"
     fi
 
-    # mgmt interface – use STEP 01 selection if present, else assume mgt
-    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
-    local HOST_MGT_IP
-    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-
-    if [ -z "${HOST_MGT_IP}" ]; then
-        # Prompt if host mgt IP cannot be auto-detected
-        HOST_MGT_IP="$(whiptail_inputbox "STEP 10 - DL deploy" "Enter host management interface IP (${MGT_NIC_NAME}).\nExample: 10.4.0.210" "" 12 80)"
-        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail_msgbox "STEP 10 - DL deploy" "Host management IP not available.\nSkipping DL-master deploy." 10 70
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HOST_MGT_IP not available. Skipping."
-            return 0
-        fi
-    fi
-
     # Locate virt_deploy_uvp_centos.sh
     # - prefer DP_SCRIPT_PATH saved from STEP 09
     # - else search /stellar/dl/images, /stellar/dl, current dir
@@ -4310,9 +4300,14 @@ step_10_dl_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail_msgbox "STEP 10 - DL deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] virt_deploy_uvp_centos.sh not found, but continuing in DRY_RUN mode"
+            DP_SCRIPT_PATH="./virt_deploy_uvp_centos.sh"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 10 - DL deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 (download script/image) first.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
+            return 0
+        fi
     fi
 
     # Check DL image presence → if missing set nodownload=false
@@ -4327,24 +4322,43 @@ step_10_dl_master_deploy() {
 
     # Ensure DL LV is mounted on /stellar/dl
     if ! mount | grep -q "on ${DL_INSTALL_DIR} "; then
-        whiptail_msgbox "STEP 10 - DL deploy" "${DL_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] ${DL_INSTALL_DIR} is not mounted, but continuing in DRY_RUN mode"
+        else
+            whiptail_msgbox "STEP 10 - DL deploy" "${DL_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
+            return 0
+        fi
     fi
 
     # DL OTP: use from config or prompt/save once
     local _DL_OTP="${DL_OTP:-}"
     if [ -z "${_DL_OTP}" ]; then
-        _DL_OTP="$(whiptail_passwordbox "STEP 10 - DL deploy" "Enter OTP for DL-master (issued from Stellar Cyber)." "")"
-        if [ $? -ne 0 ] || [ -z "${_DL_OTP}" ]; then
-            whiptail_msgbox "STEP 10 - DL deploy" "No OTP provided. Skipping DL-master deploy." 10 70
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
-            return 0
+        # Always prompt for OTP (both dry run and actual mode)
+        local otp_prompt_msg="Enter OTP for DL-master (issued from Stellar Cyber)."
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            otp_prompt_msg="Enter OTP for DL-master (issued from Stellar Cyber).\n\n(DRY-RUN mode: You can skip this, but OTP will be required for actual deployment.)"
         fi
-        DL_OTP="${_DL_OTP}"
-        # Save OTP (reflect in configuration)
-        if type save_config >/dev/null 2>&1; then
-            save_config
+        _DL_OTP="$(whiptail_passwordbox "STEP 10 - DL deploy" "${otp_prompt_msg}" "")"
+        if [ $? -ne 0 ] || [ -z "${_DL_OTP}" ]; then
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] DL_OTP not provided, but continuing in DRY_RUN mode with placeholder"
+                _DL_OTP="dry-run-otp"  # Use placeholder for dry run
+            else
+                whiptail_msgbox "STEP 10 - DL deploy" "No OTP provided. Skipping DL-master deploy." 10 70
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
+                return 0
+            fi
+        else
+            # User provided OTP - save it
+            DL_OTP="${_DL_OTP}"
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] DL_OTP provided by user (will be used in dry run command)"
+            fi
+            # Save OTP (reflect in configuration)
+            if type save_config >/dev/null 2>&1; then
+                save_config
+            fi
         fi
     fi
 
@@ -4447,7 +4461,6 @@ step_10_dl_master_deploy() {
 --hostname=${DL_HOSTNAME} \
 --cluster-size=${DL_CLUSTERSIZE} \
 --release=${_DP_VERSION} \
---local-ip=${HOST_MGT_IP} \
 --node-role=DL-master \
 --bridge=${DL_BRIDGE} \
 --CPUS=${DL_VCPUS} \
@@ -4468,7 +4481,6 @@ step_10_dl_master_deploy() {
   Hostname      : ${DL_HOSTNAME}
   Cluster size  : ${DL_CLUSTERSIZE}
   DP version    : ${_DP_VERSION}
-  Host MGT IP   : ${HOST_MGT_IP}
   Bridge        : ${DL_BRIDGE}
   vCPU          : ${DL_VCPUS}
   Memory        : ${DL_MEMORY_GB} GB (${DL_MEMORY_MB} MB)
@@ -4633,26 +4645,16 @@ step_11_da_master_deploy() {
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
-        whiptail_msgbox "STEP 11 - DA Deployment" "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then re-run.\nSkipping this step." 12 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DP_VERSION not set. Skipping DA-master deploy."
-        return 0
-    fi
-
-
-    # host mgt NIC / IP
-    : "${MGT_NIC:=mgt}"
-    local MGT_NIC_NAME="${MGT_NIC}"
-    local HOST_MGT_IP
-    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-
-    if [ -z "${HOST_MGT_IP}" ]; then
-        HOST_MGT_IP="$(whiptail_inputbox "STEP 11 - DA Deployment" "Please enter the IP address of the host management (mgt) interface (${MGT_NIC_NAME}).\n(Example: 10.4.0.210)" "" 12 80)"
-        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail_msgbox "STEP 11 - DA Deployment" "Unable to determine host management IP.\nSkipping DA-master deployment step." 10 70
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] HOST_MGT_IP not available. Skipping."
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] DP_VERSION not set, but continuing in DRY_RUN mode"
+            _DP_VERSION="dry-run-version"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 11 - DA Deployment" "DP_VERSION is not set.\nPlease set the DP version in the configuration menu first, then re-run.\nSkipping this step." 12 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DP_VERSION not set. Skipping DA-master deploy."
             return 0
         fi
     fi
+
 
     # cm_fqdn (DL cluster IP, CM address)
     # If not set separately, use DL_IP or 192.168.122.2 as default
@@ -4686,9 +4688,14 @@ step_11_da_master_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first, then run again.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] virt_deploy_uvp_centos.sh not found. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] virt_deploy_uvp_centos.sh not found, but continuing in DRY_RUN mode"
+            DP_SCRIPT_PATH="./virt_deploy_uvp_centos.sh"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nPlease complete STEP 09 (DP script/image download) first, then run again.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] virt_deploy_uvp_centos.sh not found. Skipping."
+            return 0
+        fi
     fi
 
     # Check if DA image file exists → nodownload=true if exists, false otherwise
@@ -4702,9 +4709,13 @@ step_11_da_master_deploy() {
 
     # Check if DA LV is mounted at /stellar/da
     if ! mount | grep -q "on ${DA_INSTALL_DIR} "; then
-        whiptail_msgbox "STEP 11 - DA Deployment" "${DA_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen run again.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] ${DA_INSTALL_DIR} not mounted. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] ${DA_INSTALL_DIR} is not mounted, but continuing in DRY_RUN mode"
+        else
+            whiptail_msgbox "STEP 11 - DA Deployment" "${DA_INSTALL_DIR} is not currently mounted.\n\nPlease complete STEP 07 (LVM configuration) and /etc/fstab setup first,\nthen run again.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] ${DA_INSTALL_DIR} not mounted. Skipping."
+            return 0
+        fi
     fi
 
     # If da-master VM already exists: destroy + undefine + delete image files
@@ -4806,7 +4817,6 @@ step_11_da_master_deploy() {
     CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
 --hostname=${DA_HOSTNAME} \
 --release=${_DP_VERSION} \
---local-ip=${HOST_MGT_IP} \
 --cm_fqdn=${CM_FQDN} \
 --node-role=${DA_NODE_ROLE} \
 --bridge=${DA_BRIDGE} \
@@ -4826,7 +4836,6 @@ step_11_da_master_deploy() {
 
   Hostname        : ${DA_HOSTNAME}
   DP Version      : ${_DP_VERSION}
-  Host MGT IP     : ${HOST_MGT_IP}
   CM FQDN(DL IP)  : ${CM_FQDN}
   Bridge          : ${DA_BRIDGE}
   node_role       : ${DA_NODE_ROLE}
@@ -4987,9 +4996,14 @@ step_12_sriov_cpu_affinity() {
     vf_list="$(lspci | awk '/Ethernet/ && /Virtual Function/ {print $1}' || true)"
 
     if [[ -z "${vf_list}" ]]; then
-        whiptail_msgbox "STEP 12 - SR-IOV" "Failed to detect SR-IOV VF PCI devices.\nPlease check STEP 03 or BIOS settings." 12 70
-        log "[STEP 12] No SR-IOV VF found → aborting STEP"
-        return 1
+        if [[ "${_DRY}" -eq 1 ]]; then
+            log "[DRY-RUN] No SR-IOV VF found, but continuing in DRY_RUN mode"
+            vf_list="0000:00:00.0 0000:00:00.1"  # Use placeholder VFs for dry run
+        else
+            whiptail_msgbox "STEP 12 - SR-IOV" "Failed to detect SR-IOV VF PCI devices.\nPlease check STEP 03 or BIOS settings." 12 70
+            log "[STEP 12] No SR-IOV VF found → aborting STEP"
+            return 1
+        fi
     fi
 
     log "[STEP 12] Detected VF list:\n${vf_list}"
@@ -5217,19 +5231,522 @@ EOF
     # 7. DL data disk (LV) attach (vg_dl/lv_dl → vdb, --config)
     ###########################################################################
     local DATA_LV="/dev/mapper/vg_dl-lv_dl"
+    
+    # Helper function to extract and normalize vdb source from VM XML
+    get_vdb_source() {
+        local vm_name="$1"
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        
+        if [[ -z "${vdb_xml}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Try multiple methods to extract source device
+        local source_dev=""
+        
+        # Method 1: Extract from source dev='...' pattern
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        
+        # Method 2: Extract from source file='...' pattern
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 3: Extract from any source= pattern (more flexible)
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source.*=" | sed -E "s/.*source[^=]*=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 4: Try with different quote styles
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source" | sed -E "s/.*source[^>]*>([^<]+)<.*/\1/" | head -1 || echo "")
+        fi
+        
+        echo "${source_dev}"
+    }
+    
+    # Helper function to normalize device paths for comparison
+    normalize_device_path() {
+        local path="$1"
+        if [[ -z "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # If path exists, resolve symlinks with readlink -f
+        if [[ -e "${path}" ]]; then
+            readlink -f "${path}" 2>/dev/null || echo "${path}"
+        else
+            echo "${path}"
+        fi
+    }
+    
+    # Helper function to get device major:minor numbers
+    get_device_majmin() {
+        local path="$1"
+        if [[ -z "${path}" ]] || [[ ! -e "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Use stat to get major:minor (format: hex:hex or dec:dec)
+        stat -Lc '%t:%T' "${path}" 2>/dev/null || echo ""
+    }
+    
+    # Helper function to compare two device paths (handles /dev/mapper/... vs /dev/dm-*)
+    compare_device_paths() {
+        local path1="$1"
+        local path2="$2"
+        
+        if [[ -z "${path1}" ]] || [[ -z "${path2}" ]]; then
+            return 1
+        fi
+        
+        # Try readlink -f canonicalization first
+        local canonical1 canonical2
+        canonical1=$(readlink -f "${path1}" 2>/dev/null || echo "")
+        canonical2=$(readlink -f "${path2}" 2>/dev/null || echo "")
+        
+        # If both canonicalizations succeeded, compare them
+        if [[ -n "${canonical1}" ]] && [[ -n "${canonical2}" ]]; then
+            if [[ "${canonical1}" == "${canonical2}" ]]; then
+                return 0
+            fi
+        fi
+        
+        # Fallback: compare major:minor numbers
+        local majmin1 majmin2
+        majmin1=$(get_device_majmin "${path1}")
+        majmin2=$(get_device_majmin "${path2}")
+        
+        if [[ -n "${majmin1}" ]] && [[ -n "${majmin2}" ]] && [[ "${majmin1}" == "${majmin2}" ]]; then
+            return 0
+        fi
+        
+        # Last resort: string comparison (for non-existent paths or files)
+        if [[ "${path1}" == "${path2}" ]]; then
+            return 0
+        fi
+        
+        return 1
+    }
+    
+    # Helper function to check VM state (running or shutoff)
+    get_vm_state() {
+        local vm_name="$1"
+        local state
+        state=$(virsh domstate "${vm_name}" 2>/dev/null | head -1 || echo "")
+        echo "${state}"
+    }
+    
+    # Helper function to check if vdb is correctly attached (config/persistent check)
+    check_vdb_attached_config() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        local current_source
+        
+        # Use --inactive to check persistent config
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        
+        if [[ -z "${vdb_xml}" ]]; then
+            return 1  # vdb not found in config
+        fi
+        
+        # Extract source from config XML
+        local source_dev=""
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Config matches
+        else
+            return 1  # Config does not match
+        fi
+    }
+    
+    # Helper function to check if vdb is correctly attached (live check)
+    check_vdb_attached_live() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        
+        # Use domblklist to check live state
+        local blklist_output
+        blklist_output=$(virsh domblklist "${vm_name}" --details 2>/dev/null || virsh domblklist "${vm_name}" 2>/dev/null || echo "")
+        
+        if [[ -z "${blklist_output}" ]]; then
+            return 1  # Cannot get live block list
+        fi
+        
+        # Check if vdb exists and points to expected LV
+        local vdb_line
+        vdb_line=$(echo "${blklist_output}" | grep -E "vdb\s+" || echo "")
+        
+        if [[ -z "${vdb_line}" ]]; then
+            return 1  # vdb not found in live state
+        fi
+        
+        # Extract source from domblklist output
+        local source_dev
+        source_dev=$(echo "${vdb_line}" | awk '{print $NF}' || echo "")
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Live matches
+        else
+            return 1  # Live does not match
+        fi
+    }
 
     if [[ -e "${DATA_LV}" ]]; then
         if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
             if [[ "${_DRY}" -eq 1 ]]; then
-                log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
+                log "[DRY-RUN] Check VM state and attach ${DATA_LV} as vdb to ${DL_VM} (live+config or config-only)"
             else
-                if virsh dumpxml "${DL_VM}" | grep -q "target dev='vdb'"; then
-                    log "[STEP 12] ${DL_VM} already has vdb → skipping data disk attach"
+                # Get VM state
+                local vm_state
+                vm_state=$(get_vm_state "${DL_VM}")
+                local dl_running=0
+                if [[ "${vm_state}" == *"running"* ]]; then
+                    dl_running=1
+                fi
+                
+                log "[STEP 12] ${DL_VM} state: ${vm_state}"
+                
+                # Check if vdb is already correctly attached (both config and live if running)
+                local config_ok=0 live_ok=0
+                if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                    config_ok=1
+                fi
+                
+                if [[ ${dl_running} -eq 1 ]]; then
+                    if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                        live_ok=1
+                    fi
                 else
-                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
-                        log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+                    # Shutoff state: live check not applicable
+                    live_ok=1
+                fi
+                
+                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=${live_ok}"
+                
+                # Determine if attachment is needed
+                local needs_attach=1
+                if [[ ${dl_running} -eq 1 ]]; then
+                    # Running: both config and live must be OK
+                    if [[ ${config_ok} -eq 1 ]] && [[ ${live_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                else
+                    # Shutoff: only config needs to be OK
+                    if [[ ${config_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                fi
+                
+                if [[ ${needs_attach} -eq 0 ]]; then
+                    log "[STEP 12] ${DL_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
+                else
+                    # Check if vdb exists but with different device
+                    local current_vdb_source
+                    current_vdb_source=$(get_vdb_source "${DL_VM}")
+                    if [[ -n "${current_vdb_source}" ]]; then
+                        log "[STEP 12] ${DL_VM} has vdb but it's not ${DATA_LV} (current: ${current_vdb_source})"
+                        log "[STEP 12] Will detach current vdb and attach ${DATA_LV} as vdb"
+                        
+                        # Detach existing vdb based on VM state
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            log "[STEP 12] Detaching vdb (live+config) from ${DL_VM}..."
+                            virsh detach-disk "${DL_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                        else
+                            log "[STEP 12] Detaching vdb (config-only) from ${DL_VM}..."
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        sleep 1
+                    fi
+                    
+                    # Attempt to attach the data disk
+                    local attach_mode=""
+                    local is_block_device=0
+                    local is_file=0
+                    
+                    # Detect device type
+                    if [[ -b "${DATA_LV}" ]]; then
+                        is_block_device=1
+                        log "[STEP 12] ${DATA_LV} is a block device, will use raw driver (no qcow2 subdriver)"
+                    elif [[ -f "${DATA_LV}" ]]; then
+                        is_file=1
+                        log "[STEP 12] ${DATA_LV} is a file"
+                    fi
+                    
+                    if [[ ${dl_running} -eq 1 ]]; then
+                        attach_mode="live+config"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${DL_VM} (attach mode: ${attach_mode})..."
+                        
+                        # Try --persistent first (if supported)
+                        local attach_success=0
+                        local config_attach_success=0
+                        local attach_cmd=""
+                        
+                        # Build attach command based on device type
+                        if [[ ${is_block_device} -eq 1 ]]; then
+                            # Block device: use --subdriver raw (or omit subdriver, let libvirt auto-detect)
+                            attach_cmd="virsh attach-disk \"${DL_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        else
+                            # File: use default (libvirt will detect format)
+                            attach_cmd="virsh attach-disk \"${DL_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        fi
+                        
+                        if eval "${attach_cmd}" >/dev/null 2>&1; then
+                            attach_success=1
+                            config_attach_success=1  # --persistent includes config
+                            log "[STEP 12] Attach with --persistent succeeded"
+                        else
+                            # Fallback: attach live first, then config
+                            log "[STEP 12] --persistent not available or failed, using live+config two-step"
+                            
+                            if [[ ${is_block_device} -eq 1 ]]; then
+                                # Block device: no subdriver specified (raw is default for block devices)
+                                if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            else
+                                # File: default behavior
+                                if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            fi
+                        fi
+                        
+                        if [[ ${attach_success} -eq 0 ]]; then
+                            log "[WARN] ${DL_VM} data disk attach command failed, will verify actual status"
+                        fi
                     else
-                        log "[WARN] ${DL_VM} data disk(${DATA_LV}) attach failed"
+                        attach_mode="config-only"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${DL_VM} (attach mode: ${attach_mode})..."
+                        
+                        # For block devices, libvirt will auto-detect raw, no need to specify
+                        local config_attach_success=0
+                        if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                            config_attach_success=1
+                        else
+                            log "[WARN] ${DL_VM} data disk attach command failed, will verify actual status"
+                        fi
+                    fi
+                    
+                    # Verification with retry
+                    sleep 1
+                    local verification_passed=0
+                    local verify_count=0
+                    local max_verify_attempts=3
+                    local final_config_ok=0 final_live_ok=0
+                    
+                    while [[ ${verify_count} -lt ${max_verify_attempts} ]]; do
+                        verify_count=$((verify_count + 1))
+                        
+                        # Check config
+                        if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        else
+                            final_config_ok=0
+                        fi
+                        
+                        # Check live (only if running)
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            else
+                                final_live_ok=0
+                            fi
+                        else
+                            final_live_ok=1  # Not applicable for shutoff
+                        fi
+                        
+                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        
+                        # Determine success based on VM state
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is required
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                # If live is OK, check config with retry window (up to 5 seconds)
+                                if [[ ${final_config_ok} -eq 1 ]]; then
+                                    verification_passed=1
+                                    break
+                                elif [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                                    # Continue retrying for config
+                                    sleep 1
+                                    continue
+                                else
+                                    # After max attempts, if live is OK and config attach command succeeded, 
+                                    # treat as success (will be marked as "persistence pending" in final reporting)
+                                    if [[ ${config_attach_success} -eq 1 ]]; then
+                                        verification_passed=1
+                                        break
+                                    fi
+                                fi
+                            fi
+                        else
+                            # For shutoff: only config needs to be OK
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                                break
+                            fi
+                        fi
+                        
+                        if [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                            sleep 1
+                        fi
+                    done
+                    
+                    # Extended retry for config_ok (up to 5 seconds total)
+                    if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]] && [[ ${verification_passed} -eq 0 ]]; then
+                        local config_retry_count=0
+                        local max_config_retries=5
+                        while [[ ${config_retry_count} -lt ${max_config_retries} ]]; do
+                            config_retry_count=$((config_retry_count + 1))
+                            sleep 1
+                            if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                                final_config_ok=1
+                                verification_passed=1
+                                log "[STEP 12] Config verification succeeded after extended retry (${config_retry_count}s)"
+                                break
+                            fi
+                        done
+                    fi
+                    
+                    # Final recovery attempt if verification failed
+                    if [[ ${verification_passed} -eq 0 ]]; then
+                        log "[WARN] Verification failed after ${max_verify_attempts} attempts, performing final recovery..."
+                        
+                        # One more detach/attach cycle
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            virsh detach-disk "${DL_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            # Block device: no subdriver specified (raw is default)
+                            if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --persistent >/dev/null 2>&1; then
+                                log "[STEP 12] Final recovery: --persistent attach succeeded"
+                            else
+                                virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1 || true
+                                virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                            fi
+                        else
+                            virsh detach-disk "${DL_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        
+                        sleep 2
+                        
+                        # Final verification after recovery
+                        final_config_ok=0
+                        final_live_ok=0
+                        if check_vdb_attached_config "${DL_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        fi
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${DL_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            fi
+                        else
+                            final_live_ok=1
+                        fi
+                        
+                        if [[ ${dl_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is sufficient
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        else
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        fi
+                    fi
+                    
+                    # Final status reporting
+                    if [[ ${verification_passed} -eq 1 ]]; then
+                        # Check if we have a partial success case (live OK but config not OK for running VM)
+                        if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                        else
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (${attach_mode}) completed and verified"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        fi
+                    else
+                        # Only report as failed if live is also not OK (for running VM)
+                        if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 0 ]]; then
+                            log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                            log "[DEBUG] Live block list:"
+                            virsh domblklist "${DL_VM}" --details 2>/dev/null | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                        elif [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            # This should not happen due to verification_passed logic, but handle it anyway
+                            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                        else
+                            log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                        fi
                     fi
                 fi
             fi

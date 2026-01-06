@@ -68,7 +68,7 @@ STEP_IDS=(
 
 # STEP Name (description displayed in UI)
 STEP_NAMES=(
-  "01. Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  "01. Hardware / NIC / SPAN NIC Selection"
   "02. HWE Kernel Installation"
   "03. NIC Name/ifupdown Switch and Network Configuration"
   "04. KVM / Libvirt Installation and Basic Configuration"
@@ -605,10 +605,12 @@ load_config() {
   : "${DATA_SSD_LIST:=}"
 
   # ===== AIO Configuration =====
+  : "${AIO_VM_COUNT:=1}"
   : "${AIO_VCPUS:=}"
   : "${AIO_MEMORY_GB:=}"
   : "${AIO_MEMORY_MB:=}"
   : "${AIO_DISK_GB:=}"
+  : "${AIO_CPUSET:=}"
 
   # ===== 1VM (mds only) =====
   : "${SENSOR_VM_COUNT:=1}"
@@ -666,7 +668,7 @@ save_config() {
   local esc_sensor_total_vcpus esc_sensor_vcpus_per_vm esc_sensor_cpuset_mds
   local esc_sensor_total_mem_mb esc_sensor_mem_mb_per_vm
   local esc_sensor_total_lv_gb esc_sensor_lv_gb_per_vm
-  local esc_aio_vcpus esc_aio_memory_gb esc_aio_memory_mb esc_aio_disk_gb
+  local esc_aio_vcpus esc_aio_memory_gb esc_aio_memory_mb esc_aio_disk_gb esc_aio_cpuset
 
   local esc_span_nics_mds
   local esc_sensor_span_pcis_mds esc_sensor_span_pcis
@@ -692,6 +694,7 @@ save_config() {
   esc_aio_memory_gb=${AIO_MEMORY_GB//\"/\\\"}
   esc_aio_memory_mb=${AIO_MEMORY_MB//\"/\\\"}
   esc_aio_disk_gb=${AIO_DISK_GB//\"/\\\"}
+  esc_aio_cpuset=${AIO_CPUSET//\"/\\\"}
 
   esc_span_nics_mds=${SPAN_NICS_MDS//\"/\\\"}
 
@@ -728,7 +731,10 @@ HOST_ACCESS_NIC="${esc_host_access_nic}"
 SPAN_NICS="${esc_span_nics}"
 
 # ---- AIO Configuration ----
-AIO_VCPUS="${esc_aio_vcpus}"
+AIO_VM_COUNT="1"
+AIO_TOTAL_VCPUS="${esc_aio_vcpus}"
+AIO_VCPUS_PER_VM="${esc_aio_vcpus}"
+AIO_CPUSET="${esc_aio_cpuset}"
 AIO_MEMORY_GB="${esc_aio_memory_gb}"
 AIO_MEMORY_MB="${esc_aio_memory_mb}"
 AIO_DISK_GB="${esc_aio_disk_gb}"
@@ -791,6 +797,10 @@ save_config_var() {
     SPAN_NICS)      SPAN_NICS="${value}" ;;
 
     # ---- AIO Configuration ----
+    AIO_VM_COUNT) AIO_VM_COUNT="${value}" ;;
+    AIO_TOTAL_VCPUS) AIO_TOTAL_VCPUS="${value}" ;;
+    AIO_VCPUS_PER_VM) AIO_VCPUS_PER_VM="${value}" ;;
+    AIO_CPUSET) AIO_CPUSET="${value}" ;;
     AIO_VCPUS) AIO_VCPUS="${value}" ;;
     AIO_MEMORY_GB) AIO_MEMORY_GB="${value}" ;;
     AIO_MEMORY_MB) AIO_MEMORY_MB="${value}" ;;
@@ -912,7 +922,7 @@ run_step() {
   local step_description=""
   case "${step_id}" in
     "01_hw_detect")
-      step_description="This step will detect hardware, configure NICs, CPU, memory, and storage settings."
+      step_description="This step will detect hardware, configure NICs, and storage settings."
       ;;
     "02_hwe_kernel")
       step_description="This step will install Hardware Enablement (HWE) kernel for better hardware support."
@@ -945,7 +955,7 @@ run_step() {
       step_description="This step will deploy the Sensor VM (mds)."
       ;;
     "12_sensor_passthrough")
-      step_description="This step will configure PCI passthrough and CPU affinity for the Sensor VM."
+      step_description="This step will configure PCI passthrough and CPU affinity for the AIO & Sensor VM."
       ;;
     "13_install_dp_cli")
       step_description="This step will install DP Appliance CLI package."
@@ -1364,12 +1374,12 @@ list_nic_candidates() {
 
 step_01_hw_detect() {
   local STEP_ID="01_hw_detect"
-  local STEP_NAME="01. Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  local STEP_NAME="01. Hardware / NIC / SPAN NIC Selection"
   
   echo
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
-  log "[STEP 01] Hardware / NIC / CPU / Memory / SPAN NIC Selection"
-  log "[STEP 01] This step will configure hardware resources for AIO and Sensor VMs."
+  log "[STEP 01] Hardware / NIC / SPAN NIC Selection"
+  log "[STEP 01] This step will configure hardware, NICs, and storage settings."
 
   # Load latest configuration (so script doesn't die even if not present)
   if type load_config >/dev/null 2>&1; then
@@ -1409,10 +1419,10 @@ step_01_hw_detect() {
   : "${DATA_SSD_LIST:=}"
   
   # NAT mode only
-  if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" && -n "${DATA_SSD_LIST}" ]]; then
+  if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${DATA_SSD_LIST}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
-    reuse_message="The following values are already set:\n\n- Network mode: ${net_mode} (NAT only)\n- NAT uplink NIC: ${HOST_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR memory: ${SENSOR_MEMORY_MB}MB\n- LV location: ${LV_LOCATION}\n- LV size: ${LV_SIZE_GB}GB\n- Data disks: ${DATA_SSD_LIST}"
+    reuse_message="The following values are already set:\n\n- Network mode: ${net_mode} (NAT only)\n- NAT uplink NIC: ${HOST_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- LV location: ${LV_LOCATION}\n- Data disks: ${DATA_SSD_LIST}"
   fi
   
   if [[ "${can_reuse_config}" -eq 1 ]]; then
@@ -1424,14 +1434,6 @@ step_01_hw_detect() {
       save_config_var "HOST_NIC"      "${HOST_NIC}"
       save_config_var "DATA_NIC"       "${DATA_NIC}"
       save_config_var "SPAN_NICS"     "${SPAN_NICS}"
-      # Legacy/Compatible (per-vm)
-      save_config_var "SENSOR_VCPUS"  "${SENSOR_VCPUS}"
-      save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
-
-      # STEP 08 required (per-vm) - prevent omission when reusing
-      save_config_var "SENSOR_VCPUS_PER_VM" "${SENSOR_VCPUS}"
-      save_config_var "SENSOR_MEMORY_MB_PER_VM" "${SENSOR_MEMORY_MB}"
-
       save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
       save_config_var "SPAN_ATTACH_MODE" "${SPAN_ATTACH_MODE}"
       save_config_var "LV_LOCATION" "${LV_LOCATION}"
@@ -1443,333 +1445,23 @@ step_01_hw_detect() {
   fi
 
   ########################
-  # 1) CPU Calculation (AIO and MDS)
+  # 1) Sensor VM Count Configuration
   ########################
   SENSOR_VM_COUNT=1
   save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
-  local total_cpus
-  total_cpus=$(nproc)
-
-  # Check NUMA configuration
-  local numa_nodes=1
-  local node0_cpus="" node1_cpus=""
-  local node0_count=0 node1_count=0
-  
-  if command -v lscpu >/dev/null 2>&1; then
-    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    
-    if [[ "${numa_nodes}" -ge 2 ]]; then
-      # Extract NUMA node0 CPU list
-      node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
-      # Extract NUMA node1 CPU list
-      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
-      
-      # Count CPUs in each NUMA node
-      if [[ -n "${node0_cpus}" ]]; then
-        node0_count=$(echo "${node0_cpus}" | tr ',' '\n' | wc -l)
-      fi
-      if [[ -n "${node1_cpus}" ]]; then
-        node1_count=$(echo "${node1_cpus}" | tr ',' '\n' | wc -l)
-      fi
-    fi
-  fi
-
-  # ==============================================================================
-  # 1-1) AIO vCPU Configuration (NUMA0)
-  # ==============================================================================
-  local default_aio_vcpus aio_vcpus
-  
-  if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
-    # Default: All CPUs in NUMA0
-    default_aio_vcpus=${node0_count}
-  else
-    # Single NUMA or detection failed: Use half of total CPUs
-    default_aio_vcpus=$((total_cpus / 2))
-    if [[ ${default_aio_vcpus} -lt 2 ]]; then
-      default_aio_vcpus=2
-    fi
-  fi
-
-  aio_vcpus=$(whiptail_inputbox "STEP 01 - AIO vCPU Configuration" "Enter the number of vCPUs for the AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nNUMA0 CPUs: ${node0_count:-N/A}\nDefault value: ${default_aio_vcpus} (all NUMA0 CPUs)\nExample: Enter 46" "${AIO_VCPUS:-${default_aio_vcpus}}") || {
-    log "User canceled AIO vCPU configuration."
-    return 1
-  }
-
-  aio_vcpus=$(echo "${aio_vcpus}" | tr -d ' ')
-  if [[ -z "${aio_vcpus}" || ! "${aio_vcpus}" =~ ^[0-9]+$ || "${aio_vcpus}" -lt 2 ]]; then
-    whiptail_msgbox "Input Error" "AIO vCPU must be entered as a number greater than or equal to 2."
-    return 1
-  fi
-
-  AIO_VCPUS="${aio_vcpus}"
-  save_config_var "AIO_VCPUS" "${AIO_VCPUS}"
-  log "Configured AIO vCPU: ${AIO_VCPUS}"
-
-  # ==============================================================================
-  # 1-2) MDS (Sensor) vCPU Configuration (NUMA1)
-  # ==============================================================================
-  local default_sensor_vcpus sensor_vcpus
-  
-  if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
-    # Default: NUMA1 CPUs minus 4
-    default_sensor_vcpus=$((node1_count - 4))
-    if [[ ${default_sensor_vcpus} -lt 2 ]]; then
-      default_sensor_vcpus=2
-    fi
-  else
-    # Single NUMA or detection failed: Total CPUs minus 4
-    default_sensor_vcpus=$((total_cpus - 4))
-    if [[ ${default_sensor_vcpus} -le 0 ]]; then
-      default_sensor_vcpus=2
-    fi
-  fi
-
-  sensor_vcpus=$(whiptail_inputbox "STEP 01 - Sensor (MDS) vCPU Configuration" "Enter the number of vCPUs for the sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nNUMA1 CPUs: ${node1_count:-N/A}\nDefault value: ${default_sensor_vcpus} (NUMA1 CPUs - 4)\nExample: Enter 22" "${default_sensor_vcpus}") || {
-    log "User canceled sensor vCPU configuration."
-    return 1
-  }
-
-  sensor_vcpus=$(echo "${sensor_vcpus}" | tr -d ' ')
-  if [[ -z "${sensor_vcpus}" || ! "${sensor_vcpus}" =~ ^[0-9]+$ || "${sensor_vcpus}" -lt 2 ]]; then
-    whiptail_msgbox "Input Error" "Sensor vCPU must be entered as a number greater than or equal to 2."
-    return 1
-  fi
-
-  SENSOR_VCPUS="${sensor_vcpus}"
-  SENSOR_VCPUS_PER_VM="${sensor_vcpus}"
-  SENSOR_TOTAL_VCPUS="${sensor_vcpus}"
-
-  # ==============================================================================
-  # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
-  # mds uses NUMA1 cpuset
-  # ==============================================================================
-  if [[ "${numa_nodes}" -ge 2 && -n "${node1_cpus}" ]]; then
-    log "[STEP 01] NUMA node(${numa_nodes}) Detected. Setting CPU Pinning for mds on NUMA1."
-    # Cut the list according to the number of vCPUs entered by the user (allocate from the front)
-    SENSOR_CPUSET_MDS=$(echo "${node1_cpus}" | cut -d',' -f1-"${SENSOR_VCPUS}")
-    log "  -> MDS (Node1): ${SENSOR_CPUSET_MDS}"
-  else
-    log "[STEP 01] Single NUMA node or detection impossible. Using sequential allocation."
-    SENSOR_CPUSET_MDS="0-$((SENSOR_VCPUS-1))"
-  fi
-  # ==============================================================================
-
-  log "Configured sensor vCPU: ${SENSOR_VCPUS} (mds cpuset=${SENSOR_CPUSET_MDS})"
-
-  save_config_var "SENSOR_TOTAL_VCPUS" "${SENSOR_TOTAL_VCPUS}"
-  save_config_var "SENSOR_VCPUS_PER_VM" "${SENSOR_VCPUS_PER_VM}"
-  save_config_var "SENSOR_VCPUS" "${SENSOR_VCPUS}"
-  save_config_var "SENSOR_CPUSET_MDS" "${SENSOR_CPUSET_MDS}"
-
   ########################
-  # 2) Memory Calculation (AIO and MDS)
+  # 2) LV Location Configuration (Sensor only)
   ########################
-  SENSOR_VM_COUNT=1
-  save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
-
-  local total_mem_kb total_mem_gb available_mem_gb default_aio_gb default_sensor_gb
-  total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-  total_mem_gb=$((total_mem_kb / 1024 / 1024))
-  
-  # Reserve 12GB for KVM host
-  available_mem_gb=$((total_mem_gb - 12))
-  if [[ ${available_mem_gb} -le 0 ]]; then
-    whiptail_msgbox "Memory Insufficient Warning" "System memory is insufficient.\nTotal memory: ${total_mem_gb}GB\nAfter reserving 12GB for host, available memory is ${available_mem_gb}GB.\n\nPlease enter appropriate memory sizes manually." 12 70
-    available_mem_gb=16
-  fi
-
-  # Calculate default values: 70% for AIO, 30% for MDS
-  default_aio_gb=$((available_mem_gb * 70 / 100))
-  default_sensor_gb=$((available_mem_gb * 30 / 100))
-  
-  # Ensure minimum values
-  if [[ ${default_aio_gb} -lt 8 ]]; then
-    default_aio_gb=8
-  fi
-  if [[ ${default_sensor_gb} -lt 8 ]]; then
-    default_sensor_gb=8
-  fi
-
-  # ==============================================================================
-  # 2-1) AIO Memory Configuration
-  # ==============================================================================
-  local aio_gb aio_memory_mb
-  aio_gb=$(whiptail_inputbox "STEP 01 - AIO Memory Configuration" \
-                       "Enter the memory (GB) for the AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_aio_gb}GB (70% of available)\nExample: Enter 136" \
-                       "${AIO_MEMORY_GB:-${default_aio_gb}}" \
-                       13 80) || {
-    log "User canceled AIO memory configuration."
-    return 1
-  }
-
-  aio_gb=$(echo "${aio_gb}" | tr -d ' ')
-  if [[ -z "${aio_gb}" || ! "${aio_gb}" =~ ^[0-9]+$ || "${aio_gb}" -lt 8 ]]; then
-    whiptail_msgbox "Input Error" "AIO memory must be entered as a number (GB) greater than or equal to 8."
-    return 1
-  fi
-
-  # Memory (MB) for AIO
-  aio_memory_mb=$(( aio_gb * 1024 ))
-  AIO_MEMORY_GB="${aio_gb}"
-  AIO_MEMORY_MB="${aio_memory_mb}"
-  
-  log "Configured AIO memory: ${aio_gb}GB (${AIO_MEMORY_MB}MB)"
-  save_config_var "AIO_MEMORY_GB" "${AIO_MEMORY_GB}"
-  save_config_var "AIO_MEMORY_MB" "${AIO_MEMORY_MB}"
-
-  # ==============================================================================
-  # 2-2) MDS (Sensor) Memory Configuration
-  # ==============================================================================
-  local sensor_gb sensor_memory_mb
-  sensor_gb=$(whiptail_inputbox "STEP 01 - Sensor (MDS) Memory Configuration" \
-                       "Enter the memory (GB) for the sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_sensor_gb}GB (30% of available)\nExample: Enter 32" \
-                       "${SENSOR_MEMORY_GB:-${default_sensor_gb}}" \
-                       13 80) || {
-    log "User canceled sensor memory configuration."
-    return 1
-  }
-
-  sensor_gb=$(echo "${sensor_gb}" | tr -d ' ')
-  if [[ -z "${sensor_gb}" || ! "${sensor_gb}" =~ ^[0-9]+$ || "${sensor_gb}" -lt 8 ]]; then
-    whiptail_msgbox "Input Error" "Sensor memory must be entered as a number (GB) greater than or equal to 8."
-    return 1
-  fi
-
-  # Memory (MB) for single VM
-  sensor_memory_mb=$(( sensor_gb * 1024 ))
-  SENSOR_MEMORY_MB="${sensor_memory_mb}"
-  SENSOR_MEMORY_MB_PER_VM="${sensor_memory_mb}"
-  SENSOR_TOTAL_MEMORY_MB="${sensor_memory_mb}"
-
-  log "Configured sensor memory: ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)"
-
-  save_config_var "SENSOR_TOTAL_MEMORY_MB" "${SENSOR_TOTAL_MEMORY_MB}"
-  save_config_var "SENSOR_MEMORY_MB_PER_VM" "${SENSOR_MEMORY_MB_PER_VM}"
-  save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
-
-
-  ########################
-  # 3) Storage Allocation Configuration (AIO and MDS)
-  ########################
-  
-  # ==============================================================================
-  # 3-1) AIO Storage Size Configuration
-  # ==============================================================================
-  local aio_disk_gb default_aio_disk_gb=500
-  
-  while true; do
-    aio_disk_gb=$(whiptail_inputbox "STEP 01 - AIO Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the AIO VM.\n\n- Minimum size: 100GB\n- Default value: ${default_aio_disk_gb}GB\n\nExample: Enter 500\n\nSize (GB):" \
-                         "${AIO_DISK_GB:-${default_aio_disk_gb}}" \
-                         15 80) || {
-      log "User canceled AIO storage size configuration."
-      return 1
-    }
-
-    aio_disk_gb=$(echo "${aio_disk_gb}" | tr -d ' ')
-
-    # Number validation
-    if ! [[ "${aio_disk_gb}" =~ ^[0-9]+$ ]]; then
-      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${aio_disk_gb}"
-      continue
-    fi
-
-    # Minimum size validation (100GB)
-    if [[ "${aio_disk_gb}" -lt 100 ]]; then
-      whiptail_msgbox "Insufficient Size" "Minimum 100GB must be greater than or equal to.\nInput value: ${aio_disk_gb}GB"
-      continue
-    fi
-
-    break
-  done
-
-  AIO_DISK_GB="${aio_disk_gb}"
-  log "Configured AIO disk size: ${AIO_DISK_GB}GB"
-  save_config_var "AIO_DISK_GB" "${AIO_DISK_GB}"
-
-  # ==============================================================================
-  # 3-2) MDS (Sensor) Storage Size Configuration
-  # ==============================================================================
-  # Check and display sda3 disk information
-  log "[STEP 01] Check sda3 disk information"
-
-  # Check total size of ubuntu-vg (OpenXDR method) - Modified: unit fixed
-  local ubuntu_vg_total_size
-  # Extract only GB unit number with --units g --nosuffix option (may include decimal point)
-  ubuntu_vg_total_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
-
-  # Check ubuntu-lv usage size - Modified: unit fixed
-  local ubuntu_lv_size ubuntu_lv_gb=0
-  if command -v lvs >/dev/null 2>&1; then
-    # Extract only unit number in GB using --units g --nosuffix option
-    ubuntu_lv_size=$(lvs ubuntu-vg/ubuntu-lv --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
-    # Remove decimal point (integer conversion) -> Example: 100.50 -> 100
-    ubuntu_lv_gb=${ubuntu_lv_size%.*}
-  else
-    ubuntu_lv_size="Unable to verify"
-  fi
-
-  # ubuntu-vg convert total size to integer (remove decimal point) -> Example: 1781.xx -> 1781
-  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
-  
-  # Available space calculate
-  local available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
-  [[ ${available_gb} -lt 0 ]] && available_gb=0
-  
   # LV location set to ubuntu-vg (OpenXDR method)
   local lv_location="ubuntu-vg"
   log "[STEP 01] LV location Auto configured: ${lv_location} (Existing ubuntu-vg Available space Use)"
-  
-  SENSOR_VM_COUNT=1
-  save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
-
-  # From user LV size Receive input (single VM)
-  local lv_size_gb default_sensor_disk_gb=200
-  while true; do
-    lv_size_gb=$(whiptail_inputbox "STEP 01 - Sensor (MDS) Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
-                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
-                         18 80) || {
-      log "User canceled sensor storage size configuration."
-      return 1
-    }
-
-    lv_size_gb=$(echo "${lv_size_gb}" | tr -d ' ')
-
-    # Number validation
-    if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
-      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
-      continue
-    fi
-
-    # Minimum size validation (80GB)
-    if [[ "${lv_size_gb}" -lt 80 ]]; then
-      whiptail_msgbox "Insufficient Size" "Minimum 80GB must be greater than or equal to.\nInput value: ${lv_size_gb}GB"
-      continue
-    fi
-
-    break
-  done
-
-  SENSOR_LV_SIZE_GB_PER_VM="${lv_size_gb}"
-  SENSOR_TOTAL_LV_SIZE_GB="${lv_size_gb}"
-
-  log "Configured LV location: ${lv_location}"
-  log "Configured LV size: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
 
   LV_LOCATION="${lv_location}"
-
-  # Legacy/Compatible: Existing LV_SIZE_GB
-  LV_SIZE_GB="${SENSOR_LV_SIZE_GB_PER_VM}"
-
   save_config_var "LV_LOCATION" "${LV_LOCATION}"
-  save_config_var "SENSOR_TOTAL_LV_SIZE_GB" "${SENSOR_TOTAL_LV_SIZE_GB}"
-  save_config_var "SENSOR_LV_SIZE_GB_PER_VM" "${SENSOR_LV_SIZE_GB_PER_VM}"
-  save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"  
 
   ########################
-  # 3.5) Select data disks for LVM (AIO storage)
+  # 3) Select data disks for LVM (AIO storage)
   ########################
   log "[STEP 01] Select data disks for LVM storage (AIO)"
 
@@ -2114,12 +1806,8 @@ step_01_hw_detect() {
 [STEP 01 Result Summary - NAT Mode]
 
 - Sensor network mode : ${net_mode}
-- Sensor vCPU       : ${SENSOR_VCPUS}
-- Sensor memory     : ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)
 - LV location          : ${LV_LOCATION}
-- LV size          : ${LV_SIZE_GB}GB
 - NAT uplink NIC     : ${HOST_NIC}
-- Data NIC         : N/A (NAT mode using virbr0)
 - Data disks (LVM)  : ${DATA_SSD_LIST}
 - SPAN NICs       : ${SPAN_NICS}
 - SPAN attachment mode    : ${SPAN_ATTACH_MODE} (PCI passthrough only)
@@ -3167,8 +2855,7 @@ step_05_kernel_tuning() {
     fi
   fi
 
-  if ! whiptail --title "STEP 05 Execution Confirmation" \
-                 --yesno "Do you want to proceed with kernel tuning?" 10 60
+  if ! whiptail_yesno "STEP 05 Execution Confirmation" "Do you want to proceed with kernel tuning?"
   then
     log "User canceled STEP 05 execution."
     return 0
@@ -4164,6 +3851,22 @@ step_07_lvm_storage() {
   run_cmd "sudo systemctl daemon-reload"
   run_cmd "sudo mount -a"
 
+  #######################################
+  # 7.5) Change ownership of /stellar (after mount)
+  #######################################
+  log "[STEP 07] Set /stellar ownership to stellar:stellar (per docs)"
+
+  if id stellar >/dev/null 2>&1; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] sudo chown -R stellar:stellar /stellar"
+    else
+      run_cmd "sudo chown -R stellar:stellar /stellar"
+      log "[STEP 07] /stellar ownership update complete"
+    fi
+  else
+    log "[WARN] 'stellar' user not found; skipping chown."
+  fi
+
   local tmp_df="/tmp/xdr_step07_df.txt"
   {
     echo "═══════════════════════════════════════════════════════════"
@@ -4264,23 +3967,7 @@ step_07_lvm_storage() {
   } > "${tmp_df}" 2>&1
 
   #######################################
-  # 8) Change ownership of /stellar (doc: chown -R stellar:stellar /stellar)
-  #######################################
-  log "[STEP 07] Set /stellar ownership to stellar:stellar (per docs)"
-
-  if id stellar >/dev/null 2>&1; then
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] sudo chown -R stellar:stellar /stellar"
-    else
-      sudo chown -R stellar:stellar /stellar
-      log "[STEP 07] /stellar ownership update complete"
-    fi
-  else
-    log "[WARN] 'stellar' user not found; skipping chown."
-  fi
-
-  #######################################
-  # 9) Show summary
+  # 8) Show summary
   #######################################
   show_textbox "STEP 07 summary" "${tmp_df}"
 
@@ -4721,8 +4408,8 @@ step_09_aio_deploy() {
     local AIO_HOSTNAME="${AIO_HOSTNAME:-aio}"
     local AIO_CLUSTERSIZE="1"  # Fixed to 1 for AIO
 
-    local AIO_VCPUS="${AIO_VCPUS:-42}"
-    local AIO_MEMORY_GB="${AIO_MEMORY_GB:-136}"       # in GB
+    # Note: AIO_VCPUS and AIO_MEMORY_GB will be calculated based on system resources below
+    # Do not set hardcoded defaults here - they will be calculated from NUMA configuration
     local AIO_DISK_GB="${AIO_DISK_GB:-500}"           # in GB
 
     local AIO_INSTALL_DIR="${AIO_INSTALL_DIR:-/stellar/aio}"
@@ -4758,20 +4445,6 @@ step_09_aio_deploy() {
         log "[STEP 09] VM directories cleanup completed"
     fi
 
-    # mgmt interface – use STEP 01 selection if present, else assume mgt
-    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
-    local HOST_MGT_IP
-    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
-
-    if [ -z "${HOST_MGT_IP}" ]; then
-        HOST_MGT_IP="$(whiptail_inputbox "STEP 09 - AIO deploy" "Enter host management interface IP (${MGT_NIC_NAME}).\nExample: 10.4.0.210" "" 12 80)"
-        if [ $? -ne 0 ] || [ -z "${HOST_MGT_IP}" ]; then
-            whiptail_msgbox "STEP 09 - AIO deploy" "Host management IP not available.\nSkipping AIO deploy." 10 70
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] HOST_MGT_IP not available. Skipping."
-            return 0
-        fi
-    fi
-
     # Locate virt_deploy_uvp_centos.sh
     local DP_SCRIPT_PATH_CANDIDATES=()
     [ -n "${DP_SCRIPT_PATH:-}" ] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
@@ -4791,9 +4464,14 @@ step_09_aio_deploy() {
     done
 
     if [ -z "${DP_SCRIPT_PATH}" ]; then
-        whiptail_msgbox "STEP 09 - AIO deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 08 (download script/image) first.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] virt_deploy_uvp_centos.sh not found. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] virt_deploy_uvp_centos.sh not found, but continuing in DRY_RUN mode"
+            DP_SCRIPT_PATH="./virt_deploy_uvp_centos.sh"  # Use placeholder for dry run
+        else
+            whiptail_msgbox "STEP 09 - AIO deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 08 (download script/image) first.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] virt_deploy_uvp_centos.sh not found. Skipping."
+            return 0
+        fi
     fi
 
     # Check AIO image presence → if missing set nodownload=false
@@ -4807,23 +4485,42 @@ step_09_aio_deploy() {
 
     # Ensure AIO LV is mounted on /stellar/aio
     if ! mount | grep -q "on ${AIO_INSTALL_DIR} "; then
-        whiptail_msgbox "STEP 09 - AIO deploy" "${AIO_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] ${AIO_INSTALL_DIR} not mounted. Skipping."
-        return 0
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] ${AIO_INSTALL_DIR} is not mounted, but continuing in DRY_RUN mode"
+        else
+            whiptail_msgbox "STEP 09 - AIO deploy" "${AIO_INSTALL_DIR} is not mounted.\nComplete STEP 07 (LVM) and fstab setup, then rerun.\nSkipping this step." 14 80
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] ${AIO_INSTALL_DIR} not mounted. Skipping."
+            return 0
+        fi
     fi
 
     # AIO OTP: use from config or prompt/save once
     local _AIO_OTP="${AIO_OTP:-}"
     if [ -z "${_AIO_OTP}" ]; then
-        _AIO_OTP="$(whiptail_passwordbox "STEP 09 - AIO deploy" "Enter OTP for AIO (issued from Stellar Cyber)." "")"
-        if [ $? -ne 0 ] || [ -z "${_AIO_OTP}" ]; then
-            whiptail_msgbox "STEP 09 - AIO deploy" "No OTP provided. Skipping AIO deploy." 10 70
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO_OTP not provided. Skipping."
-            return 0
+        # Always prompt for OTP (both dry run and actual mode)
+        local otp_prompt_msg="Enter OTP for AIO (issued from Stellar Cyber)."
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+            otp_prompt_msg="Enter OTP for AIO (issued from Stellar Cyber).\n\n(DRY-RUN mode: You can skip this, but OTP will be required for actual deployment.)"
         fi
-        AIO_OTP="${_AIO_OTP}"
-        if type save_config >/dev/null 2>&1; then
-            save_config
+        _AIO_OTP="$(whiptail_passwordbox "STEP 09 - AIO deploy" "${otp_prompt_msg}" "")"
+        if [ $? -ne 0 ] || [ -z "${_AIO_OTP}" ]; then
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] AIO_OTP not provided, but continuing in DRY_RUN mode with placeholder"
+                _AIO_OTP="dry-run-otp"  # Use placeholder for dry run
+            else
+                whiptail_msgbox "STEP 09 - AIO deploy" "No OTP provided. Skipping AIO deploy." 10 70
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] AIO_OTP not provided. Skipping."
+                return 0
+            fi
+        else
+            # User provided OTP - save it
+            AIO_OTP="${_AIO_OTP}"
+            if [[ "${_DRY_RUN}" -eq 1 ]]; then
+                log "[DRY-RUN] AIO_OTP provided by user (will be used in dry run command)"
+            fi
+            if type save_config >/dev/null 2>&1; then
+                save_config
+            fi
         fi
     fi
 
@@ -4859,9 +4556,58 @@ step_09_aio_deploy() {
     ############################################################
     # Prompt for AIO VM configuration (memory, vCPU, disk)
     ############################################################
+    # Calculate default values based on system resources
+    # Memory allocation: 12GB reserved for KVM host, remaining 70% for AIO
+    local total_cpus total_mem_kb total_mem_gb available_mem_gb
+    total_cpus=$(nproc)
+    total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    total_mem_gb=$((total_mem_kb / 1024 / 1024))
+    # Reserve 12GB for KVM host
+    available_mem_gb=$((total_mem_gb - 12))
+    [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
+    
+    # Check NUMA configuration for AIO vCPU default calculation
+    # AIO default: All NUMA0 vCPUs
+    local numa_nodes=1
+    local node0_cpus="" node0_count=0
+    if command -v lscpu >/dev/null 2>&1; then
+      numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
+      if [[ "${numa_nodes}" -ge 2 ]]; then
+        # Extract NUMA node0 CPU list
+        node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
+        # Count CPUs in NUMA node0
+        if [[ -n "${node0_cpus}" ]]; then
+          node0_count=$(echo "${node0_cpus}" | tr ',' '\n' | wc -l)
+        fi
+      fi
+    fi
+    
+    # Default memory: 70% of available memory (after 12GB host reserve) for AIO
+    local default_aio_mem_gb=$((available_mem_gb * 70 / 100))
+    [[ ${default_aio_mem_gb} -lt 8 ]] && default_aio_mem_gb=8
+    
+    # Default vCPU: All NUMA0 CPUs (if NUMA0 detected)
+    # This ensures AIO gets all CPUs from NUMA0
+    local default_aio_vcpus
+    if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
+      # Allocate all NUMA0 CPUs to AIO
+      default_aio_vcpus=${node0_count}
+    else
+      # NUMA detection failed: Use half of total CPUs as fallback
+      default_aio_vcpus=$((total_cpus / 2))
+      [[ ${default_aio_vcpus} -lt 2 ]] && default_aio_vcpus=2
+    fi
+    
+    local default_aio_disk_gb=500
+    
+    # Use existing values if set, otherwise use calculated defaults
+    : "${AIO_MEMORY_GB:=${default_aio_mem_gb}}"
+    : "${AIO_VCPUS:=${default_aio_vcpus}}"
+    : "${AIO_DISK_GB:=${default_aio_disk_gb}}"
+    
     # 1) Memory
     local _AIO_MEM_INPUT
-    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nCurrent default: ${AIO_MEMORY_GB} GB" "${AIO_MEMORY_GB}" 12 70)"
+    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% of available)\nExample: Enter 136" "${AIO_MEMORY_GB}" 13 80)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_MEM_INPUT}" ]; then
         if [[ "${_AIO_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_MEM_INPUT}" -gt 0 ]; then
@@ -4869,11 +4615,20 @@ step_09_aio_deploy() {
         else
             whiptail_msgbox "STEP 09 - AIO memory" "Invalid memory value.\nUsing current default (${AIO_MEMORY_GB} GB)." 10 70
         fi
+    else
+        # User canceled or empty input - use default
+        AIO_MEMORY_GB="${default_aio_mem_gb}"
     fi
 
     # 2) vCPU
+    local aio_vcpu_msg
+    if [[ "${numa_nodes}" -ge 2 && ${node0_count} -gt 0 ]]; then
+      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nNUMA0 CPUs: ${node0_count}\nDefault value: ${default_aio_vcpus} (all NUMA0 CPUs)\nExample: Enter 46"
+    else
+      aio_vcpu_msg="Enter number of vCPUs for AIO VM.\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_aio_vcpus} (half of total CPUs)\nExample: Enter 46"
+    fi
     local _AIO_VCPU_INPUT
-    _AIO_VCPU_INPUT="$(whiptail_inputbox "STEP 09 - AIO vCPU" "Enter number of vCPUs for AIO VM.\n\nCurrent default: ${AIO_VCPUS}" "${AIO_VCPUS}" 12 70)"
+    _AIO_VCPU_INPUT="$(whiptail_inputbox "STEP 09 - AIO vCPU" "${aio_vcpu_msg}" "${AIO_VCPUS}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_VCPU_INPUT}" ]; then
         if [[ "${_AIO_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_VCPU_INPUT}" -gt 0 ]; then
@@ -4881,18 +4636,28 @@ step_09_aio_deploy() {
         else
             whiptail_msgbox "STEP 09 - AIO vCPU" "Invalid vCPU value.\nUsing current default (${AIO_VCPUS})." 10 70
         fi
+    else
+        # User canceled or empty input - use default
+        AIO_VCPUS="${default_aio_vcpus}"
     fi
 
     # 3) Disk size
     local _AIO_DISK_INPUT
-    _AIO_DISK_INPUT="$(whiptail_inputbox "STEP 09 - AIO disk" "Enter disk size (GB) for AIO VM.\n\nCurrent default: ${AIO_DISK_GB} GB" "${AIO_DISK_GB}" 12 70)"
+    _AIO_DISK_INPUT="$(whiptail_inputbox "STEP 09 - AIO disk" "Enter disk size (GB) for AIO VM.\n\nMinimum size: 100GB\nDefault value: ${default_aio_disk_gb}GB\nExample: Enter 500" "${AIO_DISK_GB}" 12 70)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_DISK_INPUT}" ]; then
         if [[ "${_AIO_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_DISK_INPUT}" -gt 0 ]; then
-            AIO_DISK_GB="${_AIO_DISK_INPUT}"
+            if [[ "${_AIO_DISK_INPUT}" -lt 100 ]]; then
+                whiptail_msgbox "STEP 09 - AIO disk" "Minimum disk size is 100GB.\nUsing current default (${AIO_DISK_GB} GB)." 10 70
+            else
+                AIO_DISK_GB="${_AIO_DISK_INPUT}"
+            fi
         else
             whiptail_msgbox "STEP 09 - AIO disk" "Invalid disk size value.\nUsing current default (${AIO_DISK_GB} GB)." 10 70
         fi
+    else
+        # User canceled or empty input - use default
+        AIO_DISK_GB="${default_aio_disk_gb}"
     fi
 
     if type save_config >/dev/null 2>&1; then
@@ -4903,12 +4668,13 @@ step_09_aio_deploy() {
     local AIO_MEMORY_MB=$(( AIO_MEMORY_GB * 1024 ))
 
     # Build command to run virt_deploy_uvp_centos.sh
+    # Note: --local-ip is set to same as --ip (VM IP) for AIO deployment
     local CMD
     CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
 --hostname=${AIO_HOSTNAME} \
 --cluster-size=${AIO_CLUSTERSIZE} \
 --release=${_DP_VERSION} \
---local-ip=${HOST_MGT_IP} \
+--local-ip=${AIO_IP} \
 --node-role=AIO \
 --bridge=${AIO_BRIDGE} \
 --CPUS=${AIO_VCPUS} \
@@ -4929,7 +4695,6 @@ step_09_aio_deploy() {
   Hostname      : ${AIO_HOSTNAME}
   Cluster size  : ${AIO_CLUSTERSIZE}
   DP version    : ${_DP_VERSION}
-  Host MGT IP   : ${HOST_MGT_IP}
   Bridge        : ${AIO_BRIDGE}
   vCPU          : ${AIO_VCPUS}
   Memory        : ${AIO_MEMORY_GB} GB (${AIO_MEMORY_MB} MB)
@@ -5069,16 +4834,73 @@ step_10_sensor_lv_download() {
   log "[STEP 10] This step will create sensor logical volume and download sensor image/script."
   load_config
 
-  # Use user configuration (use STEP01 Total/distribution values)
+  # LV location configuration
   : "${LV_LOCATION:=ubuntu-vg}"
-  : "${SENSOR_VM_COUNT:=1}"  # Fixed to 1 for single mds deployment
-  : "${SENSOR_TOTAL_LV_SIZE_GB:=${SENSOR_TOTAL_LV_SIZE_GB:-${LV_SIZE_GB:-200}}}"
-  : "${SENSOR_LV_SIZE_GB_PER_VM:=$((SENSOR_TOTAL_LV_SIZE_GB / SENSOR_VM_COUNT))}"
+  SENSOR_VM_COUNT=1  # Fixed to 1 for single mds deployment
+  save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
-  # Legacy compatible: LV_SIZE_GB is redefined as "Per VM"
-  LV_SIZE_GB="${SENSOR_LV_SIZE_GB_PER_VM}"
+  #######################################
+  # Prompt for Sensor LV size configuration
+  #######################################
+  # Check total size of ubuntu-vg (OpenXDR method)
+  local ubuntu_vg_total_size
+  ubuntu_vg_total_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
 
-  log "[STEP 10] User configuration - LV location: ${LV_LOCATION}, Total: ${SENSOR_TOTAL_LV_SIZE_GB}GB, Per VM: ${SENSOR_LV_SIZE_GB_PER_VM}GB (VM=${SENSOR_VM_COUNT})"
+  # Check ubuntu-lv usage size
+  local ubuntu_lv_size ubuntu_lv_gb=0
+  if command -v lvs >/dev/null 2>&1; then
+    ubuntu_lv_size=$(lvs ubuntu-vg/ubuntu-lv --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
+    ubuntu_lv_gb=${ubuntu_lv_size%.*}
+  fi
+
+  # ubuntu-vg convert total size to integer
+  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
+  
+  # Available space calculate
+  local available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
+  [[ ${available_gb} -lt 0 ]] && available_gb=0
+  
+  # Default LV size
+  local default_sensor_disk_gb=200
+  
+  # Prompt for LV size
+  local lv_size_gb
+  while true; do
+    lv_size_gb=$(whiptail_inputbox "STEP 10 - Sensor (MDS) Storage Size Configuration" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
+                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
+                         18 80) || {
+      log "User canceled sensor storage size configuration."
+      return 1
+    }
+
+    lv_size_gb=$(echo "${lv_size_gb}" | tr -d ' ')
+
+    # Number validation
+    if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
+      whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
+      continue
+    fi
+
+    # Minimum size validation (80GB)
+    if [[ "${lv_size_gb}" -lt 80 ]]; then
+      whiptail_msgbox "Insufficient Size" "Minimum 80GB must be greater than or equal to.\nInput value: ${lv_size_gb}GB"
+      continue
+    fi
+
+    break
+  done
+
+  SENSOR_LV_SIZE_GB_PER_VM="${lv_size_gb}"
+  SENSOR_TOTAL_LV_SIZE_GB="${lv_size_gb}"
+  LV_SIZE_GB="${lv_size_gb}"
+
+  log "[STEP 10] Configured LV location: ${LV_LOCATION}"
+  log "[STEP 10] Configured LV size: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
+
+  save_config_var "SENSOR_TOTAL_LV_SIZE_GB" "${SENSOR_TOTAL_LV_SIZE_GB}"
+  save_config_var "SENSOR_LV_SIZE_GB_PER_VM" "${SENSOR_LV_SIZE_GB_PER_VM}"
+  save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
 
   local tmp_status="/tmp/xdr_step09_status.txt"
 
@@ -5508,22 +5330,178 @@ step_11_sensor_deploy() {
   fi
 
   #######################################
-  # 2) Sensor VM deployment (mds single)
+  # 2) Prompt for Sensor VM configuration (memory, vCPU, disk)
+  #######################################
+  # Calculate default values based on system resources
+  # Memory allocation: 12GB reserved for KVM host, remaining 30% for Sensor
+  local total_cpus total_mem_kb total_mem_gb available_mem_gb
+  total_cpus=$(nproc)
+  total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  total_mem_gb=$((total_mem_kb / 1024 / 1024))
+  # Reserve 12GB for KVM host
+  available_mem_gb=$((total_mem_gb - 12))
+  [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
+  
+  # Check NUMA configuration for Sensor vCPU default calculation
+  # Sensor default: NUMA1 vCPUs minus 4 (4 CPUs reserved for host)
+  local numa_nodes=1
+  local node1_cpus="" node1_count=0
+  if command -v lscpu >/dev/null 2>&1; then
+    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
+    if [[ "${numa_nodes}" -ge 2 ]]; then
+      # Extract NUMA node1 CPU list
+      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
+      # Count CPUs in NUMA node1
+      if [[ -n "${node1_cpus}" ]]; then
+        node1_count=$(echo "${node1_cpus}" | tr ',' '\n' | wc -l)
+      fi
+    fi
+  fi
+  
+  # Default memory: 30% of available memory (after 12GB host reserve) for Sensor
+  local default_sensor_mem_gb=$((available_mem_gb * 30 / 100))
+  [[ ${default_sensor_mem_gb} -lt 8 ]] && default_sensor_mem_gb=8
+  
+  # Default vCPU: NUMA1 CPUs minus 4 (4 CPUs reserved for host)
+  # This ensures Sensor gets NUMA1 CPUs except 4 reserved for host
+  local default_sensor_vcpus
+  if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
+    # Allocate NUMA1 CPUs minus 4 (4 CPUs reserved for host)
+    default_sensor_vcpus=$((node1_count - 4))
+    [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
+  else
+    # NUMA detection failed: Total CPUs minus 4 as fallback
+    default_sensor_vcpus=$((total_cpus - 4))
+    [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
+  fi
+  
+  local default_sensor_disk_gb=200
+  
+  # Use existing values if set, otherwise use calculated defaults
+  : "${SENSOR_MEMORY_MB:=}"
+  : "${SENSOR_VCPUS:=}"
+  : "${SENSOR_LV_SIZE_GB_PER_VM:=}"
+  
+  # Convert existing memory from MB to GB if set
+  local sensor_mem_gb
+  if [[ -n "${SENSOR_MEMORY_MB}" ]]; then
+    sensor_mem_gb=$((SENSOR_MEMORY_MB / 1024))
+  else
+    sensor_mem_gb="${default_sensor_mem_gb}"
+  fi
+  
+  # 1) Memory
+  local _SENSOR_MEM_INPUT
+  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% of available)\nExample: Enter 32" "${sensor_mem_gb}" 13 80)"
+
+  if [ $? -eq 0 ] && [ -n "${_SENSOR_MEM_INPUT}" ]; then
+    if [[ "${_SENSOR_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_MEM_INPUT}" -gt 0 ]; then
+      sensor_mem_gb="${_SENSOR_MEM_INPUT}"
+    else
+      whiptail_msgbox "STEP 11 - Sensor memory" "Invalid memory value.\nUsing current default (${sensor_mem_gb} GB)." 10 70
+    fi
+  else
+    # User canceled or empty input - use default
+    sensor_mem_gb="${default_sensor_mem_gb}"
+  fi
+
+  # 2) vCPU
+  local vcpu_default_msg
+  if [[ "${numa_nodes}" -ge 2 && ${node1_count} -gt 0 ]]; then
+    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nNUMA1 CPUs: ${node1_count}\nDefault value: ${default_sensor_vcpus} (NUMA1 CPUs - 4)\nExample: Enter 22"
+  else
+    vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_sensor_vcpus} (total CPUs - 4)\nExample: Enter 22"
+  fi
+  local _SENSOR_VCPU_INPUT
+  _SENSOR_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) vCPU" "${vcpu_default_msg}" "${SENSOR_VCPUS:-${default_sensor_vcpus}}" 12 70)"
+
+  local sensor_vcpus
+  if [ $? -eq 0 ] && [ -n "${_SENSOR_VCPU_INPUT}" ]; then
+    if [[ "${_SENSOR_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_VCPU_INPUT}" -gt 0 ]; then
+      sensor_vcpus="${_SENSOR_VCPU_INPUT}"
+    else
+      whiptail_msgbox "STEP 11 - Sensor vCPU" "Invalid vCPU value.\nUsing current default (${default_sensor_vcpus})." 10 70
+      sensor_vcpus="${default_sensor_vcpus}"
+    fi
+  else
+    # User canceled or empty input - use default
+    sensor_vcpus="${default_sensor_vcpus}"
+  fi
+
+  # 3) Disk size
+  local _SENSOR_DISK_INPUT
+  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter 200" "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" 12 70)"
+
+  local sensor_disk_gb
+  if [ $? -eq 0 ] && [ -n "${_SENSOR_DISK_INPUT}" ]; then
+    if [[ "${_SENSOR_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_DISK_INPUT}" -gt 0 ]; then
+      if [[ "${_SENSOR_DISK_INPUT}" -lt 80 ]]; then
+        whiptail_msgbox "STEP 11 - Sensor disk" "Minimum disk size is 80GB.\nUsing current default (${default_sensor_disk_gb} GB)." 10 70
+        sensor_disk_gb="${default_sensor_disk_gb}"
+      else
+        sensor_disk_gb="${_SENSOR_DISK_INPUT}"
+      fi
+    else
+      whiptail_msgbox "STEP 11 - Sensor disk" "Invalid disk size value.\nUsing current default (${default_sensor_disk_gb} GB)." 10 70
+      sensor_disk_gb="${default_sensor_disk_gb}"
+    fi
+  else
+    # User canceled or empty input - use default
+    sensor_disk_gb="${default_sensor_disk_gb}"
+  fi
+
+  # Convert memory to MB
+  local mem_mds=$(( sensor_mem_gb * 1024 ))
+  local cpus_mds="${sensor_vcpus}"
+  local disksize="${sensor_disk_gb}"
+
+  # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
+  local numa_nodes=1
+  local node1_cpus=""
+  if command -v lscpu >/dev/null 2>&1; then
+    numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
+    if [[ "${numa_nodes}" -ge 2 ]]; then
+      # Extract NUMA node1 CPU list
+      node1_cpus=$(lscpu | grep "NUMA node1 CPU(s):" | sed 's/NUMA node1 CPU(s)://' | tr -d '[:space:]')
+    fi
+  fi
+
+  local sensor_cpuset_mds
+  if [[ "${numa_nodes}" -ge 2 && -n "${node1_cpus}" ]]; then
+    log "[STEP 11] NUMA node(${numa_nodes}) Detected. Setting CPU Pinning for mds on NUMA1."
+    # Cut the list according to the number of vCPUs entered by the user (allocate from the front)
+    sensor_cpuset_mds=$(echo "${node1_cpus}" | cut -d',' -f1-"${sensor_vcpus}")
+    log "  -> MDS (Node1): ${sensor_cpuset_mds}"
+  else
+    log "[STEP 11] NUMA detection failed. Using sequential allocation."
+    sensor_cpuset_mds="0-$((sensor_vcpus-1))"
+  fi
+
+  # Save configuration
+  SENSOR_MEMORY_MB="${mem_mds}"
+  SENSOR_MEMORY_MB_PER_VM="${mem_mds}"
+  SENSOR_TOTAL_MEMORY_MB="${mem_mds}"
+  SENSOR_VCPUS="${cpus_mds}"
+  SENSOR_VCPUS_PER_VM="${cpus_mds}"
+  SENSOR_TOTAL_VCPUS="${cpus_mds}"
+  SENSOR_CPUSET_MDS="${sensor_cpuset_mds}"
+  SENSOR_LV_SIZE_GB_PER_VM="${sensor_disk_gb}"
+  SENSOR_TOTAL_LV_SIZE_GB="${sensor_disk_gb}"
+  LV_SIZE_GB="${sensor_disk_gb}"
+
+  log "Configured sensor vCPU: ${SENSOR_VCPUS} (mds cpuset=${SENSOR_CPUSET_MDS})"
+
+  if type save_config >/dev/null 2>&1; then
+    save_config
+  fi
+
+  #######################################
+  # 3) Sensor VM deployment (mds single)
   #######################################
   log "[STEP 11] Starting sensor VM deployment for mds"
 
   local release="${SENSOR_VERSION}"
   local nodownload="1"
-
-  # Get vCPU and memory for mds (from STEP 01 configuration)
-  local cpus_mds="${SENSOR_VCPUS_PER_VM:-${SENSOR_VCPUS}}"
-  local mem_mds="${SENSOR_MEMORY_MB_PER_VM:-${SENSOR_MEMORY_MB}}"
-
-  # Extract disk size number only (script internally adds G suffix)
-  local disk_raw="${SENSOR_LV_SIZE_GB_PER_VM:-${SENSOR_LV_SIZE_GB:-500}}"
-  local disk_num=$(echo "${disk_raw}" | tr -cd '0-9')
-  [[ -z "${disk_num}" ]] && disk_num=100
-  local disksize="${disk_num}"
 
   # common environment variables
   export disksize="${disksize}"
@@ -5915,29 +5893,67 @@ EOF
                     cpuset_for_vm="${node1_cpus}"
                 else
                     log "[WARN] ${SENSOR_VM}: Cannot retrieve NUMA node1 CPU list, cannot apply Affinity."
-                        cpuset_for_vm=""
+                    cpuset_for_vm=""
                 fi
             fi
 
             if [[ -z "${cpuset_for_vm}" ]]; then
                 log "[WARN] ${SENSOR_VM}: Per VM CPUSET is empty, so skip Affinity"
             else
-                log "[ACTION] ${SENSOR_VM}: CPU Affinity configuration (cpuset=${cpuset_for_vm})"
-                if [[ "${_DRY}" -eq 0 ]]; then
-                    virsh emulatorpin "${SENSOR_VM}" "${cpuset_for_vm}" --config >/dev/null 2>&1 || true
+                # Convert cpuset string to array (e.g., "48,49,50" -> array with 48, 49, 50)
+                local cpu_arr=()
+                local c
+                for c in $(echo "${cpuset_for_vm}" | tr ',' ' '); do
+                    cpu_arr+=("${c}")
+                done
 
+                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
+                    log "[WARN] ${SENSOR_VM}: CPU array is empty, so skip Affinity"
+                else
+                    log "[ACTION] ${SENSOR_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_vm})"
+                    
+                    # Get maximum vCPU count
                     local max_vcpus
                     max_vcpus="$(virsh vcpucount "${SENSOR_VM}" --maximum --config 2>/dev/null || echo 0)"
-                    for (( i=0; i<max_vcpus; i++ )); do
-                        virsh vcpupin "${SENSOR_VM}" "${i}" "${cpuset_for_vm}" --config >/dev/null 2>&1 || true
-                    done
-                else
-                    log "[DRY-RUN] ${SENSOR_VM}: emulatorpin / vcpupin cpuset=${cpuset_for_vm} (not executed)"
-                fi
+                    max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
+                    [[ -z "${max_vcpus}" ]] && max_vcpus="0"
+
+                    if [[ "${max_vcpus}" -eq 0 ]]; then
+                        log "[WARN] ${SENSOR_VM}: Unable to determine vCPU count → skipping CPU Affinity"
+                    else
+                        # Limit vCPU count to available CPUs
+                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
+                            log "[WARN] ${SENSOR_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
+                            max_vcpus="${#cpu_arr[@]}"
+                        fi
+
+                        # Set emulatorpin to all CPUs in the list (for emulator thread)
+                        local emulator_cpuset
+                        emulator_cpuset=$(echo "${cpuset_for_vm}" | tr ' ' ',')
+                        if [[ "${_DRY}" -eq 0 ]]; then
+                            virsh emulatorpin "${SENSOR_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
+                            
+                            # Pin each vCPU to individual pCPU
+                            local i
+                            for (( i=0; i<max_vcpus; i++ )); do
+                                local pcpu="${cpu_arr[$i]}"
+                                if virsh vcpupin "${SENSOR_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+                                    log "[STEP 12] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+                                else
+                                    log "[WARN] ${SENSOR_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+                                fi
+                            done
+                        else
+                            log "[DRY-RUN] ${SENSOR_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
+                            for (( i=0; i<max_vcpus; i++ )); do
+                                local pcpu="${cpu_arr[$i]}"
+                                log "[DRY-RUN] ${SENSOR_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
+                            done
+                        fi
+                    fi
             fi
-        else
-            log "[STEP 12] ${SENSOR_VM}: Single NUMA node environment → skip CPU Affinity."
         fi
+    fi
 
         #######################################################################
         # 4.5 Safe restart to apply configuration
@@ -5988,8 +6004,6 @@ EOF
                         echo "     - CPU set: ${actual_cpuset}"
                     fi
                     echo "     - Emulator pinning would be configured"
-                else
-                    echo "     - Single NUMA node environment → CPU affinity would be skipped"
                 fi
                 echo
                 echo "  3. VM Restart:"
@@ -6027,8 +6041,6 @@ EOF
                     else
                         echo "  • ⚠️  CPU affinity not configured (NUMA1 CPU detection failed)"
                     fi
-                else
-                    echo "  • Single NUMA node environment → CPU affinity skipped"
                 fi
             fi
             echo
@@ -6055,12 +6067,15 @@ EOF
         local AIO_VM="aio"
         
         # Check AIO VM existence
+        local actual_cpuset_aio=""
+        local cpuset_for_aio=""
+        
         if ! virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
             log "[STEP 12] WARNING: AIO VM(${AIO_VM}) not found. Skip CPU affinity configuration."
         else
             log "[STEP 12] ${AIO_VM}: CPU Affinity application start"
             
-            local cpuset_for_aio="${AIO_CPUSET:-}"
+            cpuset_for_aio="${AIO_CPUSET:-}"
             
             if [[ -z "${cpuset_for_aio}" ]]; then
                 # Extract NUMA node0 CPU list for aio
@@ -6077,216 +6092,751 @@ EOF
             if [[ -z "${cpuset_for_aio}" ]]; then
                 log "[WARN] ${AIO_VM}: CPUSET is empty, so skip Affinity"
             else
-                log "[ACTION] ${AIO_VM}: CPU Affinity configuration (cpuset=${cpuset_for_aio})"
-                
-                # Safely stop if VM is running (for CPU affinity configuration)
-                if virsh list --name | grep -q "^${AIO_VM}$"; then
-                    log "[STEP 12] ${AIO_VM}: Running → shutdown"
-                    virsh shutdown "${AIO_VM}" >/dev/null 2>&1 || true
+                # Convert cpuset string to array (e.g., "0,2,4,6" -> array with 0, 2, 4, 6)
+                local cpu_arr=()
+                local c
+                for c in $(echo "${cpuset_for_aio}" | tr ',' ' '); do
+                    cpu_arr+=("${c}")
+                done
+
+                if [[ "${#cpu_arr[@]}" -eq 0 ]]; then
+                    log "[WARN] ${AIO_VM}: CPU array is empty, so skip Affinity"
+                else
+                    log "[ACTION] ${AIO_VM}: CPU Affinity configuration (CPU list: ${cpuset_for_aio})"
                     
-                    local t=0
-                    while virsh list --name | grep -q "^${AIO_VM}$"; do
-                        sleep 2
-                        t=$((t+2))
-                        if [[ $t -ge 120 ]]; then
-                            log "[WARN] ${AIO_VM}: shutdown timeout → destroy"
-                            virsh destroy "${AIO_VM}" >/dev/null 2>&1 || true
-                            break
-                        fi
-                    done
-                fi
-                
-                if [[ "${_DRY}" -eq 0 ]]; then
-                    virsh emulatorpin "${AIO_VM}" "${cpuset_for_aio}" --config >/dev/null 2>&1 || true
+                    # Safely stop if VM is running (for CPU affinity configuration)
+                    if virsh list --name | grep -q "^${AIO_VM}$"; then
+                        log "[STEP 12] ${AIO_VM}: Running → shutdown"
+                        virsh shutdown "${AIO_VM}" >/dev/null 2>&1 || true
+                        
+                        local t=0
+                        while virsh list --name | grep -q "^${AIO_VM}$"; do
+                            sleep 2
+                            t=$((t+2))
+                            if [[ $t -ge 120 ]]; then
+                                log "[WARN] ${AIO_VM}: shutdown timeout → destroy"
+                                virsh destroy "${AIO_VM}" >/dev/null 2>&1 || true
+                                break
+                            fi
+                        done
+                    fi
                     
+                    # Get maximum vCPU count
                     local max_vcpus
                     max_vcpus="$(virsh vcpucount "${AIO_VM}" --maximum --config 2>/dev/null || echo 0)"
                     max_vcpus=$(echo "${max_vcpus}" | tr -d '\n\r' | grep -o '[0-9]*' | head -1)
                     [[ -z "${max_vcpus}" ]] && max_vcpus="0"
-                    
-                    for (( i=0; i<max_vcpus; i++ )); do
-                        virsh vcpupin "${AIO_VM}" "${i}" "${cpuset_for_aio}" --config >/dev/null 2>&1 || true
-                    done
-                    log "[STEP 12] ${AIO_VM}: CPU Affinity applied to NUMA0 (cpuset=${cpuset_for_aio})"
-                else
-                    log "[DRY-RUN] ${AIO_VM}: emulatorpin / vcpupin cpuset=${cpuset_for_aio} (not executed)"
-                fi
-                
-                # Safe restart to apply configuration
-                restart_vm_safely "${AIO_VM}"
-                
-                # Get actual CPU affinity setting for display
-                local actual_cpuset_aio=""
-                actual_cpuset_aio=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
-                if [[ -z "${actual_cpuset_aio}" ]]; then
-                    actual_cpuset_aio="${cpuset_for_aio}"
+
+                    if [[ "${max_vcpus}" -eq 0 ]]; then
+                        log "[WARN] ${AIO_VM}: Unable to determine vCPU count → skipping CPU Affinity"
+                    else
+                        # Limit vCPU count to available CPUs
+                        if [[ "${#cpu_arr[@]}" -lt "${max_vcpus}" ]]; then
+                            log "[WARN] ${AIO_VM}: CPU list count(${#cpu_arr[@]}) is less than maximum vCPU(${max_vcpus}). Limiting to ${#cpu_arr[@]} vCPUs."
+                            max_vcpus="${#cpu_arr[@]}"
+                        fi
+
+                        # Set emulatorpin to all CPUs in the list (for emulator thread)
+                        local emulator_cpuset
+                        emulator_cpuset=$(echo "${cpuset_for_aio}" | tr ' ' ',')
+                        if [[ "${_DRY}" -eq 0 ]]; then
+                            virsh emulatorpin "${AIO_VM}" "${emulator_cpuset}" --config >/dev/null 2>&1 || true
+                            
+                            # Pin each vCPU to individual pCPU
+                            local i
+                            for (( i=0; i<max_vcpus; i++ )); do
+                                local pcpu="${cpu_arr[$i]}"
+                                if virsh vcpupin "${AIO_VM}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+                                    log "[STEP 12] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+                                else
+                                    log "[WARN] ${AIO_VM}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+                                fi
+                            done
+                            log "[STEP 12] ${AIO_VM}: CPU Affinity applied to NUMA0 (CPU list: ${cpuset_for_aio})"
+                            
+                            # Get actual CPU affinity setting for display
+                            actual_cpuset_aio=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
+                            if [[ -z "${actual_cpuset_aio}" ]]; then
+                                actual_cpuset_aio="${emulator_cpuset}"
+                            fi
+                            
+                            # Save AIO_CPUSET to configuration
+                            AIO_CPUSET="${cpuset_for_aio}"
+                            if type save_config >/dev/null 2>&1; then
+                                save_config
+                            fi
+                        else
+                            log "[DRY-RUN] ${AIO_VM}: emulatorpin cpuset=${emulator_cpuset} (not executed)"
+                            for (( i=0; i<max_vcpus; i++ )); do
+                                local pcpu="${cpu_arr[$i]}"
+                                log "[DRY-RUN] ${AIO_VM}: vcpupin ${i} ${pcpu} --config (not executed)"
+                            done
+                            actual_cpuset_aio="${emulator_cpuset}"
+                        fi
+                        
+                        # Safe restart to apply configuration
+                        restart_vm_safely "${AIO_VM}"
+                    fi
                 fi
             fi
         fi
         
-        #######################################################################
-        # AIO data disk (LV) attach (vg_aio/lv_aio → vdb, --config)
-        #######################################################################
-        local DATA_LV="/dev/mapper/vg_aio-lv_aio"
-        local data_disk_attached=0
-        local data_disk_status=""
+        log "[STEP 12] ----- AIO VM CPU Affinity processing completed: aio -----"
+    fi
+    
+    #######################################################################
+    # AIO data disk (LV) attach (vg_aio/lv_aio → vdb, --config)
+    # This is done regardless of NUMA configuration
+    #######################################################################
+    local AIO_VM="aio"
+    local DATA_LV="/dev/mapper/vg_aio-lv_aio"
+    local data_disk_attached=0
+    local data_disk_status=""
+    
+    # Helper function to extract and normalize vdb source from VM XML
+    get_vdb_source() {
+        local vm_name="$1"
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
         
-        if [[ -e "${DATA_LV}" ]]; then
-            if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
-                if [[ "${_DRY}" -eq 1 ]]; then
-                    log "[DRY-RUN] virsh attach-disk ${AIO_VM} ${DATA_LV} vdb --config"
-                    data_disk_status="Would be attached"
+        if [[ -z "${vdb_xml}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Try multiple methods to extract source device
+        local source_dev=""
+        
+        # Method 1: Extract from source dev='...' pattern
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        
+        # Method 2: Extract from source file='...' pattern
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 3: Extract from any source= pattern (more flexible)
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source.*=" | sed -E "s/.*source[^=]*=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        # Method 4: Try with different quote styles
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source" | sed -E "s/.*source[^>]*>([^<]+)<.*/\1/" | head -1 || echo "")
+        fi
+        
+        echo "${source_dev}"
+    }
+    
+    # Helper function to normalize device paths for comparison
+    normalize_device_path() {
+        local path="$1"
+        if [[ -z "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # If path exists, resolve symlinks with readlink -f
+        if [[ -e "${path}" ]]; then
+            readlink -f "${path}" 2>/dev/null || echo "${path}"
+        else
+            echo "${path}"
+        fi
+    }
+    
+    # Helper function to get device major:minor numbers
+    get_device_majmin() {
+        local path="$1"
+        if [[ -z "${path}" ]] || [[ ! -e "${path}" ]]; then
+            echo ""
+            return
+        fi
+        
+        # Use stat to get major:minor (format: hex:hex or dec:dec)
+        stat -Lc '%t:%T' "${path}" 2>/dev/null || echo ""
+    }
+    
+    # Helper function to compare two device paths (handles /dev/mapper/... vs /dev/dm-*)
+    compare_device_paths() {
+        local path1="$1"
+        local path2="$2"
+        
+        if [[ -z "${path1}" ]] || [[ -z "${path2}" ]]; then
+            return 1
+        fi
+        
+        # Try readlink -f canonicalization first
+        local canonical1 canonical2
+        canonical1=$(readlink -f "${path1}" 2>/dev/null || echo "")
+        canonical2=$(readlink -f "${path2}" 2>/dev/null || echo "")
+        
+        # If both canonicalizations succeeded, compare them
+        if [[ -n "${canonical1}" ]] && [[ -n "${canonical2}" ]]; then
+            if [[ "${canonical1}" == "${canonical2}" ]]; then
+                return 0
+            fi
+        fi
+        
+        # Fallback: compare major:minor numbers
+        local majmin1 majmin2
+        majmin1=$(get_device_majmin "${path1}")
+        majmin2=$(get_device_majmin "${path2}")
+        
+        if [[ -n "${majmin1}" ]] && [[ -n "${majmin2}" ]] && [[ "${majmin1}" == "${majmin2}" ]]; then
+            return 0
+        fi
+        
+        # Last resort: string comparison (for non-existent paths or files)
+        if [[ "${path1}" == "${path2}" ]]; then
+            return 0
+        fi
+        
+        return 1
+    }
+    
+    # Helper function to check VM state (running or shutoff)
+    get_vm_state() {
+        local vm_name="$1"
+        local state
+        state=$(virsh domstate "${vm_name}" 2>/dev/null | head -1 || echo "")
+        echo "${state}"
+    }
+    
+    # Helper function to check if vdb is correctly attached (config/persistent check)
+    check_vdb_attached_config() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        local current_source
+        
+        # Use --inactive to check persistent config
+        local vdb_xml
+        vdb_xml=$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        
+        if [[ -z "${vdb_xml}" ]]; then
+            return 1  # vdb not found in config
+        fi
+        
+        # Extract source from config XML
+        local source_dev=""
+        source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        if [[ -z "${source_dev}" ]]; then
+            source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
+        fi
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Config matches
+        else
+            return 1  # Config does not match
+        fi
+    }
+    
+    # Helper function to check if vdb is correctly attached (live check)
+    check_vdb_attached_live() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        
+        # Use domblklist to check live state
+        local blklist_output
+        blklist_output=$(virsh domblklist "${vm_name}" --details 2>/dev/null || virsh domblklist "${vm_name}" 2>/dev/null || echo "")
+        
+        if [[ -z "${blklist_output}" ]]; then
+            return 1  # Cannot get live block list
+        fi
+        
+        # Check if vdb exists and points to expected LV
+        local vdb_line
+        vdb_line=$(echo "${blklist_output}" | grep -E "vdb\s+" || echo "")
+        
+        if [[ -z "${vdb_line}" ]]; then
+            return 1  # vdb not found in live state
+        fi
+        
+        # Extract source from domblklist output
+        local source_dev
+        source_dev=$(echo "${vdb_line}" | awk '{print $NF}' || echo "")
+        
+        if [[ -z "${source_dev}" ]]; then
+            return 1
+        fi
+        
+        # Use compare_device_paths to handle /dev/mapper/... vs /dev/dm-* cases
+        if compare_device_paths "${source_dev}" "${expected_lv}"; then
+            return 0  # Live matches
+        else
+            return 1  # Live does not match
+        fi
+    }
+    
+    # Helper function to check if vdb is correctly attached (backward compatible)
+    check_vdb_attached() {
+        local vm_name="$1"
+        local expected_lv="$2"
+        local current_source
+        
+        current_source=$(get_vdb_source "${vm_name}")
+        
+        if [[ -z "${current_source}" ]]; then
+            return 1  # vdb not found
+        fi
+        
+        # Normalize both paths for comparison
+        local normalized_current normalized_expected
+        normalized_current=$(normalize_device_path "${current_source}")
+        normalized_expected=$(normalize_device_path "${expected_lv}")
+        
+        local current_clean expected_clean
+        current_clean=$(echo "${normalized_current}" | tr -d '[:space:]' || echo "${normalized_current}")
+        expected_clean=$(echo "${normalized_expected}" | tr -d '[:space:]' || echo "${normalized_expected}")
+        
+        if [[ "${normalized_current}" == "${normalized_expected}" ]] || \
+           [[ "${current_source}" == "${expected_lv}" ]] || \
+           [[ "${current_clean}" == "${expected_clean}" ]]; then
+            return 0  # Correctly attached
+        else
+            return 1  # Different device attached
+        fi
+    }
+    
+    if [[ -e "${DATA_LV}" ]]; then
+        if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
+            if [[ "${_DRY}" -eq 1 ]]; then
+                log "[DRY-RUN] Check VM state and attach ${DATA_LV} as vdb to ${AIO_VM} (live+config or config-only)"
+                data_disk_status="Would be attached"
+                data_disk_attached=1
+            else
+                # Get VM state
+                local vm_state
+                vm_state=$(get_vm_state "${AIO_VM}")
+                local aio_running=0
+                if [[ "${vm_state}" == *"running"* ]]; then
+                    aio_running=1
+                fi
+                
+                log "[STEP 12] ${AIO_VM} state: ${vm_state}"
+                
+                # Check if vdb is already correctly attached (both config and live if running)
+                local config_ok=0 live_ok=0
+                if check_vdb_attached_config "${AIO_VM}" "${DATA_LV}"; then
+                    config_ok=1
+                fi
+                
+                if [[ ${aio_running} -eq 1 ]]; then
+                    if check_vdb_attached_live "${AIO_VM}" "${DATA_LV}"; then
+                        live_ok=1
+                    fi
                 else
-                    # Check if vdb exists and if it's the correct disk
-                    local vdb_exists=0
-                    local vdb_is_correct=0
-                    if virsh dumpxml "${AIO_VM}" | grep -q "target dev='vdb'"; then
-                        vdb_exists=1
-                        # Check if the vdb source matches our DATA_LV
-                        local vdb_source
-                        vdb_source=$(virsh dumpxml "${AIO_VM}" | grep -A 5 "target dev='vdb'" | grep -oP "source dev='\K[^']+" || echo "")
-                        if [[ "${vdb_source}" == "${DATA_LV}" ]]; then
-                            vdb_is_correct=1
-                            log "[STEP 12] ${AIO_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
-                            data_disk_attached=1
-                            data_disk_status="Already attached (correct disk)"
+                    # Shutoff state: live check not applicable
+                    live_ok=1
+                fi
+                
+                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=${live_ok}"
+                
+                # Determine if attachment is needed
+                local needs_attach=1
+                if [[ ${aio_running} -eq 1 ]]; then
+                    # Running: both config and live must be OK
+                    if [[ ${config_ok} -eq 1 ]] && [[ ${live_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                else
+                    # Shutoff: only config needs to be OK
+                    if [[ ${config_ok} -eq 1 ]]; then
+                        needs_attach=0
+                    fi
+                fi
+                
+                if [[ ${needs_attach} -eq 0 ]]; then
+                    log "[STEP 12] ${AIO_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
+                    data_disk_attached=1
+                    data_disk_status="Already attached"
+                else
+                    # Check if vdb exists but with different device
+                    local current_vdb_source
+                    current_vdb_source=$(get_vdb_source "${AIO_VM}")
+                    if [[ -n "${current_vdb_source}" ]]; then
+                        log "[STEP 12] ${AIO_VM} has vdb but it's not ${DATA_LV} (current: ${current_vdb_source})"
+                        log "[STEP 12] Will detach current vdb and attach ${DATA_LV} as vdb"
+                        
+                        # Detach existing vdb based on VM state
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            log "[STEP 12] Detaching vdb (live+config) from ${AIO_VM}..."
+                            virsh detach-disk "${AIO_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${AIO_VM}" vdb --config >/dev/null 2>&1 || true
                         else
-                            log "[STEP 12] ${AIO_VM} has vdb but it's not ${DATA_LV} (current: ${vdb_source:-<unknown>})"
-                            log "[STEP 12] Will attach ${DATA_LV} as vdb (this may replace existing vdb)"
+                            log "[STEP 12] Detaching vdb (config-only) from ${AIO_VM}..."
+                            virsh detach-disk "${AIO_VM}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        sleep 1
+                    fi
+                    
+                    # Attempt to attach the data disk
+                    local attach_mode=""
+                    local is_block_device=0
+                    local is_file=0
+                    
+                    # Detect device type
+                    if [[ -b "${DATA_LV}" ]]; then
+                        is_block_device=1
+                        log "[STEP 12] ${DATA_LV} is a block device, will use raw driver (no qcow2 subdriver)"
+                    elif [[ -f "${DATA_LV}" ]]; then
+                        is_file=1
+                        log "[STEP 12] ${DATA_LV} is a file"
+                    fi
+                    
+                    if [[ ${aio_running} -eq 1 ]]; then
+                        attach_mode="live+config"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${AIO_VM} (attach mode: ${attach_mode})..."
+                        
+                        # Try --persistent first (if supported)
+                        local attach_success=0
+                        local config_attach_success=0
+                        local attach_cmd=""
+                        
+                        # Build attach command based on device type
+                        if [[ ${is_block_device} -eq 1 ]]; then
+                            # Block device: use --subdriver raw (or omit subdriver, let libvirt auto-detect)
+                            attach_cmd="virsh attach-disk \"${AIO_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        else
+                            # File: use default (libvirt will detect format)
+                            attach_cmd="virsh attach-disk \"${AIO_VM}\" \"${DATA_LV}\" vdb --persistent"
+                        fi
+                        
+                        if eval "${attach_cmd}" >/dev/null 2>&1; then
+                            attach_success=1
+                            config_attach_success=1  # --persistent includes config
+                            log "[STEP 12] Attach with --persistent succeeded"
+                        else
+                            # Fallback: attach live first, then config
+                            log "[STEP 12] --persistent not available or failed, using live+config two-step"
+                            
+                            if [[ ${is_block_device} -eq 1 ]]; then
+                                # Block device: no subdriver specified (raw is default for block devices)
+                                if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            else
+                                # File: default behavior
+                                if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1; then
+                                    log "[STEP 12] Live attach succeeded"
+                                    if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded"
+                                    else
+                                        log "[WARN] Live attach succeeded but config attach failed"
+                                    fi
+                                else
+                                    log "[WARN] Live attach failed, trying config-only as fallback"
+                                    if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                                        attach_success=1
+                                        config_attach_success=1
+                                        log "[STEP 12] Config attach succeeded (live failed)"
+                                    fi
+                                fi
+                            fi
+                        fi
+                        
+                        if [[ ${attach_success} -eq 0 ]]; then
+                            log "[WARN] ${AIO_VM} data disk attach command failed, will verify actual status"
+                        fi
+                    else
+                        attach_mode="config-only"
+                        log "[STEP 12] Attaching ${DATA_LV} as vdb to ${AIO_VM} (attach mode: ${attach_mode})..."
+                        
+                        # For block devices, libvirt will auto-detect raw, no need to specify
+                        local config_attach_success=0
+                        if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                            config_attach_success=1
+                        else
+                            log "[WARN] ${AIO_VM} data disk attach command failed, will verify actual status"
                         fi
                     fi
                     
-                    if [[ "${vdb_is_correct}" -eq 0 ]]; then
-                        if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
-                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+                    # Verification with retry
+                    sleep 1
+                    local verification_passed=0
+                    local verify_count=0
+                    local max_verify_attempts=3
+                    local final_config_ok=0 final_live_ok=0
+                    
+                    while [[ ${verify_count} -lt ${max_verify_attempts} ]]; do
+                        verify_count=$((verify_count + 1))
+                        
+                        # Check config
+                        if check_vdb_attached_config "${AIO_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        else
+                            final_config_ok=0
+                        fi
+                        
+                        # Check live (only if running)
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${AIO_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            else
+                                final_live_ok=0
+                            fi
+                        else
+                            final_live_ok=1  # Not applicable for shutoff
+                        fi
+                        
+                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        
+                        # Determine success based on VM state
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is required
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                # If live is OK, check config with retry window (up to 5 seconds)
+                                if [[ ${final_config_ok} -eq 1 ]]; then
+                                    verification_passed=1
+                                    break
+                                elif [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                                    # Continue retrying for config
+                                    sleep 1
+                                    continue
+                                else
+                                    # After max attempts, if live is OK and config attach command succeeded, 
+                                    # treat as success (will be marked as "persistence pending" in final reporting)
+                                    if [[ ${config_attach_success} -eq 1 ]]; then
+                                        verification_passed=1
+                                        break
+                                    fi
+                                fi
+                            fi
+                        else
+                            # For shutoff: only config needs to be OK
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                                break
+                            fi
+                        fi
+                        
+                        if [[ ${verify_count} -lt ${max_verify_attempts} ]]; then
+                            sleep 1
+                        fi
+                    done
+                    
+                    # Extended retry for config_ok (up to 5 seconds total)
+                    if [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]] && [[ ${verification_passed} -eq 0 ]]; then
+                        local config_retry_count=0
+                        local max_config_retries=5
+                        while [[ ${config_retry_count} -lt ${max_config_retries} ]]; do
+                            config_retry_count=$((config_retry_count + 1))
+                            sleep 1
+                            if check_vdb_attached_config "${AIO_VM}" "${DATA_LV}"; then
+                                final_config_ok=1
+                                verification_passed=1
+                                log "[STEP 12] Config verification succeeded after extended retry (${config_retry_count}s)"
+                                break
+                            fi
+                        done
+                    fi
+                    
+                    # Final recovery attempt if verification failed
+                    if [[ ${verification_passed} -eq 0 ]]; then
+                        log "[WARN] Verification failed after ${max_verify_attempts} attempts, performing final recovery..."
+                        
+                        # One more detach/attach cycle
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            virsh detach-disk "${AIO_VM}" vdb --live >/dev/null 2>&1 || true
+                            virsh detach-disk "${AIO_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            # Block device: no subdriver specified (raw is default)
+                            if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --persistent >/dev/null 2>&1; then
+                                log "[STEP 12] Final recovery: --persistent attach succeeded"
+                            else
+                                virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --live >/dev/null 2>&1 || true
+                                virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                            fi
+                        else
+                            virsh detach-disk "${AIO_VM}" vdb --config >/dev/null 2>&1 || true
+                            sleep 1
+                            virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1 || true
+                        fi
+                        
+                        sleep 2
+                        
+                        # Final verification after recovery
+                        final_config_ok=0
+                        final_live_ok=0
+                        if check_vdb_attached_config "${AIO_VM}" "${DATA_LV}"; then
+                            final_config_ok=1
+                        fi
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            if check_vdb_attached_live "${AIO_VM}" "${DATA_LV}"; then
+                                final_live_ok=1
+                            fi
+                        else
+                            final_live_ok=1
+                        fi
+                        
+                        if [[ ${aio_running} -eq 1 ]]; then
+                            # For running VM: live_ok==1 is sufficient
+                            if [[ ${final_live_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        else
+                            if [[ ${final_config_ok} -eq 1 ]]; then
+                                verification_passed=1
+                            fi
+                        fi
+                    fi
+                    
+                    # Final status reporting
+                    if [[ ${verification_passed} -eq 1 ]]; then
+                        # Check if we have a partial success case (live OK but config not OK for running VM)
+                        if [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${AIO_VM} --inactive | grep vdb"
+                            data_disk_attached=1
+                            data_disk_status="Attached (live), persistence pending"
+                        else
+                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (${attach_mode}) completed and verified"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
                             data_disk_attached=1
                             data_disk_status="Attached successfully"
+                        fi
+                    else
+                        # Only report as failed if live is also not OK (for running VM)
+                        if [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 0 ]]; then
+                            log "[ERROR] ${AIO_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${AIO_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                            log "[DEBUG] Live block list:"
+                            virsh domblklist "${AIO_VM}" --details 2>/dev/null | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
+                            data_disk_status="Attach failed"
+                        elif [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
+                            # This should not happen due to verification_passed logic, but handle it anyway
+                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
+                            log "[STEP 12] Status: Attached (live), persistence pending"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
+                            log "[WARN] Please manually verify with: virsh dumpxml ${AIO_VM} --inactive | grep vdb"
+                            data_disk_attached=1
+                            data_disk_status="Attached (live), persistence pending"
                         else
-                            log "[WARN] ${AIO_VM} data disk(${DATA_LV}) attach failed"
+                            log "[ERROR] ${AIO_VM} data disk(${DATA_LV}) attach failed after all attempts"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[DEBUG] VM XML vdb section (config):"
+                            virsh dumpxml "${AIO_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                                log "[DEBUG]   ${line}"
+                            done
                             data_disk_status="Attach failed"
                         fi
                     fi
                 fi
-            else
-                log "[STEP 12] ${AIO_VM} VM not found → skipping AIO data disk attach"
-                data_disk_status="VM not found"
             fi
         else
-            log "[STEP 12] ${DATA_LV} does not exist, skipping AIO data disk attach"
-            data_disk_status="LV does not exist"
+            log "[STEP 12] ${AIO_VM} VM not found → skipping AIO data disk attach"
+            data_disk_status="VM not found"
         fi
-        
-        # Create summary for AIO VM (after data disk attachment)
-        local aio_result_file="/tmp/step12_result_aio.txt"
-        {
-            echo "STEP 12 - CPU Affinity & Data Disk Verification (${AIO_VM})"
-            echo "═══════════════════════════════════════════════════════════"
-            if [[ "${_DRY}" -eq 1 ]]; then
-                echo "🔍 DRY-RUN MODE: No actual changes were made"
-                echo
-                echo "📊 SIMULATED STATUS:"
-                echo "  • VM status: Would be checked"
-                echo "  • CPU affinity: Would be applied to NUMA0"
-                echo "  • Data disk: Would be attached as vdb"
-            else
-                echo "✅ EXECUTION COMPLETED"
-                echo
-                echo "📊 CONFIGURATION STATUS:"
-                local aio_state
-                aio_state=$(virsh dominfo "${AIO_VM}" 2>/dev/null | grep "^State:" | awk '{print $2}' || echo "unknown")
-                echo "  • VM status: ${aio_state}"
-                echo
-                echo "⚙️  CPU AFFINITY:"
-                if [[ "${numa_nodes}" -gt 1 ]]; then
-                    if [[ -n "${actual_cpuset_aio}" ]]; then
-                        echo "  • CPU set: ${actual_cpuset_aio}"
-                        echo "  • NUMA node: NUMA0"
-                        echo "    ✅ CPU affinity configured successfully"
-                    else
-                        echo "  • ⚠️  CPU affinity not configured (NUMA0 CPU detection failed)"
-                    fi
+    else
+        log "[STEP 12] ${DATA_LV} does not exist, skipping AIO data disk attach"
+        data_disk_status="LV does not exist"
+    fi
+    
+    # Create summary for AIO VM (after data disk attachment)
+    local aio_result_file="/tmp/step12_result_aio.txt"
+    {
+        echo "STEP 12 - CPU Affinity & Data Disk Verification (${AIO_VM})"
+        echo "═══════════════════════════════════════════════════════════"
+        if [[ "${_DRY}" -eq 1 ]]; then
+            echo "🔍 DRY-RUN MODE: No actual changes were made"
+            echo
+            echo "📊 SIMULATED STATUS:"
+            echo "  • VM status: Would be checked"
+            echo "  • CPU affinity: Would be applied to NUMA0"
+            echo "  • Data disk: Would be attached as vdb"
+        else
+            echo "✅ EXECUTION COMPLETED"
+            echo
+            echo "📊 CONFIGURATION STATUS:"
+            local aio_state
+            aio_state=$(virsh dominfo "${AIO_VM}" 2>/dev/null | grep "^State:" | awk '{print $2}' || echo "unknown")
+            echo "  • VM status: ${aio_state}"
+            echo
+            echo "⚙️  CPU AFFINITY:"
+            if [[ "${numa_nodes}" -gt 1 ]]; then
+                if [[ -n "${actual_cpuset_aio}" ]]; then
+                    echo "  • CPU set: ${actual_cpuset_aio}"
+                    echo "  • NUMA node: NUMA0"
+                    echo "    ✅ CPU affinity configured successfully"
                 else
-                    echo "  • Single NUMA node environment → CPU affinity skipped"
-                fi
-                echo
-                echo "💾 DATA DISK:"
-                if [[ -e "${DATA_LV}" ]]; then
-                    if [[ "${data_disk_attached}" -eq 1 ]]; then
-                        echo "  • Data disk: ${DATA_LV}"
-                        echo "  • Attached as: vdb"
-                        echo "    ✅ Data disk attached successfully"
-                    else
-                        echo "  • Data disk: ${DATA_LV}"
-                        echo "  • Status: ${data_disk_status}"
-                        if [[ "${data_disk_status}" == "Attach failed" ]]; then
-                            echo "    ❌ Data disk attachment failed"
-                        elif [[ "${data_disk_status}" == "VM not found" ]]; then
-                            echo "    ⚠️  Data disk attachment skipped (VM not found)"
-                        else
-                            echo "    ⚠️  Data disk attachment skipped"
-                        fi
-                    fi
-                else
-                    echo "  • Data disk: ${DATA_LV}"
-                    echo "  • Status: ${data_disk_status}"
-                    echo "    ⚠️  Data disk LV does not exist"
+                    echo "  • ⚠️  CPU affinity not configured (NUMA0 CPU detection failed)"
                 fi
             fi
             echo
-            echo "⚠️  IMPORTANT:"
-            echo "  • CPU affinity requires multiple NUMA nodes"
-            echo "  • VM must be stopped before CPU affinity configuration"
-            echo "  • Verify CPU affinity with: virsh vcpupin ${AIO_VM}"
-            echo "  • Verify data disk with: virsh dumpxml ${AIO_VM} | grep -A 5 'target dev=\"vdb\"'"
-        } > "${aio_result_file}"
-        
-        show_paged "STEP 12 result (${AIO_VM})" "${aio_result_file}"
-        
-        log "[STEP 12] ----- AIO VM CPU Affinity processing completed: aio -----"
-    else
-        log "[STEP 12] Single NUMA node environment → skip AIO VM CPU Affinity."
-        
-        # Even in single NUMA, still attach data disk if available
-        local AIO_VM="aio"
-        local DATA_LV="/dev/mapper/vg_aio-lv_aio"
-        
-        if [[ -e "${DATA_LV}" ]]; then
-            if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
-                if [[ "${_DRY}" -eq 1 ]]; then
-                    log "[DRY-RUN] virsh attach-disk ${AIO_VM} ${DATA_LV} vdb --config"
-                else
-                    # Check if vdb exists and if it's the correct disk
-                    local vdb_exists=0
-                    local vdb_is_correct=0
-                    if virsh dumpxml "${AIO_VM}" | grep -q "target dev='vdb'"; then
-                        vdb_exists=1
-                        # Check if the vdb source matches our DATA_LV
-                        local vdb_source
-                        vdb_source=$(virsh dumpxml "${AIO_VM}" | grep -A 5 "target dev='vdb'" | grep -oP "source dev='\K[^']+" || echo "")
-                        if [[ "${vdb_source}" == "${DATA_LV}" ]]; then
-                            vdb_is_correct=1
-                            log "[STEP 12] ${AIO_VM} already has correct data disk(${DATA_LV}) as vdb → skipping"
-                        else
-                            log "[STEP 12] ${AIO_VM} has vdb but it's not ${DATA_LV} (current: ${vdb_source:-<unknown>})"
-                            log "[STEP 12] Will attach ${DATA_LV} as vdb (this may replace existing vdb)"
-                        fi
+            echo "💾 DATA DISK:"
+            if [[ -e "${DATA_LV}" ]]; then
+                echo "  • Data disk: ${DATA_LV}"
+                echo "  • Attached as: vdb"
+                if [[ "${data_disk_attached}" -eq 1 ]]; then
+                    if [[ "${data_disk_status}" == "Already attached" ]]; then
+                        echo "    ✅ Data disk already attached (skipped)"
+                    elif [[ "${data_disk_status}" == "Attached successfully" ]]; then
+                        echo "    ✅ Data disk attached successfully"
+                    elif [[ "${data_disk_status}" == "Would be attached" ]]; then
+                        echo "    ✅ Data disk would be attached (DRY-RUN)"
+                    else
+                        echo "    ⚠️  Status: ${data_disk_status}"
                     fi
-                    
-                    if [[ "${vdb_is_correct}" -eq 0 ]]; then
-                        if virsh attach-disk "${AIO_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
-                            log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
-                        else
-                            log "[WARN] ${AIO_VM} data disk(${DATA_LV}) attach failed"
-                        fi
+                else
+                    echo "  • Status: ${data_disk_status}"
+                    if [[ "${data_disk_status}" == "Attach failed" ]]; then
+                        echo "    ❌ Data disk attachment failed"
+                    elif [[ "${data_disk_status}" == "Attach verification failed" ]]; then
+                        echo "    ⚠️  Data disk attach command succeeded but verification failed"
+                        echo "    💡 Please verify manually: virsh dumpxml ${AIO_VM} | grep -A 5 'target dev=\"vdb\"'"
+                    elif [[ "${data_disk_status}" == "VM not found" ]]; then
+                        echo "    ⚠️  Data disk attachment skipped (VM not found)"
+                    elif [[ "${data_disk_status}" == "LV does not exist" ]]; then
+                        echo "    ⚠️  Data disk LV does not exist"
+                    else
+                        echo "    ⚠️  Data disk attachment skipped"
                     fi
                 fi
             else
-                log "[STEP 12] ${AIO_VM} VM not found → skipping AIO data disk attach"
+                echo "  • Data disk: ${DATA_LV}"
+                echo "  • Status: ${data_disk_status}"
+                echo "    ⚠️  Data disk LV does not exist"
             fi
-        else
-            log "[STEP 12] ${DATA_LV} does not exist, skipping AIO data disk attach"
         fi
-    fi
+        echo
+        echo "⚠️  IMPORTANT:"
+        echo "  • CPU affinity requires multiple NUMA nodes"
+        echo "  • VM must be stopped before CPU affinity configuration"
+        echo "  • Verify CPU affinity with: virsh vcpupin ${AIO_VM}"
+        echo "  • Verify data disk with: virsh dumpxml ${AIO_VM} | grep -A 5 'target dev=\"vdb\"'"
+    } > "${aio_result_file}"
+    
+    show_paged "STEP 12 result (${AIO_VM})" "${aio_result_file}"
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -6417,6 +6967,8 @@ step_13_install_dp_cli() {
     # 2) Create/initialize venv then install dp-cli
     if [[ "${_DRY}" -eq 1 ]]; then
         log "[DRY-RUN] venv create: ${VENV_DIR}"
+        log "[DRY-RUN] Check Python version (>= 3.10 required)"
+        log "[DRY-RUN] Install pip, setuptools, wheel, pbr to venv"
         log "[DRY-RUN] install dp-cli to venv: ${pkg}"
         log "[DRY-RUN] Perform runtime verification import based"
     else
@@ -6428,9 +6980,19 @@ step_13_install_dp_cli() {
 
         "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 
-        # setuptools<81 pin
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv pip/setuptools Installation failed" | tee -a "${ERRLOG}"
+        # Check Python version (dp-cli requires Python >= 3.10)
+        local python_version
+        python_version=$("${VENV_DIR}/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
+        local major_version minor_version
+        IFS='.' read -r major_version minor_version <<< "${python_version}"
+        if [[ ${major_version} -lt 3 ]] || [[ ${major_version} -eq 3 && ${minor_version} -lt 10 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Python 3.10 or higher is required. Current version: ${python_version}" | tee -a "${ERRLOG}"
+            return 1
+        fi
+
+        # Install pip, setuptools, wheel, and pbr (dp-cli uses pbr for packaging)
+        "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel pbr >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv pip/setuptools/pbr Installation failed" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
@@ -7083,34 +7645,69 @@ build_validation_summary() {
   fi
 
   ###############################
-  # STEP 08: Sensor VM Deployment
+  # STEP 08: AIO VM Deployment
+  ###############################
+  if virsh list --all 2>/dev/null | grep -qE '\saio\s'; then
+    ok_msgs+=("AIO VM (aio) exists")
+  else
+    warn_msgs+=("AIO VM (aio) not found.")
+    warn_msgs+=("  → ACTION: Re-run STEP 09 (AIO VM Deployment)")
+    warn_msgs+=("  → CHECK: Verify VMs with 'virsh list --all'")
+  fi
+
+  ###############################
+  # STEP 11: Sensor VM Deployment
   ###############################
   if virsh list --all 2>/dev/null | grep -qE '\smds\s'; then
     ok_msgs+=("Sensor VM (mds) exists")
   else
     warn_msgs+=("Sensor VM (mds) not found.")
-    warn_msgs+=("  → ACTION: Re-run STEP 08 (Sensor VM Deployment)")
+    warn_msgs+=("  → ACTION: Re-run STEP 11 (Sensor VM Deployment)")
     warn_msgs+=("  → CHECK: Verify VMs with 'virsh list --all'")
   fi
 
   ###############################
-  # STEP 09: PCI Passthrough / CPU Affinity
+  # STEP 12: PCI Passthrough / CPU Affinity
   ###############################
+  # Check AIO VM CPU affinity (cputune)
+  if virsh dumpxml aio 2>/dev/null | grep -q '<cputune>'; then
+    # Get actual CPU affinity for display
+    local aio_cpuset
+    aio_cpuset=$(virsh emulatorpin aio --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
+    if [[ -n "${aio_cpuset}" ]]; then
+      ok_msgs+=("aio VM has CPU pinning (cputune) configuration (cpuset: ${aio_cpuset})")
+    else
+      ok_msgs+=("aio VM has CPU pinning (cputune) configuration")
+    fi
+  else
+    warn_msgs+=("aio VM XML does not have CPU pinning (cputune) configuration.")
+    warn_msgs+=("  → ACTION: Re-run STEP 12 (PCI Passthrough / CPU Affinity)")
+    warn_msgs+=("  → NOTE: NUMA0-based vCPU placement may not be applied without this")
+  fi
+
+  # Check Sensor VM PCI passthrough
   if virsh dumpxml mds 2>/dev/null | grep -q '<hostdev'; then
     ok_msgs+=("mds VM has PCI passthrough (hostdev) configuration")
   else
     warn_msgs+=("mds VM XML does not have PCI passthrough (hostdev) configuration.")
-    warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
+    warn_msgs+=("  → ACTION: Re-run STEP 12 (PCI Passthrough / CPU Affinity)")
     warn_msgs+=("  → NOTE: SPAN NIC passthrough may not be applied without this")
   fi
 
-  # Check CPU pinning (cputune)
+  # Check Sensor VM CPU pinning (cputune)
   if virsh dumpxml mds 2>/dev/null | grep -q '<cputune>'; then
-    ok_msgs+=("mds VM has CPU pinning (cputune) configuration")
+    # Get actual CPU affinity for display
+    local mds_cpuset
+    mds_cpuset=$(virsh emulatorpin mds --config 2>/dev/null | grep "emulator: CPU Affinity" | sed 's/.*: //' || echo "")
+    if [[ -n "${mds_cpuset}" ]]; then
+      ok_msgs+=("mds VM has CPU pinning (cputune) configuration (cpuset: ${mds_cpuset})")
+    else
+      ok_msgs+=("mds VM has CPU pinning (cputune) configuration")
+    fi
   else
     warn_msgs+=("mds VM XML does not have CPU pinning (cputune) configuration.")
-    warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
-    warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
+    warn_msgs+=("  → ACTION: Re-run STEP 12 (PCI Passthrough / CPU Affinity)")
+    warn_msgs+=("  → NOTE: NUMA1-based vCPU placement may not be applied without this")
   fi
 
   ###############################
@@ -7294,9 +7891,9 @@ menu_full_validation() {
     echo
 
     ##################################################
-    # 4. Sensor VM / Storage verify
+    # 4. AIO & Sensor VM / Storage verify
     ##################################################
-    echo "## 4. Sensor VM / Storage verify"
+    echo "## 4. AIO & Sensor VM / Storage verify"
     echo
 
     echo "\$ virsh list --all"
@@ -7307,6 +7904,10 @@ menu_full_validation() {
     lvs 2>&1 || echo "[WARN] LVM information query failed"
     echo
 
+    echo "\$ df -h /stellar/aio"
+    df -h /stellar/aio 2>&1 || echo "[INFO] /stellar/aio mount point not found."
+    echo
+
     echo "\$ df -h /var/lib/libvirt/images/mds"
     df -h /var/lib/libvirt/images/mds 2>&1 || echo "[INFO] /var/lib/libvirt/images/mds mount point not found."
     echo
@@ -7315,6 +7916,25 @@ menu_full_validation() {
     echo "\$ ls -la /var/lib/libvirt/images/"
     ls -la /var/lib/libvirt/images/ 2>&1 || echo "[INFO] libvirt image directory not found."
     echo
+
+    echo "## 4.1. Sensor VM CPU Affinity Verification"
+    echo
+    if virsh dominfo mds >/dev/null 2>&1; then
+      echo "\$ virsh emulatorpin mds --config"
+      virsh emulatorpin mds --config 2>&1 || echo "[WARN] Failed to get Sensor VM emulator pinning"
+      echo
+
+      echo "\$ virsh vcpupin mds --config"
+      virsh vcpupin mds --config 2>&1 || echo "[WARN] Failed to get Sensor VM vCPU pinning"
+      echo
+
+      echo "\$ virsh dumpxml mds | grep -A 10 '<cputune>'"
+      virsh dumpxml mds 2>/dev/null | grep -A 10 '<cputune>' || echo "[INFO] Sensor VM does not have cputune configuration"
+      echo
+    else
+      echo "[INFO] Sensor VM (mds) not found"
+      echo
+    fi
 
     ##################################################
     # 5. System tuning verify

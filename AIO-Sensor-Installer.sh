@@ -1245,7 +1245,7 @@ run_step() {
         if [[ "${DRY_RUN}" -eq 0 ]]; then
           if [[ -x /usr/local/bin/aella_cli ]] && \
              [[ -d /opt/dp_cli_venv ]] && \
-             /opt/dp_cli_venv/bin/python -c "import dp_cli" >/dev/null 2>&1; then
+             /opt/dp_cli_venv/bin/python -c "import appliance_cli" >/dev/null 2>&1; then
             cli_status="Installed (venv + CLI)"
           elif [[ -x /usr/local/bin/aella_cli ]] || [[ -d /opt/dp_cli_venv ]]; then
             cli_status="Partially installed"
@@ -6847,7 +6847,8 @@ EOF
 }
 
 ###############################################################################
-# STEP 10 – Install DP Appliance CLI package (use local file, no internet download)
+###############################################################################
+# STEP 13 – Install DP Appliance CLI package (use local files, no internet download)
 ###############################################################################
 step_13_install_dp_cli() {
     local STEP_ID="13_install_dp_cli"
@@ -6859,15 +6860,15 @@ step_13_install_dp_cli() {
     local ERRLOG="/var/log/aella/dp_cli_step13_error.log"
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP Appliance CLI package install/apply"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Installing/Applying DP Appliance CLI package"
 
     if type load_config >/dev/null 2>&1; then
         load_config || true
     fi
 
-    if ! whiptail_yesno "STEP 10 Execution Confirmation" "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
+    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
     then
-        log "User canceled STEP 10 execution."
+        log "User canceled STEP 13 execution."
         return 0
     fi
 
@@ -6881,22 +6882,22 @@ step_13_install_dp_cli() {
     fi
 
     # 0-1) Install required packages first (before download/extraction)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
     if [[ "${_DRY}" -eq 1 ]]; then
         log "[DRY-RUN] apt-get update -y"
         log "[DRY-RUN] apt-get install -y python3-pip python3-venv wget curl unzip"
     else
         if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
             return 1
         fi
         if ! apt-get install -y python3-pip python3-venv wget curl unzip >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
             return 1
         fi
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Required packages installed successfully"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Required packages installed successfully"
     fi
 
     # 1) Download dp_cli from GitHub
@@ -6915,30 +6916,30 @@ step_13_install_dp_cli() {
         # Clean up any existing download
         rm -rf "${TEMP_DIR}" || true
         mkdir -p "${TEMP_DIR}" || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to create temp directory: ${TEMP_DIR}" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to create temp directory: ${TEMP_DIR}" | tee -a "${ERRLOG}"
             return 1
         }
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Downloading dp_cli from GitHub: ${GITHUB_REPO}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Downloading dp_cli from GitHub: ${GITHUB_REPO}"
         echo "=== Downloading from GitHub (this may take a moment) ==="
         
         # Download using wget or curl
         if command -v wget >/dev/null 2>&1; then
             if ! wget --progress=bar:force -O "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
                 rm -rf "${TEMP_DIR}" || true
                 return 1
             fi
         elif command -v curl >/dev/null 2>&1; then
             if ! curl -L -o "${ZIP_FILE}" "${DOWNLOAD_URL}" >>"${ERRLOG}" 2>&1; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to download from GitHub" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check network connection and ${ERRLOG} for details." | tee -a "${ERRLOG}"
                 rm -rf "${TEMP_DIR}" || true
                 return 1
             fi
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Neither wget nor curl is available. Please install one of them." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Neither wget nor curl is available. Please install one of them." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         fi
@@ -6946,80 +6947,68 @@ step_13_install_dp_cli() {
         echo "=== Extracting downloaded file ==="
         # Extract zip file (unzip should already be installed)
         if ! unzip -q "${ZIP_FILE}" -d "${TEMP_DIR}" >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to extract zip file" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         fi
 
         # Check if setup.py exists in extracted directory
         if [[ ! -f "${EXTRACT_DIR}/setup.py" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: setup.py not found in downloaded package" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: setup.py not found in downloaded package" | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         fi
 
         pkg="${EXTRACT_DIR}"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Successfully downloaded and extracted dp_cli from GitHub"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Successfully downloaded and extracted dp_cli from GitHub"
     fi
 
     # 2) Create/initialize venv then install dp-cli
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] venv create: ${VENV_DIR}"
-        log "[DRY-RUN] Check Python version (>= 3.10 required)"
-        log "[DRY-RUN] Install pip, setuptools, wheel, pbr to venv"
-        log "[DRY-RUN] install dp-cli to venv: ${pkg}"
-        log "[DRY-RUN] Perform runtime verification import based"
+        log "[DRY-RUN] Creating venv: ${VENV_DIR}"
+        log "[DRY-RUN] Installing dp-cli in venv: ${pkg}"
+        log "[DRY-RUN] Runtime verification performed based on import"
     else
         rm -rf "${VENV_DIR}" || true
         python3 -m venv "${VENV_DIR}" || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv creation failed: ${VENV_DIR}" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv creation failed: ${VENV_DIR}" | tee -a "${ERRLOG}"
             return 1
         }
 
         "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 
-        # Check Python version (dp-cli requires Python >= 3.10)
-        local python_version
-        python_version=$("${VENV_DIR}/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "0.0")
-        local major_version minor_version
-        IFS='.' read -r major_version minor_version <<< "${python_version}"
-        if [[ ${major_version} -lt 3 ]] || [[ ${major_version} -eq 3 && ${minor_version} -lt 10 ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Python 3.10 or higher is required. Current version: ${python_version}" | tee -a "${ERRLOG}"
-            return 1
-        fi
-
-        # Install pip, setuptools, wheel, and pbr (dp-cli uses pbr for packaging)
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel pbr >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv pip/setuptools/pbr Installation failed" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+        # setuptools<81 pin
+        "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv pip/setuptools installation failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
 
         # Install from downloaded directory
         (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli Installation failed(venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli installation failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         }
 
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp_cli import failed (venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('appliance_cli import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: appliance_cli import failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
 
         if [[ ! -x "${VENV_DIR}/bin/aella_cli" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: ${VENV_DIR}/bin/aella_cli not found." | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: dp-cli package must include console_scripts (aella_cli) entry point." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: ${VENV_DIR}/bin/aella_cli does not exist." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: dp-cli package must include console_scripts (aella_cli) entry point." | tee -a "${ERRLOG}"
             return 1
         fi
 
-        # Perform runtime verification import based only (removed aella_cli execution smoke test)
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli runtime import verification failed (venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
+        # Runtime verification performed only based on import (removed aella_cli execution smoke test)
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli runtime import verification failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
     fi
@@ -7072,7 +7061,7 @@ EOF
         echo "stellar ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/stellar
         chmod 440 /etc/sudoers.d/stellar
         visudo -cf /etc/sudoers.d/stellar >/dev/null 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: sudoers syntax invalid: /etc/sudoers.d/stellar" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: sudoers syntax invalid: /etc/sudoers.d/stellar" | tee -a "${ERRLOG}"
             return 1
         }
     fi
@@ -7103,29 +7092,29 @@ EOF
         fi
     fi
 
-    # 11) verify
+    # 11) Verification
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] Skip install verify step."
+        log "[DRY-RUN] Skipping installation verification step."
     else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: /usr/local/bin/aella_cli*"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: /usr/local/bin/aella_cli*"
         ls -l /usr/local/bin/aella_cli* 2>/dev/null || true
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: venv dp_cli import"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || true
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv appliance_cli import"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('appliance_cli import OK')") >>"${ERRLOG}" 2>&1 || true
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: venv pkg_resources"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv pkg_resources"
         (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; print('pkg_resources OK')") >>"${ERRLOG}" 2>&1 || true
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: runtime import check"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: runtime import check"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: error log path => ${ERRLOG}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: error log path => ${ERRLOG}"
         tail -n 40 "${ERRLOG}" 2>/dev/null || true
     fi
 
     # Clean up temporary download directory
     if [[ "${_DRY}" -eq 0 && -n "${TEMP_DIR:-}" && -d "${TEMP_DIR}" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Cleaning up temporary download directory: ${TEMP_DIR}"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Cleaning up temporary download directory: ${TEMP_DIR}"
         rm -rf "${TEMP_DIR}" || true
     fi
 
@@ -7133,8 +7122,7 @@ EOF
         mark_step_done "${STEP_ID}"
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
-    log "[STEP 13] DP Appliance CLI package installation completed successfully."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 13. Install DP Appliance CLI package ====="
     echo
 }
 

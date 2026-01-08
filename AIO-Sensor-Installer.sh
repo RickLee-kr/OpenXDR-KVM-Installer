@@ -541,9 +541,17 @@ This can significantly impact the running cluster (DL / DA services).\n\
 Are you sure you want to proceed with redeployment?"
 
   if command -v whiptail >/dev/null 2>&1; then
+      # Calculate dialog size dynamically and center message
+      local dialog_dims
+      dialog_dims=$(calc_dialog_size 18 80)
+      local dialog_height dialog_width
+      read -r dialog_height dialog_width <<< "${dialog_dims}"
+      local centered_msg
+      centered_msg=$(center_message "${msg}")
+      
       if ! whiptail --title "${step_name} - ${vm_name} Redeployment Confirmation" \
                     --defaultno \
-                    --yesno "${msg}" 18 80; then
+                    --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"; then
           log "[${step_name}] ${vm_name} redeployment canceled by user."
           return 1
       fi
@@ -4556,13 +4564,14 @@ step_09_aio_deploy() {
     # Prompt for AIO VM configuration (memory, vCPU, disk)
     ############################################################
     # Calculate default values based on system resources
-    # Memory allocation: 12GB reserved for KVM host, remaining 70% for AIO
-    local total_cpus total_mem_kb total_mem_gb available_mem_gb
+    # Memory allocation: 12% of total memory reserved for KVM host, remaining 70% for AIO, 30% for MDS
+    local total_cpus total_mem_kb total_mem_gb host_reserve_gb available_mem_gb
     total_cpus=$(nproc)
     total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
     total_mem_gb=$((total_mem_kb / 1024 / 1024))
-    # Reserve 12GB for KVM host
-    available_mem_gb=$((total_mem_gb - 12))
+    # Reserve 12% of total memory for KVM host
+    host_reserve_gb=$((total_mem_gb * 12 / 100))
+    available_mem_gb=$((total_mem_gb - host_reserve_gb))
     [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
     
     # Check NUMA configuration for AIO vCPU default calculation
@@ -4581,7 +4590,7 @@ step_09_aio_deploy() {
       fi
     fi
     
-    # Default memory: 70% of available memory (after 12GB host reserve) for AIO
+    # Default memory: 70% of available memory (after 12% host reserve) for AIO
     local default_aio_mem_gb=$((available_mem_gb * 70 / 100))
     [[ ${default_aio_mem_gb} -lt 8 ]] && default_aio_mem_gb=8
     
@@ -4605,14 +4614,16 @@ step_09_aio_deploy() {
     : "${AIO_DISK_GB:=${default_aio_disk_gb}}"
     
     # 1) Memory
+    # Always use calculated default value for input box (not saved value)
     local _AIO_MEM_INPUT
-    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% of available)\nExample: Enter 136" "${AIO_MEMORY_GB}" 13 80)"
+    _AIO_MEM_INPUT="$(whiptail_inputbox "STEP 09 - AIO memory" "Enter memory (GB) for AIO VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_aio_mem_gb}GB (70% of available)\nExample: Enter 136" "${default_aio_mem_gb}" 14 80)"
 
     if [ $? -eq 0 ] && [ -n "${_AIO_MEM_INPUT}" ]; then
         if [[ "${_AIO_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_AIO_MEM_INPUT}" -gt 0 ]; then
             AIO_MEMORY_GB="${_AIO_MEM_INPUT}"
         else
-            whiptail_msgbox "STEP 09 - AIO memory" "Invalid memory value.\nUsing current default (${AIO_MEMORY_GB} GB)." 10 70
+            whiptail_msgbox "STEP 09 - AIO memory" "Invalid memory value.\nUsing current default (${default_aio_mem_gb} GB)." 10 70
+            AIO_MEMORY_GB="${default_aio_mem_gb}"
         fi
     else
         # User canceled or empty input - use default
@@ -5332,13 +5343,14 @@ step_11_sensor_deploy() {
   # 2) Prompt for Sensor VM configuration (memory, vCPU, disk)
   #######################################
   # Calculate default values based on system resources
-  # Memory allocation: 12GB reserved for KVM host, remaining 30% for Sensor
-  local total_cpus total_mem_kb total_mem_gb available_mem_gb
+  # Memory allocation: 12% of total memory reserved for KVM host, remaining 30% for Sensor
+  local total_cpus total_mem_kb total_mem_gb host_reserve_gb available_mem_gb
   total_cpus=$(nproc)
   total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   total_mem_gb=$((total_mem_kb / 1024 / 1024))
-  # Reserve 12GB for KVM host
-  available_mem_gb=$((total_mem_gb - 12))
+  # Reserve 12% of total memory for KVM host
+  host_reserve_gb=$((total_mem_gb * 12 / 100))
+  available_mem_gb=$((total_mem_gb - host_reserve_gb))
   [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
   
   # Check NUMA configuration for Sensor vCPU default calculation
@@ -5357,7 +5369,7 @@ step_11_sensor_deploy() {
     fi
   fi
   
-  # Default memory: 30% of available memory (after 12GB host reserve) for Sensor
+  # Default memory: 30% of available memory (after 12% host reserve) for Sensor
   local default_sensor_mem_gb=$((available_mem_gb * 30 / 100))
   [[ ${default_sensor_mem_gb} -lt 8 ]] && default_sensor_mem_gb=8
   
@@ -5381,26 +5393,29 @@ step_11_sensor_deploy() {
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_LV_SIZE_GB_PER_VM:=}"
   
-  # Convert existing memory from MB to GB if set
-  local sensor_mem_gb
-  if [[ -n "${SENSOR_MEMORY_MB}" ]]; then
-    sensor_mem_gb=$((SENSOR_MEMORY_MB / 1024))
-  else
-    sensor_mem_gb="${default_sensor_mem_gb}"
-  fi
-  
   # 1) Memory
+  # Always use calculated default value for input box (not saved value)
+  local sensor_mem_gb="${default_sensor_mem_gb}"
   local _SENSOR_MEM_INPUT
-  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nAvailable (after 12GB host reserve): ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% of available)\nExample: Enter 32" "${sensor_mem_gb}" 13 80)"
+  local mem_input_rc
+  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) memory" "Enter memory (GB) for Sensor VM (mds).\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB (30% of available)\nExample: Enter 32" "${default_sensor_mem_gb}" 14 80)"
+  mem_input_rc=$?
 
-  if [ $? -eq 0 ] && [ -n "${_SENSOR_MEM_INPUT}" ]; then
+  if [ ${mem_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 11] User canceled memory input. Exiting step."
+    return 0
+  fi
+
+  if [ -n "${_SENSOR_MEM_INPUT}" ]; then
     if [[ "${_SENSOR_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_MEM_INPUT}" -gt 0 ]; then
       sensor_mem_gb="${_SENSOR_MEM_INPUT}"
     else
-      whiptail_msgbox "STEP 11 - Sensor memory" "Invalid memory value.\nUsing current default (${sensor_mem_gb} GB)." 10 70
+      whiptail_msgbox "STEP 11 - Sensor memory" "Invalid memory value.\nUsing current default (${default_sensor_mem_gb} GB)." 10 70
+      sensor_mem_gb="${default_sensor_mem_gb}"
     fi
   else
-    # User canceled or empty input - use default
+    # Empty input - use default
     sensor_mem_gb="${default_sensor_mem_gb}"
   fi
 
@@ -5412,10 +5427,18 @@ step_11_sensor_deploy() {
     vcpu_default_msg="Enter number of vCPUs for Sensor VM (mds).\n\nTotal logical CPUs: ${total_cpus}\nDefault value: ${default_sensor_vcpus} (total CPUs - 4)\nExample: Enter 22"
   fi
   local _SENSOR_VCPU_INPUT
+  local vcpu_input_rc
   _SENSOR_VCPU_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) vCPU" "${vcpu_default_msg}" "${SENSOR_VCPUS:-${default_sensor_vcpus}}" 12 70)"
+  vcpu_input_rc=$?
 
   local sensor_vcpus
-  if [ $? -eq 0 ] && [ -n "${_SENSOR_VCPU_INPUT}" ]; then
+  if [ ${vcpu_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 11] User canceled vCPU input. Exiting step."
+    return 0
+  fi
+
+  if [ -n "${_SENSOR_VCPU_INPUT}" ]; then
     if [[ "${_SENSOR_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_VCPU_INPUT}" -gt 0 ]; then
       sensor_vcpus="${_SENSOR_VCPU_INPUT}"
     else
@@ -5423,16 +5446,24 @@ step_11_sensor_deploy() {
       sensor_vcpus="${default_sensor_vcpus}"
     fi
   else
-    # User canceled or empty input - use default
+    # Empty input - use default
     sensor_vcpus="${default_sensor_vcpus}"
   fi
 
   # 3) Disk size
   local _SENSOR_DISK_INPUT
+  local disk_input_rc
   _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter 200" "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" 12 70)"
+  disk_input_rc=$?
 
   local sensor_disk_gb
-  if [ $? -eq 0 ] && [ -n "${_SENSOR_DISK_INPUT}" ]; then
+  if [ ${disk_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 11] User canceled disk size input. Exiting step."
+    return 0
+  fi
+
+  if [ -n "${_SENSOR_DISK_INPUT}" ]; then
     if [[ "${_SENSOR_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_DISK_INPUT}" -gt 0 ]; then
       if [[ "${_SENSOR_DISK_INPUT}" -lt 80 ]]; then
         whiptail_msgbox "STEP 11 - Sensor disk" "Minimum disk size is 80GB.\nUsing current default (${default_sensor_disk_gb} GB)." 10 70
@@ -5445,7 +5476,7 @@ step_11_sensor_deploy() {
       sensor_disk_gb="${default_sensor_disk_gb}"
     fi
   else
-    # User canceled or empty input - use default
+    # Empty input - use default
     sensor_disk_gb="${default_sensor_disk_gb}"
   fi
 
@@ -5718,6 +5749,9 @@ step_12_sensor_passthrough() {
     ###########################################################################
     # Process each Sensor VM in SENSOR_VMS array
     ###########################################################################
+    # Store sensor results for combined display
+    local sensor_result_files=()
+    
     for SENSOR_VM in "${SENSOR_VMS[@]}"; do
         log "[STEP 12] ----- Sensor VM processing start: ${SENSOR_VM} -----"
 
@@ -6050,7 +6084,8 @@ EOF
             echo "  • Verify CPU affinity with: virsh vcpupin ${SENSOR_VM}"
         } > "${result_file}"
 
-        show_paged "STEP 12 result (${SENSOR_VM})" "${result_file}"
+        # Store result file for combined display (don't show individually)
+        sensor_result_files+=("${result_file}")
 
         log "[STEP 12] ----- Sensor VM processing completed: ${SENSOR_VM} -----"
     done
@@ -6762,6 +6797,39 @@ EOF
     fi
     
     # Create summary for AIO VM (after data disk attachment)
+    # Get actual CPU affinity setting for display (similar to Sensor VM)
+    local actual_cpuset_aio_display=""
+    if [[ "${numa_nodes}" -gt 1 ]]; then
+        # First try to use AIO_CPUSET if available
+        actual_cpuset_aio_display="${AIO_CPUSET:-}"
+        if [[ -z "${actual_cpuset_aio_display}" ]]; then
+            # Try to get from NUMA node0 CPU list
+            if command -v lscpu >/dev/null 2>&1; then
+                local node0_cpus
+                node0_cpus=$(lscpu | grep "NUMA node0 CPU(s):" | sed 's/NUMA node0 CPU(s)://' | tr -d '[:space:]')
+                if [[ -n "${node0_cpus}" ]]; then
+                    actual_cpuset_aio_display="${node0_cpus}"
+                fi
+            fi
+        fi
+        if [[ -z "${actual_cpuset_aio_display}" ]]; then
+            # Last resort: try to get from virsh if VM exists
+            if virsh dominfo "${AIO_VM}" >/dev/null 2>&1; then
+                # Try multiple parsing methods for virsh emulatorpin output
+                local emulatorpin_output
+                emulatorpin_output=$(virsh emulatorpin "${AIO_VM}" --config 2>/dev/null || echo "")
+                if [[ -n "${emulatorpin_output}" ]]; then
+                    # Method 1: grep for "emulator: CPU Affinity" and extract after colon
+                    actual_cpuset_aio_display=$(echo "${emulatorpin_output}" | grep -i "emulator.*CPU.*Affinity" | sed -E 's/.*[Cc][Pp][Uu].*[Aa]ffinity[^:]*:\s*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "")
+                    # Method 2: if still empty, try to extract from any line with numbers
+                    if [[ -z "${actual_cpuset_aio_display}" ]]; then
+                        actual_cpuset_aio_display=$(echo "${emulatorpin_output}" | grep -oE '[0-9]+([,-][0-9]+)*' | head -1 || echo "")
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
     local aio_result_file="/tmp/step12_result_aio.txt"
     {
         echo "STEP 12 - CPU Affinity & Data Disk Verification (${AIO_VM})"
@@ -6783,8 +6851,8 @@ EOF
             echo
             echo "⚙️  CPU AFFINITY:"
             if [[ "${numa_nodes}" -gt 1 ]]; then
-                if [[ -n "${actual_cpuset_aio}" ]]; then
-                    echo "  • CPU set: ${actual_cpuset_aio}"
+                if [[ -n "${actual_cpuset_aio_display}" ]]; then
+                    echo "  • CPU set: ${actual_cpuset_aio_display}"
                     echo "  • NUMA node: NUMA0"
                     echo "    ✅ CPU affinity configured successfully"
                 else
@@ -6835,7 +6903,65 @@ EOF
         echo "  • Verify data disk with: virsh dumpxml ${AIO_VM} | grep -A 5 'target dev=\"vdb\"'"
     } > "${aio_result_file}"
     
-    show_paged "STEP 12 result (${AIO_VM})" "${aio_result_file}"
+    ###########################################################################
+    # Combine all results (Sensor VMs + AIO VM) into a single message box
+    ###########################################################################
+    local combined_result_file="/tmp/step12_combined_result.txt"
+    {
+        echo "STEP 12 - PCI Passthrough / CPU Affinity Configuration Result"
+        echo "════════════════════════════════════════════════════════════════════════"
+        echo
+        echo "This step automatically configured PCI passthrough and CPU affinity for"
+        echo "all VMs (Sensor and AIO)."
+        echo
+        echo "════════════════════════════════════════════════════════════════════════"
+        echo
+        
+        # Display Sensor VM results
+        if [[ ${#sensor_result_files[@]} -gt 0 ]]; then
+            echo "📡 SENSOR VM RESULTS:"
+            echo "────────────────────────────────────────────────────────────────────"
+            for result_file in "${sensor_result_files[@]}"; do
+                if [[ -f "${result_file}" ]]; then
+                    # Skip the header line (title) and separator line, show content from line 3
+                    tail -n +3 "${result_file}"
+                    echo
+                fi
+            done
+        else
+            echo "📡 SENSOR VM RESULTS:"
+            echo "────────────────────────────────────────────────────────────────────"
+            echo "  • No Sensor VMs processed"
+            echo
+        fi
+        
+        echo "════════════════════════════════════════════════════════════════════════"
+        echo
+        
+        # Display AIO VM results
+        echo "🖥️  AIO VM RESULTS:"
+        echo "────────────────────────────────────────────────────────────────────"
+        if [[ -f "${aio_result_file}" ]]; then
+            # Skip the header line (title) and separator line, show content from line 3
+            tail -n +3 "${aio_result_file}"
+        else
+            echo "  • AIO VM results not available"
+        fi
+        echo
+        echo "════════════════════════════════════════════════════════════════════════"
+        echo
+        echo "✅ STEP 12 completed automatically for all VMs"
+        echo
+        echo "⚠️  IMPORTANT NOTES:"
+        echo "  • PCI passthrough requires IOMMU to be enabled (configured in STEP 05)"
+        echo "  • VM must be stopped before PCI passthrough configuration"
+        echo "  • CPU affinity requires multiple NUMA nodes"
+        echo "  • Verify PCI passthrough: virsh dumpxml <vm_name> | grep hostdev"
+        echo "  • Verify CPU affinity: virsh vcpupin <vm_name>"
+    } > "${combined_result_file}"
+    
+    # Display combined result in a single message box
+    show_textbox "STEP 12 - PCI Passthrough / CPU Affinity Result (All VMs)" "${combined_result_file}"
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -6978,15 +7104,15 @@ step_13_install_dp_cli() {
 
         "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 
-        # setuptools<81 pin
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv pip/setuptools installation failed" | tee -a "${ERRLOG}"
+        # Install setuptools<81 and wheel (pip will skip if already satisfied)
+        "${VENV_DIR}/bin/python" -m pip install --quiet "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: venv setuptools installation failed" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
 
-        # Install from downloaded directory
-        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
+        # Install from downloaded directory (pip will skip if already installed)
+        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --quiet .) >>"${ERRLOG}" 2>&1 || {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: dp-cli installation failed (venv)" | tee -a "${ERRLOG}"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
@@ -7101,9 +7227,6 @@ EOF
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv appliance_cli import"
         (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('appliance_cli import OK')") >>"${ERRLOG}" 2>&1 || true
-
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: venv pkg_resources"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; print('pkg_resources OK')") >>"${ERRLOG}" 2>&1 || true
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] verify: runtime import check"
         (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true

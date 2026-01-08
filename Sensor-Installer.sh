@@ -621,6 +621,8 @@ save_config_var() {
     # ★ Added here
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_NIC)        DATA_NIC="${value}" ;;
+    HOST_NIC_RENAMED) HOST_NIC_RENAMED="${value}" ;;
+    DATA_NIC_RENAMED) DATA_NIC_RENAMED="${value}" ;;
     SPAN_NICS)      SPAN_NICS="${value}" ;;
     SENSOR_VCPUS)   SENSOR_VCPUS="${value}" ;;
     SENSOR_MEMORY_MB) SENSOR_MEMORY_MB="${value}" ;;
@@ -895,7 +897,7 @@ list_nic_candidates() {
 #######################################
 
 step_01_hw_detect() {
-  log "[STEP 01] Hardware / NIC / CPU / Memory / SPAN NIC Selection"
+  log "[STEP 01] Hardware / NIC / SPAN NIC Selection"
 
   # Load latest configuration (prevent script failure if not available)
   if type load_config >/dev/null 2>&1; then
@@ -927,43 +929,91 @@ step_01_hw_detect() {
   : "${LV_SIZE_GB:=}"
   
   if [[ "${net_mode}" == "bridge" ]]; then
-    if [[ -n "${HOST_NIC}" && -n "${DATA_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" ]]; then
+    if [[ -n "${HOST_NIC}" && -n "${DATA_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
       [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- HOST NIC: ${HOST_NIC}\n- DATA NIC: ${DATA_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR Memory: ${SENSOR_MEMORY_MB}MB\n- LV Location: ${LV_LOCATION}\n- LV Size: ${LV_SIZE_GB}GB"
+      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- HOST NIC: ${HOST_NIC}\n- DATA NIC: ${DATA_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
     fi
   elif [[ "${net_mode}" == "nat" ]]; then
-    if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_VCPUS}" && -n "${SENSOR_MEMORY_MB}" && -n "${SENSOR_SPAN_VF_PCIS}" && -n "${LV_LOCATION}" && -n "${LV_SIZE_GB}" ]]; then
+    if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
       [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}\n- SENSOR vCPU: ${SENSOR_VCPUS}\n- SENSOR Memory: ${SENSOR_MEMORY_MB}MB\n- LV Location: ${LV_LOCATION}\n- LV Size: ${LV_SIZE_GB}GB"
+      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
     fi
   fi
   
   if [[ "${can_reuse_config}" -eq 1 ]]; then
     # Validate that configured NICs actually exist before reusing
+    # Check both original names and renamed names (after STEP 03 udev rule)
     local nic_validation_failed=0
     local missing_nics=""
     
+    # Load renamed interface names if available
+    : "${HOST_NIC_RENAMED:=}"
+    : "${DATA_NIC_RENAMED:=}"
+    
     if [[ "${net_mode}" == "bridge" ]]; then
-      if [[ ! -d "/sys/class/net/${HOST_NIC}" ]]; then
-        missing_nics="${missing_nics}HOST_NIC: ${HOST_NIC}\n"
+      # Check HOST_NIC (original or renamed)
+      local host_nic_found=0
+      if [[ -d "/sys/class/net/${HOST_NIC}" ]]; then
+        host_nic_found=1
+      elif [[ -n "${HOST_NIC_RENAMED}" ]] && [[ -d "/sys/class/net/${HOST_NIC_RENAMED}" ]]; then
+        host_nic_found=1
+        log "[STEP 01] HOST_NIC found with renamed name: ${HOST_NIC_RENAMED} (original: ${HOST_NIC})"
+      fi
+      
+      if [[ ${host_nic_found} -eq 0 ]]; then
+        missing_nics="${missing_nics}HOST_NIC: ${HOST_NIC}"
+        if [[ -n "${HOST_NIC_RENAMED}" ]]; then
+          missing_nics="${missing_nics} (renamed: ${HOST_NIC_RENAMED})\n"
+        else
+          missing_nics="${missing_nics}\n"
+        fi
         nic_validation_failed=1
       fi
-      if [[ ! -d "/sys/class/net/${DATA_NIC}" ]]; then
-        missing_nics="${missing_nics}DATA_NIC: ${DATA_NIC}\n"
+      
+      # Check DATA_NIC (original or renamed)
+      local data_nic_found=0
+      if [[ -d "/sys/class/net/${DATA_NIC}" ]]; then
+        data_nic_found=1
+      elif [[ -n "${DATA_NIC_RENAMED}" ]] && [[ -d "/sys/class/net/${DATA_NIC_RENAMED}" ]]; then
+        data_nic_found=1
+        log "[STEP 01] DATA_NIC found with renamed name: ${DATA_NIC_RENAMED} (original: ${DATA_NIC})"
+      fi
+      
+      if [[ ${data_nic_found} -eq 0 ]]; then
+        missing_nics="${missing_nics}DATA_NIC: ${DATA_NIC}"
+        if [[ -n "${DATA_NIC_RENAMED}" ]]; then
+          missing_nics="${missing_nics} (renamed: ${DATA_NIC_RENAMED})\n"
+        else
+          missing_nics="${missing_nics}\n"
+        fi
         nic_validation_failed=1
       fi
     elif [[ "${net_mode}" == "nat" ]]; then
-      if [[ ! -d "/sys/class/net/${HOST_NIC}" ]]; then
-        missing_nics="${missing_nics}NAT uplink NIC (HOST_NIC): ${HOST_NIC}\n"
+      # Check HOST_NIC (original or renamed)
+      local host_nic_found=0
+      if [[ -d "/sys/class/net/${HOST_NIC}" ]]; then
+        host_nic_found=1
+      elif [[ -n "${HOST_NIC_RENAMED}" ]] && [[ -d "/sys/class/net/${HOST_NIC_RENAMED}" ]]; then
+        host_nic_found=1
+        log "[STEP 01] HOST_NIC found with renamed name: ${HOST_NIC_RENAMED} (original: ${HOST_NIC})"
+      fi
+      
+      if [[ ${host_nic_found} -eq 0 ]]; then
+        missing_nics="${missing_nics}NAT uplink NIC (HOST_NIC): ${HOST_NIC}"
+        if [[ -n "${HOST_NIC_RENAMED}" ]]; then
+          missing_nics="${missing_nics} (renamed: ${HOST_NIC_RENAMED})\n"
+        else
+          missing_nics="${missing_nics}\n"
+        fi
         nic_validation_failed=1
       fi
     fi
     
-    # Validate SPAN NICs
+    # Validate SPAN NICs (SPAN NICs are not renamed, so check original names)
     if [[ -n "${SPAN_NICS:-}" ]]; then
       for span_nic in ${SPAN_NICS}; do
         if [[ ! -d "/sys/class/net/${span_nic}" ]]; then
@@ -994,12 +1044,8 @@ step_01_hw_detect() {
       save_config_var "HOST_NIC"      "${HOST_NIC}"
       save_config_var "DATA_NIC"       "${DATA_NIC}"
       save_config_var "SPAN_NICS"     "${SPAN_NICS}"
-      save_config_var "SENSOR_VCPUS"  "${SENSOR_VCPUS}"
-      save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
       save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
       save_config_var "SPAN_ATTACH_MODE" "${SPAN_ATTACH_MODE}"
-      save_config_var "LV_LOCATION" "${LV_LOCATION}"
-      save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
 
       # Reuse means 'success + nothing more to do in this step', so return 0 normally
       return 0
@@ -1007,116 +1053,7 @@ step_01_hw_detect() {
   fi
 
   ########################
-  # 1) CPU Calculation
-  ########################
-  local total_cpus default_sensor_cpus sensor_vcpus
-  total_cpus=$(nproc)
-  default_sensor_cpus=$((total_cpus - 4))
-  
-  if [[ ${default_sensor_cpus} -le 0 ]]; then
-    default_sensor_cpus=1
-  fi
-  
-  sensor_vcpus=$(whiptail_inputbox "STEP 01 - Sensor vCPU Configuration" "Enter the number of vCPUs to allocate to the sensor VM.\n\nTotal logical CPUs: ${total_cpus}\nDefault: ${default_sensor_cpus}" "${default_sensor_cpus}" 12 70) || {
-    log "User canceled sensor vCPU configuration."
-    return 1
-  }
-
-  log "Configured sensor vCPU: ${sensor_vcpus}"
-  SENSOR_VCPUS="${sensor_vcpus}"
-  save_config_var "SENSOR_VCPUS" "${SENSOR_VCPUS}"
-
-  ########################
-  # 2) Memory Calculation
-  ########################
-  local total_mem_kb total_mem_gb default_sensor_gb sensor_gb sensor_memory_mb
-  total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
-  total_mem_gb=$((total_mem_kb / 1024 / 1024))
-  default_sensor_gb=$((total_mem_gb - 12))
-  
-  if [[ ${default_sensor_gb} -le 0 ]]; then
-    whiptail_msgbox "Memory Insufficient Warning" "System memory is insufficient.\nTotal memory: ${total_mem_gb}GB\nDefault allocation value is 0 or less.\n\nPlease enter an appropriate memory size in the next screen." 12 70
-    default_sensor_gb=4  # Suggest 4GB as default
-  fi
-  
-  sensor_gb=$(whiptail_inputbox "STEP 01 - Sensor Memory Configuration" "Enter the memory (GB) to allocate to the sensor VM.\n\nTotal memory: ${total_mem_gb}GB\nRecommended: ${default_sensor_gb}GB" "${default_sensor_gb}" 12 70) || {
-    log "User canceled sensor memory configuration."
-    return 1
-  }
-
-  sensor_memory_mb=$((sensor_gb * 1024))
-  log "Configured sensor memory: ${sensor_gb}GB (${sensor_memory_mb}MB)"
-  SENSOR_MEMORY_MB="${sensor_memory_mb}"
-  save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
-
-  ########################
-  # 3) Storage Allocation Configuration
-  ########################
-  # Check and display sda3 disk information
-  log "[STEP 01] Checking sda3 disk information"
-
-  # Check ubuntu-vg total size (OpenXDR method) - Modified: fixed unit
-  local ubuntu_vg_total_size
-  # Extract only GB unit numbers using --units g --nosuffix option (may include decimals)
-  ubuntu_vg_total_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
-
-  # Check ubuntu-lv used size - Modified: fixed unit
-  local ubuntu_lv_size ubuntu_lv_gb=0
-  if command -v lvs >/dev/null 2>&1; then
-    # Extract only GB unit numbers using --units g --nosuffix option
-    ubuntu_lv_size=$(lvs ubuntu-vg/ubuntu-lv --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
-    # Remove decimal point (integer conversion) -> Example: 100.50 -> 100
-    ubuntu_lv_gb=${ubuntu_lv_size%.*}
-  else
-    ubuntu_lv_size="Unable to check"
-  fi
-
-  # Convert ubuntu-vg total size to integer (remove decimal point) -> Example: 1781.xx -> 1781
-  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
-  
-  # Calculate available space
-  local available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
-  [[ ${available_gb} -lt 0 ]] && available_gb=0
-  
-  # Configure LV location to ubuntu-vg (OpenXDR method)
-  local lv_location="ubuntu-vg"
-  log "[STEP 01] Auto-configuring LV location: ${lv_location} (Using existing ubuntu-vg free space)"
-  
-  # Get LV size input from user
-  local lv_size_gb
-  while true; do
-    lv_size_gb=$(whiptail_inputbox "STEP 01 - Sensor Storage Size Configuration" "Enter sensor VM storage size (GB):\n\nubuntu-vg Total Size: ${ubuntu_vg_total_size}\nSystem use: ${ubuntu_lv_size}\nAvailable: approximately ${available_gb}GB\n\nInstallation Location: ubuntu-vg (OpenXDR Method)\nMinimum Size: 80GB\nDefault: 500GB\n\nSize (GB):" "200" 16 65) || {
-      log "User canceled sensor storage size configuration."
-      return 1
-    }
-      
-      # numeric format Verification
-      if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
-        whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
-        continue
-      fi
-      
-      # Minimum Size Verification (80GB)
-      if [[ "${lv_size_gb}" -lt 80 ]]; then
-        whiptail_msgbox "Size Insufficient" "Minimum size must be at least 80GB.\nInput value: ${lv_size_gb}GB"
-        continue
-      fi
-      
-      # If valid, exit loop
-      break
-    done
-    
-    log "Configured LV Location: ${lv_location}"
-    log "Configured LV Size: ${lv_size_gb}GB"
-    
-    # Configuration store
-    LV_LOCATION="${lv_location}"
-    LV_SIZE_GB="${lv_size_gb}"
-    save_config_var "LV_LOCATION" "${LV_LOCATION}"
-    save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
-
-  ########################
-  # 4) NIC candidate  and Selection
+  # 1) NIC candidate  and Selection
   ########################
   local nics nic_list nic name idx
 
@@ -1401,10 +1338,6 @@ step_01_hw_detect() {
 [STEP 01 Result Summary - Bridge Mode]
 
 - Sensor Network Mode : ${net_mode}
-- Sensor vCPU        : ${SENSOR_VCPUS}
-- Sensor Memory       : ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)
-- LV Location          : ${LV_LOCATION}
-- LV Size          : ${LV_SIZE_GB}GB
 - Host NIC         : ${HOST_NIC}
 - Data NIC         : ${DATA_NIC}
 - SPAN NICs       : ${SPAN_NICS}
@@ -1419,10 +1352,6 @@ EOF
 [STEP 01 Result Summary - NAT Mode]
 
 - Sensor Network Mode : ${net_mode}
-- Sensor vCPU        : ${SENSOR_VCPUS}
-- Sensor Memory       : ${sensor_gb}GB (${SENSOR_MEMORY_MB}MB)
-- LV Location          : ${LV_LOCATION}
-- LV Size          : ${LV_SIZE_GB}GB
 - NAT uplink NIC     : ${HOST_NIC}
 - Data NIC         : N/A (NAT Mode - using virbr0)
 - SPAN NICs       : ${SPAN_NICS}
@@ -1945,6 +1874,36 @@ EOF
   # udev reload
   run_cmd "sudo udevadm control --reload"
   run_cmd "sudo udevadm trigger --type=devices --action=add"
+  
+  # Wait a moment for interface names to change
+  sleep 2
+
+  #######################################
+  # 3.5) Update state file with renamed interface names
+  #######################################
+  log "[STEP 03] Updating state file with renamed interface names"
+  
+  # After udev rule application, interfaces are renamed to 'host' and 'data'
+  # Store both original and renamed names for compatibility
+  local renamed_host_nic="host"
+  local renamed_data_nic="data"
+  
+  # Verify renamed interfaces exist
+  if ip link show "${renamed_host_nic}" >/dev/null 2>&1; then
+    log "[STEP 03] HOST NIC renamed: ${HOST_NIC} -> ${renamed_host_nic}"
+    # Store renamed name (original name is already stored)
+    save_config_var "HOST_NIC_RENAMED" "${renamed_host_nic}"
+  else
+    log "[WARN] Renamed HOST NIC '${renamed_host_nic}' not found"
+  fi
+  
+  if ip link show "${renamed_data_nic}" >/dev/null 2>&1; then
+    log "[STEP 03] DATA NIC renamed: ${DATA_NIC} -> ${renamed_data_nic}"
+    # Store renamed name (original name is already stored)
+    save_config_var "DATA_NIC_RENAMED" "${renamed_data_nic}"
+  else
+    log "[WARN] Renamed DATA NIC '${renamed_data_nic}' not found"
+  fi
 
   #######################################
   # 4) /etc/network/interfaces Creation
@@ -3891,13 +3850,48 @@ step_07_sensor_download() {
   # User Configuration  (OpenXDR Method: ubuntu-vg use)
   : "${LV_LOCATION:=ubuntu-vg}"
   
-  # Check if LV_SIZE_GB is configured (must be set in STEP 01)
-  if [[ -z "${LV_SIZE_GB:-}" ]]; then
-    whiptail_msgbox "STEP 07 - Configuration Error" "Sensor storage size (LV_SIZE_GB) is not configured.\n\nPlease complete Hardware Configuration in STEP 01." 12 70
-    log "LV_SIZE_GB is not configured"
+  #######################################
+  # 0) Get LV Size from user input
+  #######################################
+  # Check ubuntu-vg total size and available space
+  local ubuntu_vg_total_size ubuntu_lv_size ubuntu_lv_gb available_gb
+  ubuntu_vg_total_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
+  
+  if command -v lvs >/dev/null 2>&1; then
+    ubuntu_lv_size=$(lvs ubuntu-vg/ubuntu-lv --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
+    ubuntu_lv_gb=${ubuntu_lv_size%.*}
+  else
+    ubuntu_lv_gb=0
+  fi
+  
+  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
+  available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
+  [[ ${available_gb} -lt 0 ]] && available_gb=0
+  
+  local disk_info_msg="Disk Information:\n- ubuntu-vg Total Size: ${ubuntu_vg_total_size}GB\n- System use (ubuntu-lv): ${ubuntu_lv_size}GB\n- Available: approximately ${available_gb}GB\n\n"
+  
+  local lv_size_gb
+  lv_size_gb=$(whiptail_inputbox "STEP 07 - Sensor LV Creation Size" "${disk_info_msg}Enter Sensor LV Creation size (GB):\n\nDefault: 300GB\nMinimum Size: 100GB\n\nSize (GB):" "300" 16 70) || {
+    log "User canceled Sensor LV size configuration."
+    return 1
+  }
+  
+  # Validate input
+  if ! [[ "${lv_size_gb}" =~ ^[0-9]+$ ]]; then
+    whiptail_msgbox "Input Error" "Please enter a valid number.\nInput value: ${lv_size_gb}"
+    log "Invalid LV size input: ${lv_size_gb}"
     return 1
   fi
   
+  # Minimum Size Verification (100GB)
+  if [[ "${lv_size_gb}" -lt 100 ]]; then
+    whiptail_msgbox "Size Insufficient" "Minimum size must be at least 100GB.\nInput value: ${lv_size_gb}GB"
+    log "LV size too small: ${lv_size_gb}GB"
+    return 1
+  fi
+  
+  LV_SIZE_GB="${lv_size_gb}"
+  save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
   log "[STEP 07] User Configuration - LV Location: ${LV_LOCATION}, LV Size: ${LV_SIZE_GB}GB"
 
   local tmp_status="/tmp/xdr_step09_status.txt"
@@ -4091,10 +4085,33 @@ step_07_sensor_download() {
       use_local_qcow=1
       log "[STEP 07] User chose to use local qcow2 file (${local_qcow})."
       
+      # Check if target already has different version qcow2 file
+      local existing_qcow2
+      existing_qcow2=$(find "${SENSOR_IMAGE_DIR}" -maxdepth 1 -type f -name "aella-modular-ds-*.qcow2" 2>/dev/null | head -n1)
+      
+      if [[ -n "${existing_qcow2}" ]]; then
+        local existing_version
+        existing_version=$(basename "${existing_qcow2}" | sed -n 's/aella-modular-ds-\([0-9.]*\)\.qcow2/\1/p')
+        
+        if [[ "${existing_version}" != "${SENSOR_VERSION}" ]]; then
+          log "[STEP 07] Existing qcow2 file with different version found: ${existing_qcow2} (version: ${existing_version})"
+          log "[STEP 07] Removing old version qcow2 file before copying new version"
+          if [[ "${DRY_RUN}" -eq 1 ]]; then
+            log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
+          else
+            run_cmd "sudo rm -f ${existing_qcow2}"
+            log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
+          fi
+        else
+          log "[STEP 07] Existing qcow2 file with same version found: ${existing_qcow2} (version: ${existing_version})"
+          log "[STEP 07] Will overwrite with local qcow2 file"
+        fi
+      fi
+      
       if [[ "${DRY_RUN}" -eq 1 ]]; then
         log "[DRY-RUN] sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
       else
-        sudo cp "${local_qcow}" "${SENSOR_IMAGE_DIR}/${qcow2_name}"
+        run_cmd "sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
         log "[STEP 07] Local qcow2 copied to ${SENSOR_IMAGE_DIR}/${qcow2_name} (completed)"
       fi
     else
@@ -4115,9 +4132,54 @@ step_07_sensor_download() {
   
   # Download qcow2 file if local file is not available
   if [[ "${use_local_qcow}" -eq 0 ]]; then
-    log "[STEP 07] Downloading ${qcow2_name}"
-    need_qcow2=1
+    # Check if existing qcow2 file with different version exists
+    local existing_qcow2
+    existing_qcow2=$(find "${SENSOR_IMAGE_DIR}" -maxdepth 1 -type f -name "aella-modular-ds-*.qcow2" 2>/dev/null | head -n1)
+    
+    if [[ -n "${existing_qcow2}" ]]; then
+      local existing_version
+      existing_version=$(basename "${existing_qcow2}" | sed -n 's/aella-modular-ds-\([0-9.]*\)\.qcow2/\1/p')
+      
+      if [[ "${existing_version}" != "${SENSOR_VERSION}" ]]; then
+        log "[STEP 07] Existing qcow2 file with different version found: ${existing_qcow2} (version: ${existing_version})"
+        log "[STEP 07] Removing old version qcow2 file before downloading new version"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+          log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
+        else
+          run_cmd "sudo rm -f ${existing_qcow2}"
+          log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
+        fi
+      else
+        log "[STEP 07] Existing qcow2 file with same version found: ${existing_qcow2} (version: ${existing_version})"
+        log "[STEP 07] Skipping download - using existing file"
+        need_qcow2=0
+      fi
+    fi
+    
+    if [[ "${need_qcow2}" -eq 1 ]]; then
+      log "[STEP 07] Downloading ${qcow2_name}"
+    fi
   else
+    # When using local qcow2, check if target already has different version
+    local existing_qcow2
+    existing_qcow2=$(find "${SENSOR_IMAGE_DIR}" -maxdepth 1 -type f -name "aella-modular-ds-*.qcow2" 2>/dev/null | head -n1)
+    
+    if [[ -n "${existing_qcow2}" ]]; then
+      local existing_version
+      existing_version=$(basename "${existing_qcow2}" | sed -n 's/aella-modular-ds-\([0-9.]*\)\.qcow2/\1/p')
+      
+      if [[ "${existing_version}" != "${SENSOR_VERSION}" ]]; then
+        log "[STEP 07] Existing qcow2 file with different version found: ${existing_qcow2} (version: ${existing_version})"
+        log "[STEP 07] Removing old version qcow2 file before copying new version"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+          log "[DRY-RUN] sudo rm -f ${existing_qcow2}"
+        else
+          run_cmd "sudo rm -f ${existing_qcow2}"
+          log "[STEP 07] Old version qcow2 file removed: ${existing_qcow2}"
+        fi
+      fi
+    fi
+    
     log "[STEP 07] Using local qcow2 file -> skipping download"
   fi
 
@@ -4158,6 +4220,12 @@ step_07_sensor_download() {
       
       # 2) Download qcow2 image (skip if local qcow2 is being used)
       if [[ "${need_qcow2}" -eq 1 ]]; then
+        # Remove existing qcow2 file if it exists (different version or same)
+        if [[ -f "${qcow2_name}" ]]; then
+          log "[STEP 07] Removing existing qcow2 file before download: ${qcow2_name}"
+          rm -f "${qcow2_name}"
+        fi
+        
         log "[STEP 07] Starting ${qcow2_name} download: ${image_url}"
         echo "=== ${qcow2_name} download in progress (large file, this may take some time) ==="
         echo "File size may be large, please wait..."
@@ -4309,31 +4377,265 @@ step_08_sensor_deploy() {
 
   local tmp_status="${STATE_DIR}/xdr_step10_status.txt"
 
-  # Configuration check
-  if [[ -z "${SENSOR_VCPUS:-}" || -z "${SENSOR_MEMORY_MB:-}" ]]; then
-    whiptail_msgbox "STEP 08 - Configuration Error" "Sensor vCPU or Memory configuration does not exist.\n\nPlease complete Hardware Configuration in STEP 01." 12 70
-    log "SENSOR_VCPUS or SENSOR_MEMORY_MB is not configured"
-    return 1
+  #######################################
+  # 0) Prompt for Sensor VM configuration (memory, vCPU, disk)
+  #######################################
+  # Calculate default values based on system resources
+  # Memory allocation: 12% of total memory reserved for KVM host, remaining for Sensor
+  local total_cpus total_mem_kb total_mem_gb host_reserve_gb available_mem_gb
+  total_cpus=$(nproc)
+  total_mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  total_mem_gb=$((total_mem_kb / 1024 / 1024))
+  # Reserve 12% of total memory for KVM host
+  host_reserve_gb=$((total_mem_gb * 12 / 100))
+  available_mem_gb=$((total_mem_gb - host_reserve_gb))
+  [[ ${available_mem_gb} -le 0 ]] && available_mem_gb=16
+  
+  # Default memory: available memory (after 12% host reserve) for Sensor
+  local default_sensor_mem_gb=${available_mem_gb}
+  [[ ${default_sensor_mem_gb} -lt 8 ]] && default_sensor_mem_gb=8
+  
+  # Default vCPU: Total CPUs minus 4 (4 CPUs reserved for host)
+  local default_sensor_vcpus=$((total_cpus - 4))
+  [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
+  
+  local default_sensor_disk_gb=300
+  
+  # Use existing values if set, otherwise use calculated defaults
+  : "${SENSOR_MEMORY_MB:=}"
+  : "${SENSOR_VCPUS:=}"
+  : "${LV_SIZE_GB:=}"
+  
+  # 1) Memory
+  # Always use calculated default value for input box (not saved value)
+  local sensor_mem_gb="${default_sensor_mem_gb}"
+  local _SENSOR_MEM_INPUT
+  local mem_input_rc
+  _SENSOR_MEM_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM memory" "Enter memory (GB) for Sensor VM.\n\nTotal memory: ${total_mem_gb}GB\nHost reserve (12%): ${host_reserve_gb}GB\nAvailable: ${available_mem_gb}GB\nDefault value: ${default_sensor_mem_gb}GB\nExample: Enter 32" "${default_sensor_mem_gb}" 14 80)"
+  mem_input_rc=$?
+
+  if [ ${mem_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 08] User canceled memory input. Exiting step."
+    return 0
   fi
 
-  # Check if LV_SIZE_GB is configured (must be set in STEP 01)
-  if [[ -z "${LV_SIZE_GB:-}" ]]; then
-    whiptail_msgbox "STEP 08 - Configuration Error" "Sensor storage size (LV_SIZE_GB) is not configured.\n\nPlease complete Hardware Configuration in STEP 01." 12 70
-    log "LV_SIZE_GB is not configured"
-    return 1
+  if [ -n "${_SENSOR_MEM_INPUT}" ]; then
+    if [[ "${_SENSOR_MEM_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_MEM_INPUT}" -gt 0 ]; then
+      sensor_mem_gb="${_SENSOR_MEM_INPUT}"
+    else
+      whiptail_msgbox "STEP 08 - Sensor memory" "Invalid memory value.\nUsing current default (${default_sensor_mem_gb} GB)." 10 70
+      sensor_mem_gb="${default_sensor_mem_gb}"
+    fi
+  else
+    # Empty input - use default
+    sensor_mem_gb="${default_sensor_mem_gb}"
   fi
+
+  # 2) vCPU
+  local vcpu_default_msg="Total CPUs: ${total_cpus}\nReserved for host: 4\nDefault value: ${default_sensor_vcpus}"
+  local _SENSOR_VCPU_INPUT
+  local vcpu_input_rc
+  _SENSOR_VCPU_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM vCPU" "Enter number of vCPUs for Sensor VM.\n\n${vcpu_default_msg}\nExample: Enter 8" "${default_sensor_vcpus}" 12 80)"
+  vcpu_input_rc=$?
+
+  if [ ${vcpu_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 08] User canceled vCPU input. Exiting step."
+    return 0
+  fi
+
+  local sensor_vcpus="${default_sensor_vcpus}"
+  if [ -n "${_SENSOR_VCPU_INPUT}" ]; then
+    if [[ "${_SENSOR_VCPU_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_VCPU_INPUT}" -gt 0 ]; then
+      sensor_vcpus="${_SENSOR_VCPU_INPUT}"
+    else
+      whiptail_msgbox "STEP 08 - Sensor vCPU" "Invalid vCPU value.\nUsing current default (${default_sensor_vcpus})." 10 70
+      sensor_vcpus="${default_sensor_vcpus}"
+    fi
+  else
+    # Empty input - use default
+    sensor_vcpus="${default_sensor_vcpus}"
+  fi
+
+  # 3) Disk
+  local _SENSOR_DISK_INPUT
+  local disk_input_rc
+  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM disk" "Enter disk size (GB) for Sensor VM.\n\nDefault value: ${default_sensor_disk_gb}GB\nMinimum: 100GB\nExample: Enter 300" "${default_sensor_disk_gb}" 12 80)"
+  disk_input_rc=$?
+
+  if [ ${disk_input_rc} -ne 0 ]; then
+    # User canceled
+    log "[STEP 08] User canceled disk input. Exiting step."
+    return 0
+  fi
+
+  local sensor_disk_gb="${default_sensor_disk_gb}"
+  if [ -n "${_SENSOR_DISK_INPUT}" ]; then
+    if [[ "${_SENSOR_DISK_INPUT}" =~ ^[0-9]+$ ]] && [ "${_SENSOR_DISK_INPUT}" -gt 0 ]; then
+      if [[ "${_SENSOR_DISK_INPUT}" -lt 100 ]]; then
+        whiptail_msgbox "STEP 08 - Sensor disk" "Minimum disk size is 100GB.\nUsing current default (${default_sensor_disk_gb} GB)." 10 70
+        sensor_disk_gb="${default_sensor_disk_gb}"
+      else
+        sensor_disk_gb="${_SENSOR_DISK_INPUT}"
+      fi
+    else
+      whiptail_msgbox "STEP 08 - Sensor disk" "Invalid disk size value.\nUsing current default (${default_sensor_disk_gb} GB)." 10 70
+      sensor_disk_gb="${default_sensor_disk_gb}"
+    fi
+  else
+    # Empty input - use default
+    sensor_disk_gb="${default_sensor_disk_gb}"
+  fi
+
+  # Convert memory to MB
+  local mem_mb=$(( sensor_mem_gb * 1024 ))
+  local cpus="${sensor_vcpus}"
+  local disksize="${sensor_disk_gb}"
+
+  # 4) Bridge Mode: IP Configuration (if bridge mode)
+  local sensor_ip sensor_netmask sensor_gateway sensor_dns
+  if [[ "${net_mode}" == "bridge" ]]; then
+    # Use existing values if set, otherwise use defaults
+    local default_ip="${SENSOR_VM_IP:-192.168.100.100}"
+    local default_netmask="${SENSOR_VM_NETMASK:-255.255.255.0}"
+    local default_gateway="${SENSOR_VM_GATEWAY:-192.168.100.1}"
+    local default_dns="${SENSOR_VM_DNS:-8.8.8.8}"
+    
+    # IP Address
+    local _SENSOR_IP_INPUT
+    local ip_input_rc
+    _SENSOR_IP_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM IP Address" "Enter IP address for Sensor VM (Bridge Mode).\n\nDefault value: ${default_ip}\nExample: 192.168.100.100" "${default_ip}" 12 70)"
+    ip_input_rc=$?
+    
+    if [ ${ip_input_rc} -ne 0 ]; then
+      log "[STEP 08] User canceled IP input. Exiting step."
+      return 0
+    fi
+    
+    if [ -n "${_SENSOR_IP_INPUT}" ]; then
+      if [[ "${_SENSOR_IP_INPUT}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        sensor_ip="${_SENSOR_IP_INPUT}"
+      else
+        whiptail_msgbox "STEP 08 - Sensor VM IP" "Invalid IP address format.\nUsing default (${default_ip})." 10 70
+        sensor_ip="${default_ip}"
+      fi
+    else
+      sensor_ip="${default_ip}"
+    fi
+    
+    # Netmask
+    local _SENSOR_NETMASK_INPUT
+    local netmask_input_rc
+    _SENSOR_NETMASK_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM Netmask" "Enter netmask for Sensor VM (Bridge Mode).\n\nDefault value: ${default_netmask}\nExample: 255.255.255.0" "${default_netmask}" 12 70)"
+    netmask_input_rc=$?
+    
+    if [ ${netmask_input_rc} -ne 0 ]; then
+      log "[STEP 08] User canceled netmask input. Exiting step."
+      return 0
+    fi
+    
+    if [ -n "${_SENSOR_NETMASK_INPUT}" ]; then
+      if [[ "${_SENSOR_NETMASK_INPUT}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        sensor_netmask="${_SENSOR_NETMASK_INPUT}"
+      else
+        whiptail_msgbox "STEP 08 - Sensor VM Netmask" "Invalid netmask format.\nUsing default (${default_netmask})." 10 70
+        sensor_netmask="${default_netmask}"
+      fi
+    else
+      sensor_netmask="${default_netmask}"
+    fi
+    
+    # Gateway
+    local _SENSOR_GATEWAY_INPUT
+    local gateway_input_rc
+    _SENSOR_GATEWAY_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM Gateway" "Enter gateway IP for Sensor VM (Bridge Mode).\n\nDefault value: ${default_gateway}\nExample: 192.168.100.1" "${default_gateway}" 12 70)"
+    gateway_input_rc=$?
+    
+    if [ ${gateway_input_rc} -ne 0 ]; then
+      log "[STEP 08] User canceled gateway input. Exiting step."
+      return 0
+    fi
+    
+    if [ -n "${_SENSOR_GATEWAY_INPUT}" ]; then
+      if [[ "${_SENSOR_GATEWAY_INPUT}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        sensor_gateway="${_SENSOR_GATEWAY_INPUT}"
+      else
+        whiptail_msgbox "STEP 08 - Sensor VM Gateway" "Invalid gateway format.\nUsing default (${default_gateway})." 10 70
+        sensor_gateway="${default_gateway}"
+      fi
+    else
+      sensor_gateway="${default_gateway}"
+    fi
+    
+    # DNS
+    local _SENSOR_DNS_INPUT
+    local dns_input_rc
+    _SENSOR_DNS_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM DNS" "Enter DNS server IP for Sensor VM (Bridge Mode).\n\nDefault value: ${default_dns}\nExample: 8.8.8.8" "${default_dns}" 12 70)"
+    dns_input_rc=$?
+    
+    if [ ${dns_input_rc} -ne 0 ]; then
+      log "[STEP 08] User canceled DNS input. Exiting step."
+      return 0
+    fi
+    
+    if [ -n "${_SENSOR_DNS_INPUT}" ]; then
+      if [[ "${_SENSOR_DNS_INPUT}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        sensor_dns="${_SENSOR_DNS_INPUT}"
+      else
+        whiptail_msgbox "STEP 08 - Sensor VM DNS" "Invalid DNS format.\nUsing default (${default_dns})." 10 70
+        sensor_dns="${default_dns}"
+      fi
+    else
+      sensor_dns="${default_dns}"
+    fi
+    
+    # Save IP configuration
+    SENSOR_VM_IP="${sensor_ip}"
+    SENSOR_VM_NETMASK="${sensor_netmask}"
+    SENSOR_VM_GATEWAY="${sensor_gateway}"
+    SENSOR_VM_DNS="${sensor_dns}"
+    save_config_var "SENSOR_VM_IP" "${SENSOR_VM_IP}"
+    save_config_var "SENSOR_VM_NETMASK" "${SENSOR_VM_NETMASK}"
+    save_config_var "SENSOR_VM_GATEWAY" "${SENSOR_VM_GATEWAY}"
+    save_config_var "SENSOR_VM_DNS" "${SENSOR_VM_DNS}"
+    
+    log "[STEP 08] Bridge Mode IP Configuration: IP=${sensor_ip}, Netmask=${sensor_netmask}, Gateway=${sensor_gateway}, DNS=${sensor_dns}"
+  fi
+
+  # Save configuration
+  SENSOR_MEMORY_MB="${mem_mb}"
+  SENSOR_VCPUS="${cpus}"
+  LV_SIZE_GB="${sensor_disk_gb}"
+  save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
+  save_config_var "SENSOR_VCPUS" "${SENSOR_VCPUS}"
+  save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
+
+  log "[STEP 08] Sensor VM Configuration:"
+  log "  Memory: ${sensor_mem_gb}GB (${mem_mb}MB)"
+  log "  vCPU: ${cpus}"
+  log "  Disk: ${sensor_disk_gb}GB"
 
   #######################################
-  # 0) Current status check
+  # 1) Current status check
   #######################################
   local vm_exists="no"
   local vm_running="no"
 
-  if virsh list --all | grep -q "\smds\s" 2>/dev/null; then
-    vm_exists="yes"
-    if virsh list --state-running | grep -q "\smds\s" 2>/dev/null; then
-      vm_running="yes"
+  # Skip virsh check in DRY_RUN mode
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    if command -v virsh >/dev/null 2>&1; then
+      if virsh list --all | grep -q "\smds\s" 2>/dev/null; then
+        vm_exists="yes"
+        if virsh list --state-running | grep -q "\smds\s" 2>/dev/null; then
+          vm_running="yes"
+        fi
+      fi
+    else
+      log "[WARN] virsh command not found, skipping VM status check"
     fi
+  else
+    log "[DRY-RUN] Skipping virsh VM status check"
   fi
 
   {
@@ -4344,13 +4646,13 @@ step_08_sensor_deploy() {
     echo
     echo "Deployment Configuration:"
     echo "- hostname: mds"
-    echo "- vCPU: ${SENSOR_VCPUS}"
-    echo "- Memory: ${SENSOR_MEMORY_MB}MB"
-    echo "- Disk Size: ${LV_SIZE_GB}GB"
+    echo "- vCPU: ${cpus}"
+    echo "- Memory: ${sensor_mem_gb}GB (${mem_mb}MB)"
+    echo "- Disk Size: ${sensor_disk_gb}GB"
     echo "- Install Dir: /var/lib/libvirt/images/mds"
     echo
     echo " STEP: virt_deploy_modular_ds.sh script will be used"
-    echo "Sensor VM deployment (nodownload=1 execution)"
+    echo "Sensor VM deployment (nodownload=true execution)"
   } > "${tmp_status}"
 
   show_textbox "STEP 08 - Sensor VM Deployment unit" "${tmp_status}"
@@ -4366,6 +4668,18 @@ step_08_sensor_deploy() {
         run_cmd "virsh destroy mds"
       fi
       run_cmd "virsh undefine mds --remove-all-storage"
+      
+      # Remove VM disk directory to ensure clean deployment
+      local vm_disk_dir="/var/lib/libvirt/images/mds/images/mds"
+      if [[ -d "${vm_disk_dir}" ]]; then
+        log "[STEP 08] Removing existing VM disk directory: ${vm_disk_dir}"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+          log "[DRY-RUN] sudo rm -rf ${vm_disk_dir}"
+        else
+          run_cmd "sudo rm -rf ${vm_disk_dir}"
+          log "[STEP 08] VM disk directory removed: ${vm_disk_dir}"
+        fi
+      fi
     fi
   fi
 
@@ -4394,18 +4708,21 @@ step_08_sensor_deploy() {
   local release="${SENSOR_VERSION}"
   local hostname="mds"
   local installdir="/var/lib/libvirt/images/mds"
-  local cpus="${SENSOR_VCPUS}"
-  local memory="${SENSOR_MEMORY_MB}"
-  # Check if LV_SIZE_GB already has GB suffix
-  local disksize
-  if [[ "${LV_SIZE_GB}" =~ GB$ ]]; then
-    disksize="${LV_SIZE_GB}"
+  # Use values from user input above
+  # cpus, mem_mb, disksize are already set from user input
+  # Check if disksize already has GB suffix
+  local disksize_final
+  if [[ "${disksize}" =~ GB$ ]]; then
+    disksize_final="${disksize}"
   else
-    disksize="${LV_SIZE_GB}GB"
+    disksize_final="${disksize}GB"
   fi
-  local nodownload="1"
+  local nodownload="true"
+  
+  # Use mem_mb for deployment (already converted from GB to MB)
+  local memory="${mem_mb}"
 
-  local deploy_cmd="bash '${script_path}' -- --hostname='${hostname}' --release='${release}' --CPUS='${cpus}' --MEM='${memory}' --DISKSIZE='${disksize}' --installdir='${installdir}' --nodownload='${nodownload}'"
+  local deploy_cmd="bash '${script_path}' -- --hostname='${hostname}' --release='${release}' --CPUS='${cpus}' --MEM='${memory}' --DISKSIZE='${disksize_final}' --installdir='${installdir}' --nodownload='${nodownload}'"
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Sensor VM Deployment :\n${deploy_cmd}"
@@ -4429,15 +4746,20 @@ step_08_sensor_deploy() {
     log "  Release: ${release}"
     log "  CPU: ${cpus}"
     log "  Memory: ${memory}MB"
-    log "  Disk Size: ${disksize}"
+    log "  Disk Size: ${disksize_final}"
     log "  InstallationDirectory: ${installdir}"
     log "  Download skip: ${nodownload}"
     
     # Execution before VM status check
     log "[STEP 08] Checking existing VM status before deployment"
-    local existing_vm_count=$(virsh list --all | grep -c "mds" 2>/dev/null || echo "0")
-    existing_vm_count=$(echo "${existing_vm_count}" | tr -d '\n\r' | tr -d ' ' | grep -o '[0-9]*' | head -1)
-    [[ -z "${existing_vm_count}" ]] && existing_vm_count="0"
+    local existing_vm_count="0"
+    if command -v virsh >/dev/null 2>&1; then
+      existing_vm_count=$(virsh list --all | grep -c "mds" 2>/dev/null || echo "0")
+      existing_vm_count=$(echo "${existing_vm_count}" | tr -d '\n\r' | tr -d ' ' | grep -o '[0-9]*' | head -1)
+      [[ -z "${existing_vm_count}" ]] && existing_vm_count="0"
+    else
+      log "[WARN] virsh command not found, skipping VM count check"
+    fi
     log "  Existing mds VM count: ${existing_vm_count}"
     
     # Network ModePer not Check
@@ -4453,10 +4775,14 @@ step_08_sensor_deploy() {
       log "[STEP 08] NAT Mode - Checking virbr0 bridge..."
       if ! ip link show virbr0 >/dev/null 2>&1; then
         log "[STEP 08] virbr0 bridge does not exist. Starting default libvirt network..."
-        if virsh net-list --all | grep -q "default.*inactive"; then
-          run_cmd "sudo virsh net-start default" || log "WARNING: default network start failed"
-        elif ! virsh net-list | grep -q "default.*active"; then
-          log "WARNING: default libvirt network (default) could not be activated."
+        if command -v virsh >/dev/null 2>&1; then
+          if virsh net-list --all | grep -q "default.*inactive"; then
+            run_cmd "sudo virsh net-start default" || log "WARNING: default network start failed"
+          elif ! virsh net-list | grep -q "default.*active"; then
+            log "WARNING: default libvirt network (default) could not be activated."
+          fi
+        else
+          log "[WARN] virsh command not found, cannot start default network"
         fi
         
         # Check again
@@ -4477,16 +4803,19 @@ step_08_sensor_deploy() {
       export SENSOR_BRIDGE="br-data"
       export NETWORK_MODE="bridge"
       
-      # Bridge Mode - Required IP Configuration (Default or User Configuration)
+      # Bridge Mode - Use user-configured IP values (set in step above)
       local sensor_ip="${SENSOR_VM_IP:-192.168.100.100}"
       local sensor_netmask="${SENSOR_VM_NETMASK:-255.255.255.0}"
       local sensor_gateway="${SENSOR_VM_GATEWAY:-192.168.100.1}"
+      local sensor_dns="${SENSOR_VM_DNS:-8.8.8.8}"
       
       export LOCAL_IP="${sensor_ip}"
+      export IP="${sensor_ip}"  # Also set IP for consistency
       export NETMASK="${sensor_netmask}"
       export GATEWAY="${sensor_gateway}"
+      export DNS="${sensor_dns}"
       
-      log "[STEP 08] Bridge Mode VM IP Configuration: ${sensor_ip}/${sensor_netmask}, GW: ${sensor_gateway}"
+      log "[STEP 08] Bridge Mode VM IP Configuration: ${sensor_ip}/${sensor_netmask}, GW: ${sensor_gateway}, DNS: ${sensor_dns}"
     elif [[ "${net_mode}" == "nat" ]]; then
       log "[STEP 08] NAT Mode - Configuring environment variables: BRIDGE=virbr0"
       export BRIDGE="virbr0"
@@ -4503,14 +4832,7 @@ step_08_sensor_deploy() {
     fi
     
     # Configure additional environment variables for deployment script
-    local disk_size_gb
-    if [[ "${disksize}" =~ ^([0-9]+)GB$ ]]; then
-      disk_size_gb="${BASH_REMATCH[1]}"
-    elif [[ "${disksize}" =~ ^([0-9]+)$ ]]; then
-      disk_size_gb="${disksize}"
-    else
-      disk_size_gb="100"  # Default
-    fi
+    local disk_size_gb="${sensor_disk_gb}"
     
     # Export environment variables for deployment script
     export disksize="${disk_size_gb}"
@@ -4529,17 +4851,21 @@ step_08_sensor_deploy() {
     # Static IP (192.168.122.2) is used instead, so retrieve_ip_nat() will be skipped
     if [[ "${net_mode}" == "nat" ]]; then
       log "[STEP 08] NAT Mode - Ensuring default network is ready..."
-      if ! virsh net-list | grep -q "default.*active"; then
-        log "[STEP 08] Starting default libvirt network..."
-        virsh net-start default 2>/dev/null || true
-        sleep 2
-      fi
-      
-      # Verify network is active
-      if virsh net-list | grep -q "default.*active"; then
-        log "[STEP 08] Default network is active (DHCP disabled, using static IP 192.168.122.2)"
+      if command -v virsh >/dev/null 2>&1; then
+        if ! virsh net-list | grep -q "default.*active"; then
+          log "[STEP 08] Starting default libvirt network..."
+          virsh net-start default 2>/dev/null || true
+          sleep 2
+        fi
+        
+        # Verify network is active
+        if virsh net-list | grep -q "default.*active"; then
+          log "[STEP 08] Default network is active (DHCP disabled, using static IP 192.168.122.2)"
+        else
+          log "[WARNING] Default network could not be started"
+        fi
       else
-        log "[WARNING] Default network could not be started"
+        log "[WARN] virsh command not found, skipping default network check"
       fi
     fi
     
@@ -4574,139 +4900,127 @@ step_08_sensor_deploy() {
     # Clear previous log file
     > "${deploy_log_file}"
     
-    # Execute deployment script - use simple execution like bridge mode
-    # Build command line (same as xdr-6000-sensor-installer.sh)
-    # Add --nointeract=true to prevent interactive prompts
-    # For NAT mode, add --ip to specify static IP and skip retrieve_ip_nat() wait
-    local cmd_line="bash virt_deploy_modular_ds.sh -- \
-        --hostname=\"${hostname}\" \
-        --release=\"${release}\" \
-        --CPUS=\"${cpus}\" \
-        --MEM=\"${memory}\" \
-        --DISKSIZE=\"${disk_size_gb}\" \
-        --installdir=\"${installdir}\" \
-        --nodownload=\"${nodownload}\" \
-        --bridge=\"${BRIDGE}\" \
-        --nointeract=\"true\""
+    # Execute deployment script - use simple execution like original (timeout 180s)
+    # Original approach: direct execution with timeout, no background process
+    log "[STEP 08] Executing deployment script (timeout: 180s)..."
+    log "[STEP 08] Note: This may take several minutes. Please wait..."
     
-    # NAT Mode: Add static IP parameters to skip retrieve_ip_nat() wait
+    # Disable error exit temporarily for deployment
+    set +e
+    
+    # Build command line with IP parameters for both bridge and nat modes
+    local cmd_line="bash virt_deploy_modular_ds.sh -- \
+         --hostname=\"${hostname}\" \
+         --release=\"${release}\" \
+         --CPUS=\"${cpus}\" \
+         --MEM=\"${memory}\" \
+         --DISKSIZE=\"${disk_size_gb}\" \
+         --installdir=\"${installdir}\" \
+         --nodownload=\"${nodownload}\" \
+         --bridge=\"${BRIDGE}\""
+    
+    # Bridge Mode: Add static IP parameters
+    if [[ "${net_mode}" == "bridge" ]]; then
+      cmd_line="${cmd_line} \
+         --ip=\"${LOCAL_IP}\" \
+         --netmask=\"${NETMASK}\" \
+         --gw=\"${GATEWAY}\" \
+         --dns=\"${DNS}\""
+      log "[STEP 08] Bridge Mode: Using static IP ${LOCAL_IP} (${NETMASK}, GW: ${GATEWAY}, DNS: ${DNS})"
+    fi
+    
+    # NAT Mode: Add static IP parameters
     if [[ "${net_mode}" == "nat" ]]; then
       cmd_line="${cmd_line} \
-        --ip=\"${IP}\" \
-        --netmask=\"${NETMASK}\" \
-        --gw=\"${GATEWAY}\" \
-        --dns=\"${DNS}\""
-      log "[STEP 08] NAT Mode: Using static IP ${IP} (skips DHCP IP assignment wait)"
+         --ip=\"${IP}\" \
+         --netmask=\"${NETMASK}\" \
+         --gw=\"${GATEWAY}\" \
+         --dns=\"${DNS}\""
+      log "[STEP 08] NAT Mode: Using static IP ${IP} (${NETMASK}, GW: ${GATEWAY})"
     fi
     
-    log "[STEP 08] Executing deployment script (timeout: 600s)..."
-    log "[STEP 08] Command: ${cmd_line}"
-    log "[STEP 08] Note: This may take several minutes. Please wait..."
-    log "[STEP 08] Monitoring deployment progress (checking log file every 5 seconds)..."
+    # Add --nointeract=true to prevent interactive prompts (same as AIO-Sensor-Installer.sh)
+    cmd_line="${cmd_line} \
+         --nointeract=\"true\""
     
-    # Use simple execution like bridge mode (xdr-6000-sensor-installer.sh style)
-    # Disable error exit temporarily for deployment
-    # Run script in background and monitor progress
-    set +e
-    (
-      bash -c "${cmd_line}" 2>&1 | \
-           sed '/grep: \/var\/lib\/libvirt\/dnsmasq\/virbr0\.status: No such file or directory/d' | \
-           tee "${deploy_log_file}"
-    ) &
+    log "[STEP 08] Execution command: ${cmd_line}"
+    
+    # Execute deployment script in background and monitor VM status
+    log "[STEP 08] Starting deployment script in background..."
+    log "[STEP 08] Monitoring VM status - will proceed when VM is running..."
+    
+    # Start deployment script in background with output to log file
+    (bash -c "${cmd_line}" 2>&1 | \
+         sed '/grep: \/var\/lib\/libvirt\/dnsmasq\/virbr0\.status: No such file or directory/d' > "${deploy_log_file}") &
     local deploy_pid=$!
     
-    # Monitor deployment progress by checking log file and VM status
-    local monitor_count=0
-    local max_monitor=600  # 10 minutes max
-    local last_log_size=0
-    local vm_created=0
+    # Monitor VM status - check every 5 seconds
+    local max_wait=180  # Maximum wait time in seconds
+    local check_interval=5  # Check every 5 seconds
+    local elapsed=0
+    local vm_running=0
     
-    while kill -0 "${deploy_pid}" 2>/dev/null && [[ ${monitor_count} -lt ${max_monitor} ]]; do
-      sleep 5
-      ((monitor_count += 5))
-      
-      # Check log file size to see if script is producing output
-      local current_log_size=0
-      if [[ -f "${deploy_log_file}" ]]; then
-        current_log_size=$(stat -f%z "${deploy_log_file}" 2>/dev/null || stat -c%s "${deploy_log_file}" 2>/dev/null || echo "0")
+    set +e
+    while [[ ${elapsed} -lt ${max_wait} ]]; do
+      # Check if deployment script is still running
+      if ! kill -0 ${deploy_pid} 2>/dev/null; then
+        # Deployment script finished
+        wait ${deploy_pid}
+        deploy_rc=$?
+        log "[STEP 08] Deployment script finished with exit code: ${deploy_rc}"
+        break
       fi
       
-      # If log file is growing, script is still running
-      if [[ ${current_log_size} -gt ${last_log_size} ]]; then
-        last_log_size=${current_log_size}
-        # Show last few lines of progress every 30 seconds
-        if [[ $((monitor_count % 30)) -eq 0 ]]; then
-          local last_lines
-          last_lines=$(tail -n 3 "${deploy_log_file}" 2>/dev/null | grep -v "^$" | tail -n 1)
-          if [[ -n "${last_lines}" ]]; then
-            log "[STEP 08] Deployment progress (${monitor_count}s): ${last_lines}"
+      # Check if VM is running
+      if command -v virsh >/dev/null 2>&1; then
+        if virsh list --state-running | grep -q "\smds\s" 2>/dev/null; then
+          if [[ ${vm_running} -eq 0 ]]; then
+            # VM just started running
+            vm_running=1
+            log "[STEP 08] ========================================"
+            log "[STEP 08] VM 'mds' is now running!"
+            log "[STEP 08] ========================================"
+            virsh list --state-running | grep "mds" | while read line; do
+              log "[STEP 08]   ${line}"
+            done
+            log "[STEP 08] Waiting 30 seconds for VM to stabilize..."
+            sleep 30
+            log "[STEP 08] VM deployment completed successfully!"
+            # Kill deployment script (it may still be running in background)
+            kill ${deploy_pid} 2>/dev/null || true
+            deploy_rc=0
+            break
           fi
         fi
       fi
       
-      # Check if VM was created and is running (every 5 seconds)
-      if virsh list --state-running | grep -q "mds"; then
-        if [[ ${vm_created} -eq 0 ]]; then
-          log "[STEP 08] VM 'mds' detected and running (${monitor_count}s elapsed)"
-          vm_created=1
-          
-          # NAT Mode: If VM is running and static IP is configured, deployment should complete normally
-          # Static IP (192.168.122.2) is passed to deployment script, so retrieve_ip_nat() is skipped
-          if [[ "${net_mode}" == "nat" ]]; then
-            log "[STEP 08] NAT Mode: VM is running with static IP configuration"
-            log "[STEP 08] NAT Mode: Deployment script should complete normally (static IP configured)"
-            # Continue monitoring - script should complete on its own since static IP is set
-          fi
-        fi
-      elif virsh list --all | grep -q "mds"; then
-        # VM exists but not running yet
-        if [[ ${vm_created} -eq 0 ]]; then
-          log "[STEP 08] VM 'mds' detected (${monitor_count}s elapsed, not running yet)"
-          vm_created=1
-        fi
-      fi
+      sleep ${check_interval}
+      elapsed=$((elapsed + check_interval))
       
       # Show progress every 30 seconds
-      if [[ $((monitor_count % 30)) -eq 0 ]] && [[ ${current_log_size} -eq ${last_log_size} ]]; then
-        if [[ ${vm_created} -eq 1 ]]; then
-          log "[STEP 08] Deployment in progress... (${monitor_count}s elapsed, VM created, waiting for completion...)"
-        else
-          log "[STEP 08] Deployment in progress... (${monitor_count}s elapsed, waiting for VM creation...)"
-        fi
+      if [[ $((elapsed % 30)) -eq 0 ]]; then
+        log "[STEP 08] Still waiting for VM to start... (${elapsed}s / ${max_wait}s)"
       fi
     done
-    
-    # Wait for background process to complete
-    wait "${deploy_pid}" 2>/dev/null
-    deploy_rc=$?
-    
-    # If process was killed or timed out, check if VM exists
-    if [[ ${deploy_rc} -ne 0 ]] && [[ ${monitor_count} -ge ${max_monitor} ]]; then
-      log "[WARNING] Deployment script monitoring timeout (${max_monitor}s)"
-      if virsh list --all | grep -q "mds"; then
-        log "[INFO] VM exists despite timeout - deployment may have succeeded"
-        deploy_rc=0
-      fi
-    fi
     set -e
     
-    # Log immediate status
-    log "[STEP 08] Deployment script execution completed (exit code: ${deploy_rc})"
-    
-    # Timeout (124) is acceptable if VM exists and is running
-    if [[ ${deploy_rc} -eq 124 ]]; then
-      if virsh list --all | grep -q "mds.*running"; then
-         log "[INFO] Deployment script timeout - but VM is running successfully."
-         deploy_rc=0
-      fi
-    fi
-    
-    # Check if VM was created successfully regardless of exit code
-    if virsh list --all | grep -q "mds"; then
-      log "[INFO] VM 'mds' exists - deployment was successful"
-      if [[ ${deploy_rc} -ne 0 ]]; then
-        log "[INFO] Deployment script exit code: ${deploy_rc}, but VM exists. Treating as success."
-        deploy_rc=0
+    # If we reached max wait time, check final status
+    if [[ ${elapsed} -ge ${max_wait} ]]; then
+      # Kill deployment script if still running
+      kill ${deploy_pid} 2>/dev/null || true
+      wait ${deploy_pid} 2>/dev/null || true
+      
+      if command -v virsh >/dev/null 2>&1; then
+        if virsh list --state-running | grep -q "\smds\s" 2>/dev/null; then
+          log "[STEP 08] Maximum wait time reached (${max_wait}s) - but VM is running. Treating as success."
+          deploy_rc=0
+        else
+          log "[STEP 08] Maximum wait time reached (${max_wait}s) - VM is not running yet."
+          deploy_rc=1
+        fi
+      else
+        log "[WARN] virsh command not found, cannot verify VM status"
+        deploy_rc=1
       fi
     fi
 
@@ -5265,18 +5579,30 @@ step_09_sensor_passthrough() {
         # Verify that files referenced in XML actually exist
         log "[STEP 09] Checking XML source file existence"
         local missing=0
+        local optional_files=0
         while read -r f; do
             [[ -z "${f}" ]] && continue
             if [[ ! -e "${f}" ]]; then
-                log "[STEP 09] ERROR: missing file: ${f}"
-                missing=$((missing+1))
+                # Check if this is an optional file (cloud-init ISO files are optional)
+                if [[ "${f}" =~ -cidata\.iso$ ]] || [[ "${f}" =~ cloud-init ]]; then
+                    log "[STEP 09] WARNING: optional file missing (cloud-init ISO): ${f}"
+                    log "[STEP 09] This file is optional and VM can run without it"
+                    optional_files=$((optional_files+1))
+                else
+                    log "[STEP 09] ERROR: missing required file: ${f}"
+                    missing=$((missing+1))
+                fi
             fi
         done < <(virsh dumpxml "${SENSOR_VM}" | awk -F"'" '/<source file=/{print $2}')
 
         if [[ "${missing}" -gt 0 ]]; then
-            whiptail_msgbox "STEP 09 - File Missing" "VM XML references ${missing} missing file(s).\n\nPlease re-run STEP 08 (Deployment) or check image file locations."
+            whiptail_msgbox "STEP 09 - File Missing" "VM XML references ${missing} missing required file(s).\n\nPlease re-run STEP 08 (Deployment) or check image file locations."
             log "[STEP 09] ERROR: XML source file missing count=${missing}"
             return 1
+        fi
+        
+        if [[ "${optional_files}" -gt 0 ]]; then
+            log "[STEP 09] INFO: ${optional_files} optional file(s) missing (cloud-init ISO) - continuing..."
         fi
     fi
 
@@ -5301,12 +5627,19 @@ step_09_sensor_passthrough() {
   </source>
 </hostdev>
 EOF
-                if virsh dumpxml "${SENSOR_VM}" | grep -q "address.*bus='${b}'.*slot='${s}'.*function='${f}'"; then
-                    log "[INFO] PCI (${pci_full}) is already connected."
+                # Check if PCI device is already attached to VM (check full address including domain)
+                if virsh dumpxml "${SENSOR_VM}" | grep -q "address.*domain='${d}'.*bus='${b}'.*slot='${s}'.*function='${f}'"; then
+                    log "[INFO] PCI (${pci_full}) is already connected to VM. Skipping attachment."
                 else
                     log "[ACTION] Connecting PCI (${pci_full}) to VM..."
                     if [[ "${_DRY}" -eq 0 ]]; then
-                        if virsh attach-device "${SENSOR_VM}" "${pci_xml}" --config --live; then
+                        # Check if VM is running - if not, only use --config flag
+                        local attach_flags="--config"
+                        if virsh list --state-running | grep -q "\s${SENSOR_VM}\s" 2>/dev/null; then
+                            attach_flags="--config --live"
+                        fi
+                        
+                        if virsh attach-device "${SENSOR_VM}" "${pci_xml}" ${attach_flags}; then
                             log "[SUCCESS] PCI passthrough connection successful"
                         else
                             log "[ERROR] PCI passthrough connection failed (device may be in use, check IOMMU configuration)"
@@ -5372,20 +5705,71 @@ EOF
     ###########################################################################
     # 5. Result summary 
     ###########################################################################
-    local result_file="/tmp/step09_result.txt"
-    {
-        echo "STEP 09 - Verification Result"
-        echo "==================="
-        echo "- VM Status: $(virsh domstate ${SENSOR_VM} 2>/dev/null)"
-        echo "- PCI passthrough devices: ${hostdev_count}"
-        if [[ "${hostdev_count}" -gt 0 ]]; then
-            echo "  (Success: PCI Passthrough correctly applied)"
-        else
-            echo "  (Failed: PCI passthrough connection failed. Please check STEP 01 configuration)"
-        fi
-    } > "${result_file}"
+    local vm_state
+    vm_state=$(virsh domstate "${SENSOR_VM}" 2>/dev/null || echo "unknown")
+    
+    local summary
+    summary=$(cat <<EOF
+[STEP 09 Result Summary]
 
-    show_paged "STEP 09 Result" "${result_file}"
+✅ Sensor VM Configuration:
+   - VM Name: ${SENSOR_VM}
+   - VM Status: ${vm_state}
+   - PCI Passthrough Devices: ${hostdev_count}
+EOF
+)
+    
+    if [[ "${hostdev_count}" -gt 0 ]]; then
+        summary="${summary}"$(cat <<EOF
+
+✅ PCI Passthrough:
+   - Successfully connected ${hostdev_count} SPAN NIC device(s)
+   - Devices are ready for traffic monitoring
+EOF
+)
+        if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
+            summary="${summary}"$(cat <<EOF
+
+   - PCI Addresses:
+EOF
+)
+            for pci_full in ${SENSOR_SPAN_VF_PCIS}; do
+                summary="${summary}"$(cat <<EOF
+     • ${pci_full}
+EOF
+)
+            done
+        fi
+    else
+        summary="${summary}"$(cat <<EOF
+
+⚠️  PCI Passthrough:
+   - No PCI devices connected
+   - Please check STEP 01 configuration (SPAN NIC selection)
+   - Verify IOMMU is enabled in BIOS
+EOF
+)
+    fi
+    
+    if [[ "${numa_nodes}" -gt 1 ]]; then
+        summary="${summary}"$(cat <<EOF
+
+✅ CPU Affinity:
+   - NUMA nodes detected: ${numa_nodes}
+   - CPU affinity configured for optimal performance
+EOF
+)
+    fi
+    
+    summary="${summary}"$(cat <<EOF
+
+📝 Next Steps:
+   - VM is configured and ready for operation
+   - Proceed to STEP 10 (Install DP CLI) if needed
+EOF
+)
+
+    whiptail_msgbox "STEP 09 Completed" "${summary}" 20 80
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -5526,37 +5910,37 @@ step_10_install_dp_cli() {
 
         "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 
-        # setuptools<81 pin
-        "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv pip/setuptools Installation Failed" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+        # Install setuptools<81 and wheel (pip will skip if already satisfied)
+        "${VENV_DIR}/bin/python" -m pip install --quiet "setuptools<81" wheel >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: venv setuptools installation failed" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
 
-        # Install from downloaded directory
-        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall .) >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli Installation Failed(venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+        # Install from downloaded directory (pip will skip if already installed)
+        (cd "${pkg}" && "${VENV_DIR}/bin/python" -m pip install --quiet .) >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli installation failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             rm -rf "${TEMP_DIR}" || true
             return 1
         }
 
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp_cli import Failed(venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('appliance_cli import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: appliance_cli import failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
 
         if [[ ! -x "${VENV_DIR}/bin/aella_cli" ]]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: ${VENV_DIR}/bin/aella_cli  does not exist." | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: dp-cli package console_scripts (aella_cli) entry point may not be available." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: ${VENV_DIR}/bin/aella_cli does not exist." | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: dp-cli package must include console_scripts (aella_cli) entry point." | tee -a "${ERRLOG}"
             return 1
         fi
 
-        # Verify runtime import (aella_cli execution smoke test removed)
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli  import Verification Failed(venv)" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+        # Runtime verification performed only based on import (removed aella_cli execution smoke test)
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || {
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: dp-cli runtime import verification failed (venv)" | tee -a "${ERRLOG}"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG}." | tee -a "${ERRLOG}"
             return 1
         }
     fi
@@ -5647,14 +6031,11 @@ EOF
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: /usr/local/bin/aella_cli*"
         ls -l /usr/local/bin/aella_cli* 2>/dev/null || true
 
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: venv dp_cli import"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import dp_cli; print('dp_cli import OK')") >>"${ERRLOG}" 2>&1 || true
-
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: venv pkg_resources"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; print('pkg_resources OK')") >>"${ERRLOG}" 2>&1 || true
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: venv appliance_cli import"
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('appliance_cli import OK')") >>"${ERRLOG}" 2>&1 || true
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: runtime import check"
-        (cd /tmp && "${VENV_DIR}/bin/python" -c "import pkg_resources; import dp_cli; from dp_cli import aella_cli_aio_appliance; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true
+        (cd /tmp && "${VENV_DIR}/bin/python" -c "import appliance_cli; print('runtime import OK')") >>"${ERRLOG}" 2>&1 || true
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] verify: error log path => ${ERRLOG}"
         tail -n 40 "${ERRLOG}" 2>/dev/null || true
@@ -6936,7 +7317,7 @@ Server Specifications (Physical Server Recommended):
 
 • Disk:
   - Use ubuntu-vg volume group for OS and Sensor
-  - Minimum free space: 100GB recommended (80GB minimum)
+  - Minimum free space: 100GB minimum
   - Sensor LV is created automatically in STEP 07
 
 • Network Interfaces:

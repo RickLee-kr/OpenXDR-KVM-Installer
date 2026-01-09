@@ -72,7 +72,7 @@ STEP_NAMES=(
   "libvirt hooks Installation"
   "Sensor LV Creation + Image/Script Download"
   "Sensor VM Deployment"
-  "PCI Passthrough / CPU Affinity (Sensor)"
+  "Sensor VM Network & SPAN Interface Configuration"
   "Install DP Appliance CLI package"
 )
 
@@ -5256,17 +5256,6 @@ step_09_sensor_passthrough() {
     local SENSOR_VM="mds"
 
     ###########################################################################
-    # NUMA node count check (using lscpu)
-    ###########################################################################
-    local numa_nodes=1
-    if command -v lscpu >/dev/null 2>&1; then
-        numa_nodes=$(lscpu | grep "^NUMA node(s):" | awk '{print $3}')
-    fi
-    [[ -z "${numa_nodes}" ]] && numa_nodes=1
-
-    log "[STEP 09] NUMA node count: ${numa_nodes}"
-
-    ###########################################################################
     # 1. Sensor VM Exists Check
     ###########################################################################
     if ! virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
@@ -5536,6 +5525,7 @@ step_09_sensor_passthrough() {
         if [[ -n "${SPAN_BRIDGE_LIST:-}" ]]; then
           log "[DRY-RUN] SPAN bridge virtio interfaces: ${SPAN_BRIDGE_LIST}"
           for bridge_name in ${SPAN_BRIDGE_LIST}; do
+
             log "[DRY-RUN] bridge ${bridge_name} virtio interface add scheduled"
           done
         fi
@@ -5670,35 +5660,9 @@ EOF
     fi
 
     ###########################################################################
-    # 4. CPU Affinity configuration (only if multiple NUMA nodes)
-    ###########################################################################
-    if [[ "${numa_nodes}" -gt 1 ]]; then
-        log "[STEP 09] Sensor VM CPU Affinity Apply Start"
-
-        local available_cpus
-        available_cpus=$(lscpu -p=CPU | grep -v '^#' | tr '\n' ',' | sed 's/,$//')
-
-        if [[ -n "${available_cpus}" ]]; then
-            log "[ACTION] Configuring CPU Affinity (All CPUs)"
-            if [[ "${_DRY}" -eq 0 ]]; then
-                virsh emulatorpin "${SENSOR_VM}" "${available_cpus}" --config >/dev/null 2>&1 || true
-
-                local max_vcpus
-                max_vcpus="$(virsh vcpucount "${SENSOR_VM}" --maximum --config 2>/dev/null || echo 0)"
-                for (( i=0; i<max_vcpus; i++ )); do
-                    virsh vcpupin "${SENSOR_VM}" "${i}" "${available_cpus}" --config >/dev/null 2>&1 || true
-                done
-            else
-                log "[DRY-RUN] virsh emulatorpin/vcpupin ${SENSOR_VM} ${available_cpus} --config"
-            fi
-        fi
-    fi
-
-    ###########################################################################
-    # 4.5 VM restart not needed
-    # - XML modifications were applied and VM was already started (line 5168)
+    # 4. VM restart not needed
+    # - XML modifications were applied and VM was already started
     # - PCI passthrough uses --live flag, so changes are applied immediately
-    # - CPU affinity uses --config flag, which takes effect on next boot (acceptable)
     ###########################################################################
     # restart_vm_safely() removed - VM already started after XML modification
 
@@ -5747,16 +5711,6 @@ EOF
    - No PCI devices connected
    - Please check STEP 01 configuration (SPAN NIC selection)
    - Verify IOMMU is enabled in BIOS
-EOF
-)
-    fi
-    
-    if [[ "${numa_nodes}" -gt 1 ]]; then
-        summary="${summary}"$(cat <<EOF
-
-✅ CPU Affinity:
-   - NUMA nodes detected: ${numa_nodes}
-   - CPU affinity configured for optimal performance
 EOF
 )
     fi
@@ -6051,6 +6005,46 @@ EOF
         mark_step_done "${STEP_ID}"
     fi
 
+    # Completion message box
+    local completion_msg
+    completion_msg="STEP 10: DP Appliance CLI Installation Completed
+
+✅ Installation Summary:
+  • DP Appliance CLI package has been successfully installed
+  • Virtual environment created at: /opt/dp_cli_venv
+  • CLI commands available at: /usr/local/bin/aella_cli
+  • Login shell configured for stellar user
+
+📋 How to Use Appliance CLI:
+
+1. Test/Execute Appliance CLI:
+   Simply run: aella_cli
+   
+   This will launch the appliance CLI interface.
+
+2. Automatic CLI on New Login:
+   When you connect to this KVM host as the 'stellar' user,
+   the appliance CLI will automatically appear.
+   
+   The login shell has been configured to use aella_cli,
+   so you don't need to run any commands manually.
+
+3. Manual Execution:
+   If you need to run it manually from another user:
+   /usr/local/bin/aella_cli
+
+💡 Note:
+   The appliance CLI is now ready to use for managing
+   your DP (Data Processor) appliances."
+
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 20 90)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+    whiptail_msgbox "STEP 10 - Installation Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 13. Install DP Appliance CLI package ====="
     echo
 }
@@ -6334,6 +6328,7 @@ menu_select_step_and_run() {
       local step_id="${STEP_IDS[$i]}"
       local step_name="${STEP_NAMES[$i]}"
       local status=""
+      local step_num=$(printf "%02d" $((i+1)))
 
       if [[ "${LAST_COMPLETED_STEP}" == "${step_id}" ]]; then
         status="Completed"
@@ -6345,8 +6340,8 @@ menu_select_step_and_run() {
         fi
       fi
 
-      # Use STEP_IDS as menu tags instead of numeric indices
-      menu_items+=("${step_id}" "${step_name} [${status}]")
+      # Use step number as tag (instead of step_id) for cleaner display
+      menu_items+=("${step_num}" "${step_name} [${status}]")
     done
     menu_items+=("back" "Return to main menu")
 
@@ -6379,27 +6374,21 @@ menu_select_step_and_run() {
     if [[ "${choice}" == "back" ]]; then
       break
     else
-      # Find the index of the selected step_id
-      local idx
-      local found=0
-      for ((idx=0; idx<NUM_STEPS; idx++)); do
-        if [[ "${STEP_IDS[$idx]}" == "${choice}" ]]; then
-          found=1
-          # Disable set -e temporarily to handle run_step errors gracefully
-          set +e
-          run_step "${idx}"
-          local step_rc=$?
-          set -e
-          break
+      # Convert step number (e.g., "01") to step index (0-based)
+      local step_index=$((10#${choice} - 1))
+      if [[ ${step_index} -ge 0 && ${step_index} -lt ${NUM_STEPS} ]]; then
+        # Disable set -e temporarily to handle run_step errors gracefully
+        set +e
+        run_step "${step_index}"
+        local step_rc=$?
+        set -e
+        # run_step always returns 0, but check anyway for safety
+        if [[ ${step_rc} -ne 0 ]]; then
+          log "WARNING: run_step returned non-zero exit code: ${step_rc}"
         fi
-      done
-      if [[ ${found} -eq 0 ]]; then
-        log "ERROR: Selected step_id '${choice}' not found in STEP_IDS"
+      else
+        log "ERROR: Invalid step number '${choice}'"
         continue
-      fi
-      # run_step always returns 0, but check anyway for safety
-      if [[ ${step_rc} -ne 0 ]]; then
-        log "WARNING: run_step returned non-zero exit code: ${step_rc}"
       fi
     fi
   done
@@ -6772,7 +6761,7 @@ build_validation_summary() {
   fi
 
   ###############################
-  # STEP 09: PCI Passthrough / CPU Affinity (Sensor)
+  # STEP 09: Sensor VM Network & SPAN Interface Configuration
   ###############################
   if (( mds_defined == 1 )); then
     # Check PCI passthrough configuration (hostdev)
@@ -6782,18 +6771,9 @@ build_validation_summary() {
       # Check if SPAN_ATTACH_MODE is pci (should have passthrough)
       if [[ "${SPAN_ATTACH_MODE:-pci}" == "pci" ]]; then
         warn_msgs+=("mds VM XML does not have PCI passthrough (hostdev) configuration yet.")
-        warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
+        warn_msgs+=("  → ACTION: Re-run STEP 09 (Sensor VM Network & SPAN Interface Configuration)")
         warn_msgs+=("  → CHECK: Verify SPAN NIC PCI addresses in configuration")
       fi
-    fi
-
-    # Check CPU pinning (cputune)
-    if virsh dumpxml mds 2>/dev/null | grep -q '<cputune>'; then
-      ok_msgs+=("mds VM has CPU pinning (cputune) configuration")
-    else
-      warn_msgs+=("mds VM XML does not have CPU pinning (cputune) configuration.")
-      warn_msgs+=("  → ACTION: Re-run STEP 09 (PCI Passthrough / CPU Affinity)")
-      warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
     fi
   fi
 
@@ -7097,6 +7077,10 @@ show_usage_help() {
   - Press **↑** to scroll to previous page
   - Press **q** to exit
 
+• For detailed documentation and additional information:
+  - Visit: https://kvm.xdr.ooo/
+  - Comprehensive guides, troubleshooting, and advanced configuration
+
 
 ═══════════════════════════════════════════════════════════════
 📋 **Main Menu Options Overview**
@@ -7184,7 +7168,7 @@ Step-by-Step Process:
    STEP 06 → Libvirt hooks installation
    STEP 07 → Sensor LV creation + image/script download
    STEP 08 → Sensor VM (mds) deployment
-   STEP 09 → Sensor VM Network Interface Configuration (XML Modification)
+   STEP 09 → Sensor VM Network & SPAN Interface Configuration
             → Network interfaces (virbr0/br-data), SPAN PCI passthrough/bridge
    STEP 10 → DP Appliance CLI installation
 
@@ -7412,6 +7396,22 @@ Log Files:
 • Monitor disk space in ubuntu-vg throughout installation
 • Save configuration after menu 3 changes
 • VM resources are auto-calculated - no manual configuration needed
+
+═══════════════════════════════════════════════════════════════
+📚 **Additional Resources**
+═══════════════════════════════════════════════════════════════
+
+For comprehensive documentation, detailed guides, troubleshooting, and
+advanced configuration options, please visit:
+
+  🌐 https://kvm.xdr.ooo/
+
+The documentation site includes:
+• Step-by-step installation guides
+• Network configuration examples
+• Troubleshooting procedures
+• Advanced configuration scenarios
+• Best practices and recommendations
 
 ═══════════════════════════════════════════════════════════════'
 

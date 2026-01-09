@@ -7245,6 +7245,46 @@ EOF
         mark_step_done "${STEP_ID}"
     fi
 
+    # Completion message box
+    local completion_msg
+    completion_msg="STEP 13: DP Appliance CLI Installation Completed
+
+✅ Installation Summary:
+  • DP Appliance CLI package has been successfully installed
+  • Virtual environment created at: /opt/dp_cli_venv
+  • CLI commands available at: /usr/local/bin/aella_cli
+  • Login shell configured for stellar user
+
+📋 How to Use Appliance CLI:
+
+1. Test/Execute Appliance CLI:
+   Simply run: aella_cli
+   
+   This will launch the appliance CLI interface.
+
+2. Automatic CLI on New Login:
+   When you connect to this KVM host as the 'stellar' user,
+   the appliance CLI will automatically appear.
+   
+   The login shell has been configured to use aella_cli,
+   so you don't need to run any commands manually.
+
+3. Manual Execution:
+   If you need to run it manually from another user:
+   /usr/local/bin/aella_cli
+
+💡 Note:
+   The appliance CLI is now ready to use for managing
+   your DP (Data Processor) appliances."
+
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 20 90)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+    whiptail_msgbox "STEP 13 - Installation Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 13. Install DP Appliance CLI package ====="
     echo
 }

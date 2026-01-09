@@ -1,0 +1,1330 @@
+--- DP-Installer.sh.orig	2026-01-08 19:53:38
++++ DP-Installer.sh	2026-01-08 19:57:57
+@@ -556,6 +556,15 @@
+ 
+   save_config
+ }
++
++
++#######################################
++# Version compare helpers (DP_VERSION)
++#######################################
++version_ge() { dpkg --compare-versions "$1" ge "$2"; }
++version_gt() { dpkg --compare-versions "$1" gt "$2"; }
++version_le() { dpkg --compare-versions "$1" le "$2"; }
++version_lt() { dpkg --compare-versions "$1" lt "$2"; }
+ 
+ 
+ #######################################
+@@ -3614,6 +3623,1247 @@
+   show_textbox "STEP 08 - Summary" "${tmp_info}"
+ 
+   # save_state handled in run_step()
++}
++
++
++#######################################
++# DP_VERSION >= 6.2.1: KT v1.8 Step 09~12 implementations
++#######################################
++
++step_09_dp_download_v621() {
++  log "[STEP 09] Download DP deploy script and image (KT v1.8 logic for DP_VERSION >= 6.2.1)"
++  load_config
++  local tmp_info="/tmp/xdr_step09_info.txt"
++
++  #######################################
++  # 0) Check configuration values
++  #######################################
++  local ver="${DP_VERSION:-}"
++  local acps_user="${ACPS_USERNAME:-}"
++  local acps_pass="${ACPS_PASSWORD:-}"
++  local acps_url="${ACPS_BASE_URL:-https://acps.stellarcyber.ai}"
++
++  # Check required values
++  local missing=""
++  [[ -z "${ver}"       ]] && missing+="\n - DP_VERSION"
++  [[ -z "${acps_user}" ]] && missing+="\n - ACPS_USERNAME"
++  [[ -z "${acps_pass}" ]] && missing+="\n - ACPS_PASSWORD"
++
++  if [[ -n "${missing}" ]]; then
++    local msg="The following items are missing in config:${missing}\n\nSet them in Settings, then rerun."
++    log "[STEP 09] Missing config values: ${missing}"
++    whiptail_msgbox "STEP 09 - Missing config" "${msg}" 15 70
++    log "[STEP 09] Skipping STEP 09 due to missing config."
++    return 0
++  fi
++
++  # Normalize URL (trim trailing slash)
++  acps_url="${acps_url%/}"
++
++  #######################################
++  # 1) Prepare download directory
++  #######################################
++  local dl_img_dir="/stellar/dl/images"
++  log "[STEP 09] Download directory: ${dl_img_dir}"
++
++  if [[ "${DRY_RUN}" -eq 1 ]]; then
++    log "[DRY-RUN] sudo mkdir -p ${dl_img_dir}"
++  else
++    sudo mkdir -p "${dl_img_dir}"
++  fi
++
++  #######################################
++  # 2) Define download targets/URLs
++  #######################################
++  # Script version fixed at 6.2.0
++  local script_ver="6.2.0"
++  local dp_script="virt_deploy_uvp_centos.sh"
++
++  # File naming strategy: Long Name (remote) vs Short Name (local)
++  local remote_qcow2="aella-dataprocessor-ubuntu2404-py2-${ver}.qcow2"
++  local remote_xml="aella-dataprocessor-ubuntu2404-py2-${ver}.xml"
++  local remote_sha1="${remote_qcow2}.sha1"
++
++  # Local storage name (Short Name - compatible with Step 10/11)
++  local local_qcow2="aella-dataprocessor-${ver}.qcow2"
++
++  # URL assembly
++  local url_script="${acps_url}/release/${script_ver}/dataprocessor/${dp_script}"
++  local url_qcow2="${acps_url}/release/${ver}/dataprocessor/${remote_qcow2}"
++  local url_xml="${acps_url}/release/${ver}/dataprocessor/${remote_xml}"
++  local url_sha1="${acps_url}/release/${ver}/dataprocessor/${remote_sha1}"
++
++  log "[STEP 09] Configuration summary:"
++  log "  - DP_VERSION     = ${ver}"
++  log "  - ACPS_BASE_URL  = ${acps_url}"
++  log "  - Remote filename: ${remote_qcow2}"
++  log "  - Local filename  : ${local_qcow2}"
++
++  #######################################
++  # 3-A) Check for local qcow2 >= 1GB reuse
++  #######################################
++  local use_local_qcow=0
++  local found_local_file=""
++  local found_size=""
++  local search_dir="."
++
++  # Find newest *.qcow2 >= 1GB (1000M)
++  found_local_file="$(
++    find "${search_dir}" -maxdepth 1 -type f -name '*.qcow2' -size +1000M -printf '%T@ %p\n' 2>/dev/null \
++      | sort -nr \
++      | head -n1 \
++      | awk '{print $2}'
++  )"
++
++  if [[ -n "${found_local_file}" ]]; then
++    found_size="$(ls -lh "${found_local_file}" 2>/dev/null | awk '{print $5}')"
++
++    local msg
++    msg="Found a qcow2 (>=1GB) in current directory.\n\n"
++    msg+="  File: ${found_local_file}\n"
++    msg+="  Size: ${found_size}\n\n"
++    msg+="Use this file to skip download?\n"
++    msg+="(If selected, file will be saved as '${local_qcow2}')"
++
++    if whiptail_yesno "STEP 09 - reuse local qcow2" "${msg}"; then
++      use_local_qcow=1
++      log "[STEP 09] User chose to use local qcow2 file (${found_local_file})."
++
++      if [[ "${DRY_RUN}" -eq 1 ]]; then
++        log "[DRY-RUN] sudo cp \"${found_local_file}\" \"${dl_img_dir}/${remote_qcow2}\""
++      else
++        # Copy as remote_qcow2 (long name) for SHA1 verification
++        sudo cp "${found_local_file}" "${dl_img_dir}/${remote_qcow2}"
++        log "[STEP 09] Copied local file to ${dl_img_dir}/${remote_qcow2} (for verification)"
++      fi
++    else
++      log "[STEP 09] User chose to download from server instead."
++    fi
++  else
++    log "[STEP 09] No qcow2 >=1GB in current directory → will download."
++  fi
++
++  #######################################
++  # 3-B) Force Refresh (always re-download script/XML/SHA1)
++  #######################################
++  if [[ "${DRY_RUN}" -eq 1 ]]; then
++    log "[DRY-RUN] Will remove existing script/XML/SHA1 files"
++    [[ "${use_local_qcow}" -eq 0 ]] && log "[DRY-RUN] Will remove existing image files"
++  else
++    # Always remove script/XML/SHA1 to ensure latest versions
++    sudo rm -f "${dl_img_dir}/${dp_script}" \
++               "${dl_img_dir}/${remote_xml}" \
++               "${dl_img_dir}/${remote_sha1}" \
++               "${dl_img_dir}/*.xml" "${dl_img_dir}/*.sha1" 2>/dev/null || true
++
++    # Remove image only if not using local file
++    if [[ "${use_local_qcow}" -eq 0 ]]; then
++      if [[ -f "${dl_img_dir}/${local_qcow2}" || -f "${dl_img_dir}/${remote_qcow2}" ]]; then
++        log "[STEP 09] Force Refresh: removing existing qcow2 images"
++        sudo rm -f "${dl_img_dir}/${local_qcow2}" "${dl_img_dir}/${remote_qcow2}"
++      fi
++    else
++      log "[STEP 09] Using local file, skipping image removal."
++    fi
++  fi
++
++  #######################################
++  # 3-C) Perform downloads
++  #######################################
++  if [[ "${DRY_RUN}" -eq 1 ]]; then
++    log "[DRY-RUN] (password is not shown in logs)"
++    log "[DRY-RUN] Script: ${url_script}"
++    log "[DRY-RUN] XML:    ${url_xml}"
++    log "[DRY-RUN] SHA1:   ${url_sha1}"
++    if [[ "${use_local_qcow}" -eq 0 ]]; then
++      log "[DRY-RUN] Image:  ${url_qcow2}"
++    fi
++  else
++    (
++      cd "${dl_img_dir}" || exit 1
++
++      # 1) Deploy script (always)
++      log "[STEP 09] Starting ${dp_script} download..."
++      curl -O -k -u "${acps_user}:${acps_pass}" "${url_script}" || {
++        log "[ERROR] ${dp_script} download failed"
++        exit 1
++      }
++
++      # 2) XML file (always - Long Name)
++      log "[STEP 09] Starting ${remote_xml} download..."
++      curl -O -k -u "${acps_user}:${acps_pass}" "${url_xml}" || {
++        log "[WARN] XML download failed (continuing)"
++      }
++
++      # 3) SHA1 file (always - Long Name)
++      log "[STEP 09] Starting ${remote_sha1} download..."
++      curl -O -k -u "${acps_user}:${acps_pass}" "${url_sha1}" || {
++        log "[WARN] SHA1 download failed (verification may be skipped)"
++      }
++
++      # 4) qcow2 (only if not using local file - Long Name)
++      if [[ "${use_local_qcow}" -eq 0 ]]; then
++        log "[STEP 09] Starting image download: ${remote_qcow2}"
++        echo "=== Downloading ${remote_qcow2} (curl progress below) ==="
++        curl -O -k -u "${acps_user}:${acps_pass}" "${url_qcow2}" || {
++          log "[ERROR] ${remote_qcow2} download failed"
++          exit 1
++        }
++        echo "=== ${remote_qcow2} download complete ==="
++        log "[STEP 09] Image download complete"
++      else
++        log "[STEP 09] Using local image, skipping download."
++      fi
++    )
++
++    local rc=$?
++    if [[ "${rc}" -ne 0 ]]; then
++      log "[STEP 09] Download error; aborting STEP 09 (rc=${rc})"
++      return 1
++    fi
++  fi
++
++  #######################################
++  # 4) Execute permission, SHA1 verification, and rename
++  #######################################
++  local _DRY="${DRY_RUN:-0}"
++
++  if [[ "${_DRY}" -eq 0 ]]; then
++    # 4-1) Add execute permission to script
++    if [[ -f "${dl_img_dir}/${dp_script}" ]]; then
++      sudo chmod +x "${dl_img_dir}/${dp_script}"
++      log "[STEP 09] Granted execute permission to ${dl_img_dir}/${dp_script}"
++    else
++      log "[STEP 09] WARN: ${dl_img_dir}/${dp_script} missing; skipping chmod."
++    fi
++
++    # 4-2) SHA1 verification (only if both files exist)
++    if [[ -f "${dl_img_dir}/${remote_sha1}" && -f "${dl_img_dir}/${remote_qcow2}" ]]; then
++      log "[STEP 09] Running sha1sum verification for ${remote_qcow2}"
++
++      (
++        cd "${dl_img_dir}" || exit 2
++
++        if ! sha1sum -c "${remote_sha1}"; then
++          log "[WARN] sha1sum verification failed."
++
++          if whiptail_yesno "STEP 09 - sha1 verification failed" "sha1 verification failed.\n\nFile may be corrupted.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 09"
++          then
++            log "[STEP 09] User chose to continue despite sha1 failure."
++            exit 0
++          else
++            log "[STEP 09] User stopped STEP 09 due to sha1 failure."
++            exit 3
++          fi
++        fi
++
++        log "[STEP 09] sha1sum verification succeeded."
++        exit 0
++      )
++
++      local sha_rc=$?
++      case "${sha_rc}" in
++        0) ;; # ok
++        2) log "[STEP 09] Failed to access directory during sha1 check"; return 1 ;;
++        3) log "[STEP 09] User aborted STEP 09 due to sha1 failure"; return 1 ;;
++        *) log "[STEP 09] Unknown error during sha1 verification (code=${sha_rc})"; return 1 ;;
++      esac
++    else
++      log "[STEP 09] SHA1 file or image missing; skipping sha1 verification."
++    fi
++
++    # 4-3) Rename: Long Name -> Short Name
++    if [[ -f "${dl_img_dir}/${remote_qcow2}" ]]; then
++      log "[STEP 09] Renaming: ${remote_qcow2} -> ${local_qcow2}"
++      sudo mv "${dl_img_dir}/${remote_qcow2}" "${dl_img_dir}/${local_qcow2}"
++
++      # Remove SHA1 file (no longer needed, avoid confusion)
++      sudo rm -f "${dl_img_dir}/${remote_sha1}"
++    fi
++
++    #######################################
++    # 5) Patch virt_deploy_uvp_centos.sh (Short Name + ACPS_BASE_URL)
++    #######################################
++    local target_script="${dl_img_dir}/${dp_script}"
++    local hardcoded_image_name="${local_qcow2}" # Short Name
++
++    if [[ -f "${target_script}" ]]; then
++      log "[STEP 09] Patching virt_deploy_uvp_centos.sh (Short Name + ACPS_BASE_URL)"
++
++      # 1. IMAGE variable patch
++      sed -i "s|^#\?IMAGE=\${DIR}/\${IMAGE_NAME}|IMAGE=${dl_img_dir}/${hardcoded_image_name}|" "${target_script}"
++
++      # 2. uvp_package_url patch (use ACPS_BASE_URL, not FS_SERVER or apsdev)
++      sed -i "s|^#\?uvp_package_url=.*|uvp_package_url=${acps_url}/release/\${RELEASE}/dataprocessor/${hardcoded_image_name}|" "${target_script}"
++
++      log "[STEP 09] virt_deploy_uvp_centos.sh patched (IMAGE, uvp_package_url)."
++    fi
++
++    #######################################
++    # 6) Copy to DA image directory
++    #######################################
++    local da_img_dir="/stellar/da/images"
++
++    run_cmd "sudo mkdir -p ${da_img_dir}"
++
++    # Copy image (Short Name)
++    if [[ -f "${dl_img_dir}/${local_qcow2}" ]]; then
++      run_cmd "sudo cp ${dl_img_dir}/${local_qcow2} ${da_img_dir}/"
++    else
++      log "[WARN] ${local_qcow2} missing; skipping DA image copy."
++    fi
++
++    # Copy script
++    if [[ -f "${dl_img_dir}/${dp_script}" ]]; then
++      run_cmd "sudo cp ${dl_img_dir}/${dp_script} ${da_img_dir}/"
++    else
++      log "[WARN] ${dp_script} missing; skipping DA script copy."
++    fi
++  else
++    # DRY_RUN mode
++    log "[DRY-RUN] chmod, SHA1 verification, Rename, script patching, file copying skipped"
++  fi
++
++  #######################################
++  # 7) Final summary
++  #######################################
++  : > "${tmp_info}"
++  {
++    echo "═══════════════════════════════════════════════════════════"
++    echo "  STEP 09: Execution Summary (v621)"
++    echo "═══════════════════════════════════════════════════════════"
++    if [[ "${use_local_qcow}" -eq 1 ]]; then
++      echo "# Image source: Local file reuse"
++      echo "  - Original: ${found_local_file}"
++    else
++      echo "# Image source: Downloaded from server"
++      echo "  - Remote: ${remote_qcow2}"
++    fi
++    echo
++    echo "# Final local name: ${local_qcow2}"
++    echo "  (This filename is used in Step 10/11)"
++    echo
++    echo "# Download path: ${dl_img_dir}"
++    echo "# Script patched: Yes (IMAGE, uvp_package_url)"
++    echo "# ACPS_BASE_URL: ${acps_url}"
++  } >> "${tmp_info}"
++
++  show_textbox "STEP 09 - Summary (v621)" "${tmp_info}"
++}
++
++step_10_dl_master_deploy_v621() {
++  local STEP_ID="10_dl_master_deploy"
++
++  echo
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 10. DL-master VM deployment (v621) ====="
++
++  # Load configuration
++  if type load_config >/dev/null 2>&1; then
++    load_config
++  fi
++
++  local _DRY_RUN="${DRY_RUN:-0}"
++
++  # VM hostname input (KT v1.8 feature)
++  local default_hostname="${DL_HOSTNAME:-dl-master}"
++  local vm_name_input
++
++  vm_name_input=$(whiptail_inputbox "STEP 10 - DL VM name (Role) Configuration" "Enter hostname for DL VM.\n\n(Example: dl-master, dl-worker1, dl-worker2 ...)\n\n※ Important: This name is used for NVRAM filename (\${VM_NAME}_VARS.fd)." "${default_hostname}" 15 70)
++  if [[ $? -ne 0 ]] || [[ -z "${vm_name_input}" ]]; then
++    vm_name_input="dl-master"
++  fi
++
++  DL_HOSTNAME="${vm_name_input}"
++
++  # Save to config
++  if type save_config_var >/dev/null 2>&1; then
++    save_config_var "DL_HOSTNAME" "${DL_HOSTNAME}"
++  fi
++
++  log "[STEP 10] Selected VM name: ${DL_HOSTNAME}"
++
++  local DL_CLUSTERSIZE="${DL_CLUSTERSIZE:-1}"
++  local DL_VCPUS="${DL_VCPUS:-42}"
++  local DL_MEMORY_GB="${DL_MEMORY_GB:-186}"       # GB
++  local DL_DISK_GB="${DL_DISK_GB:-500}"           # GB
++
++  local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
++  local DL_BRIDGE="${DL_BRIDGE:-virbr0}"
++  local DL_IMAGE_DIR="${DL_INSTALL_DIR}/images"
++
++  local DL_IP="${DL_IP:-192.168.122.2}"
++  local DL_NETMASK="${DL_NETMASK:-255.255.255.0}"
++  local DL_GW="${DL_GW:-192.168.122.1}"
++  local DL_DNS="${DL_DNS:-8.8.8.8}"
++
++  # DP_VERSION check
++  local _DP_VERSION="${DP_VERSION:-}"
++  if [[ -z "${_DP_VERSION}" ]]; then
++    whiptail_msgbox "STEP 10 - DL deploy" "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DP_VERSION not set. Skipping DL-master deploy."
++    return 0
++  fi
++
++  # Clean up VM directories (hostname + role-based)
++  local DL_DIR_HOST="${DL_IMAGE_DIR}/${DL_HOSTNAME}"
++  local DL_DIR_ROLE="${DL_IMAGE_DIR}/dl-master"
++
++  if [[ "${_DRY_RUN}" -eq 1 ]]; then
++    log "[DRY-RUN] rm -rf '${DL_DIR_HOST}' '${DL_DIR_ROLE}'"
++    log "[DRY-RUN] rm -f '${DL_IMAGE_DIR}/${DL_HOSTNAME}.raw' '${DL_IMAGE_DIR}/dl-master.raw'"
++  else
++    [[ -d "${DL_DIR_HOST}" ]] && sudo rm -rf "${DL_DIR_HOST}" 2>/dev/null || true
++    [[ -d "${DL_DIR_ROLE}" ]] && sudo rm -rf "${DL_DIR_ROLE}" 2>/dev/null || true
++    sudo rm -f "${DL_IMAGE_DIR}/${DL_HOSTNAME}.raw" "${DL_IMAGE_DIR}/${DL_HOSTNAME}.log" 2>/dev/null || true
++    sudo rm -f "${DL_IMAGE_DIR}/dl-master.raw" "${DL_IMAGE_DIR}/dl-master.log" 2>/dev/null || true
++  fi
++
++  # Host MGT IP
++  local MGT_NIC_NAME="${MGT_NIC:-mgt}"
++  local HOST_MGT_IP
++  HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
++
++  if [[ -z "${HOST_MGT_IP}" ]]; then
++    HOST_MGT_IP="$(whiptail_inputbox "STEP 10 - DL deploy" "Enter host management interface (${MGT_NIC_NAME}) IP.\n(Example: 10.4.0.210)" "" 12 80)"
++    if [[ $? -ne 0 ]] || [[ -z "${HOST_MGT_IP}" ]]; then
++      whiptail_msgbox "STEP 10 - DL deploy" "Host management IP not available.\nSkipping DL-master deploy." 10 70
++      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HOST_MGT_IP not available. Skipping."
++      return 0
++    fi
++  fi
++
++  # Locate virt_deploy_uvp_centos.sh
++  local DP_SCRIPT_PATH_CANDIDATES=()
++  [[ -n "${DP_SCRIPT_PATH:-}" ]] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
++  DP_SCRIPT_PATH_CANDIDATES+=("${DL_IMAGE_DIR}/virt_deploy_uvp_centos.sh")
++  DP_SCRIPT_PATH_CANDIDATES+=("${DL_INSTALL_DIR}/virt_deploy_uvp_centos.sh")
++  DP_SCRIPT_PATH_CANDIDATES+=("./virt_deploy_uvp_centos.sh")
++
++  local DP_SCRIPT_PATH=""
++  local c
++  for c in "${DP_SCRIPT_PATH_CANDIDATES[@]}"; do
++    if [[ -f "${c}" ]]; then
++      DP_SCRIPT_PATH="${c}"
++      break
++    fi
++  done
++
++  if [[ -z "${DP_SCRIPT_PATH}" ]]; then
++    whiptail_msgbox "STEP 10 - DL deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 first.\nSkipping this step." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
++    return 0
++  fi
++
++  # Check DL image
++  local QCOW2_PATH="${DL_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
++  local DL_NODOWNLOAD="true"
++
++  if [[ ! -f "${QCOW2_PATH}" ]]; then
++    DL_NODOWNLOAD="false"
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL qcow2 image not found at ${QCOW2_PATH}. Will run with --nodownload=false."
++  fi
++
++  # Check mount
++  if ! mount | grep -q "on ${DL_INSTALL_DIR} "; then
++    whiptail_msgbox "STEP 10 - DL deploy" "${DL_INSTALL_DIR} is not mounted.\nComplete STEP 07 first.\nSkipping this step." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DL_INSTALL_DIR} not mounted. Skipping."
++    return 0
++  fi
++
++  # DL OTP
++  local _DL_OTP="${DL_OTP:-}"
++  if [[ -z "${_DL_OTP}" ]]; then
++    _DL_OTP="$(whiptail_passwordbox "STEP 10 - DL deploy" "Enter OTP for DL-master (issued from Stellar Cyber)." "")"
++    if [[ $? -ne 0 ]] || [[ -z "${_DL_OTP}" ]]; then
++      whiptail_msgbox "STEP 10 - DL deploy" "No OTP provided. Skipping DL-master deploy." 10 70
++      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL_OTP not provided. Skipping."
++      return 0
++    fi
++    DL_OTP="${_DL_OTP}"
++    if type save_config >/dev/null 2>&1; then
++      save_config
++    fi
++  fi
++
++  # Check existing VM
++  if virsh dominfo "${DL_HOSTNAME}" >/dev/null 2>&1; then
++    if ! confirm_destroy_vm "${DL_HOSTNAME}" "STEP 10 - DL deploy"; then
++      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Existing VM detected, user kept it. Skipping."
++      return 0
++    fi
++
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Destroying and undefining existing ${DL_HOSTNAME}..."
++
++    if [[ "${_DRY_RUN}" -eq 1 ]]; then
++      echo "[DRY_RUN] virsh destroy '${DL_HOSTNAME}' || true"
++      echo "[DRY_RUN] virsh undefine '${DL_HOSTNAME}' --nvram || virsh undefine '${DL_HOSTNAME}' || true"
++    else
++      virsh destroy "${DL_HOSTNAME}" >/dev/null 2>&1 || true
++      virsh undefine "${DL_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${DL_HOSTNAME}" >/dev/null 2>&1 || true
++    fi
++  fi
++
++  # DL memory input
++  local _DL_MEM_INPUT
++  _DL_MEM_INPUT="$(whiptail_inputbox "STEP 10 - DL memory" "Enter memory (GB) for DL-master VM.\n\nCurrent default: ${DL_MEMORY_GB} GB" "${DL_MEMORY_GB}" 12 70)"
++
++  if [[ $? -eq 0 ]] && [[ -n "${_DL_MEM_INPUT}" ]]; then
++    if [[ "${_DL_MEM_INPUT}" =~ ^[0-9]+$ ]] && [[ "${_DL_MEM_INPUT}" -gt 0 ]]; then
++      DL_MEMORY_GB="${_DL_MEM_INPUT}"
++    else
++      whiptail_msgbox "STEP 10 - DL memory" "Invalid memory value.\nUsing current default (${DL_MEMORY_GB} GB)." 10 70
++    fi
++  fi
++  save_config_var "DL_MEMORY_GB" "${DL_MEMORY_GB}"
++
++  if type save_config >/dev/null 2>&1; then
++    save_config
++  fi
++
++  local DL_MEMORY_MB=$(( DL_MEMORY_GB * 1024 ))
++
++  # Build command
++  local CMD
++  CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
++--hostname=${DL_HOSTNAME} \
++--cluster-size=${DL_CLUSTERSIZE} \
++--release=${_DP_VERSION} \
++--local-ip=${HOST_MGT_IP} \
++--node-role=DL-master \
++--bridge=${DL_BRIDGE} \
++--CPUS=${DL_VCPUS} \
++--MEM=${DL_MEMORY_MB} \
++--DISKSIZE=${DL_DISK_GB} \
++--nodownload=${DL_NODOWNLOAD} \
++--installdir=${DL_INSTALL_DIR} \
++--OTP=${_DL_OTP} \
++--ip=${DL_IP} \
++--netmask=${DL_NETMASK} \
++--gw=${DL_GW} \
++--dns=${DL_DNS}"
++
++  # Final confirmation
++  local SUMMARY
++  SUMMARY="Deploy DL-master VM with:
++
++  Hostname      : ${DL_HOSTNAME}
++  Cluster size  : ${DL_CLUSTERSIZE}
++  DP version    : ${_DP_VERSION}
++  Host MGT IP   : ${HOST_MGT_IP}
++  Bridge        : ${DL_BRIDGE}
++  vCPU          : ${DL_VCPUS}
++  Memory        : ${DL_MEMORY_GB} GB (${DL_MEMORY_MB} MB)
++  Disk size     : ${DL_DISK_GB} GB
++  installdir    : ${DL_INSTALL_DIR}
++  VM IP         : ${DL_IP}
++  Netmask       : ${DL_NETMASK}
++  Gateway       : ${DL_GW}
++  DNS           : ${DL_DNS}
++  nodownload    : ${DL_NODOWNLOAD}
++  Script path   : ${DP_SCRIPT_PATH}
++
++Run virt_deploy_uvp_centos.sh with these settings?"
++
++  if ! whiptail_yesno "STEP 10 - DL deploy" "${SUMMARY}"; then
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled DL-master deploy."
++    return 0
++  fi
++
++  echo
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Running DL-master deploy command:"
++  echo "  ${CMD}"
++  echo
++
++  if [[ "${_DRY_RUN}" -eq 1 ]]; then
++    echo "[DRY_RUN] Command not executed (DRY_RUN=1)."
++    whiptail_msgbox "STEP 10 - DL deploy (DRY RUN)" "DRY_RUN mode.\n\nCommand printed but not executed:\n\n${CMD}" 20 80
++    if type mark_step_done >/dev/null 2>&1; then
++      mark_step_done "${STEP_ID}"
++    fi
++    return 0
++  fi
++
++  # Actual execution
++  eval "${CMD}"
++  local RC=$?
++
++  if [[ ${RC} -ne 0 ]]; then
++    whiptail_msgbox "STEP 10 - DL deploy" "virt_deploy_uvp_centos.sh exited with code ${RC}.\nCheck status via virsh list / virsh console ${DL_HOSTNAME}." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master deploy failed with RC=${RC}."
++    return ${RC}
++  fi
++
++  # Validation
++  if virsh dominfo "${DL_HOSTNAME}" >/dev/null 2>&1; then
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master VM '${DL_HOSTNAME}' successfully created/updated."
++  else
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] WARNING: virt_deploy script finished, but virsh dominfo ${DL_HOSTNAME} failed."
++  fi
++
++  whiptail_msgbox "STEP 10 - DL deploy complete" "DL-master VM (UEFI) deployment completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck logs and virsh list / virsh console ${DL_HOSTNAME} for status." 14 80
++
++  if type mark_step_done >/dev/null 2>&1; then
++    mark_step_done "${STEP_ID}"
++  fi
++
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 10. DL-master VM deployment (v621) ====="
++  echo
++}
++
++step_11_da_master_deploy_v621() {
++  local STEP_ID="11_da_master_deploy"
++
++  echo
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 11. DA-master VM deployment (v621) ====="
++
++  # Load configuration
++  if type load_config >/dev/null 2>&1; then
++    load_config
++  fi
++
++  local _DRY_RUN="${DRY_RUN:-0}"
++
++  # VM hostname input (KT v1.8 feature)
++  local default_hostname="${DA_HOSTNAME:-da-master}"
++  local vm_name_input
++
++  vm_name_input=$(whiptail_inputbox "STEP 11 - DA VM name Configuration" "Enter hostname for DA VM.\n\n(Example: da-master, da-worker1, da-worker2 ...)\n\n※ This name is used for NVRAM filename (\${VM_NAME}_VARS.fd)." "${default_hostname}" 15 70)
++  if [[ $? -ne 0 ]] || [[ -z "${vm_name_input}" ]]; then
++    vm_name_input="da-master"
++  fi
++
++  DA_HOSTNAME="${vm_name_input}"
++
++  # Save to config
++  save_config_var "DA_HOSTNAME" "${DA_HOSTNAME}"
++
++  log "[STEP 11] Selected VM name: ${DA_HOSTNAME}"
++
++  local DA_VCPUS="${DA_VCPUS:-46}"
++  local DA_MEMORY_GB="${DA_MEMORY_GB:-156}"       # GB
++  local DA_DISK_GB="${DA_DISK_GB:-500}"           # GB
++
++  local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
++  local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
++  local DA_IMAGE_DIR="${DA_INSTALL_DIR}/images"
++
++  local DA_IP="${DA_IP:-192.168.122.3}"
++  local DA_NETMASK="${DA_NETMASK:-255.255.255.0}"
++  local DA_GW="${DA_GW:-192.168.122.1}"
++  local DA_DNS="${DA_DNS:-8.8.8.8}"
++
++  # DP_VERSION check
++  local _DP_VERSION="${DP_VERSION:-}"
++  if [[ -z "${_DP_VERSION}" ]]; then
++    whiptail_msgbox "STEP 11 - DA Deployment" "DP_VERSION is not set.\nSet it in Settings and rerun.\nSkipping this step." 12 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DP_VERSION not set. Skipping DA-master deploy."
++    return 0
++  fi
++
++  # Clean up VM directories (hostname + role-based)
++  local DA_DIR_HOST="${DA_IMAGE_DIR}/${DA_HOSTNAME}"
++  local DA_DIR_ROLE="${DA_IMAGE_DIR}/da-master"
++
++  if [[ "${_DRY_RUN}" -eq 1 ]]; then
++    log "[DRY-RUN] rm -rf '${DA_DIR_HOST}' '${DA_DIR_ROLE}'"
++    log "[DRY-RUN] rm -f '${DA_IMAGE_DIR}/${DA_HOSTNAME}.raw' '${DA_IMAGE_DIR}/da-master.raw'"
++  else
++    [[ -d "${DA_DIR_HOST}" ]] && sudo rm -rf "${DA_DIR_HOST}" 2>/dev/null || true
++    [[ -d "${DA_DIR_ROLE}" ]] && sudo rm -rf "${DA_DIR_ROLE}" 2>/dev/null || true
++    sudo rm -f "${DA_IMAGE_DIR}/${DA_HOSTNAME}.raw" "${DA_IMAGE_DIR}/${DA_HOSTNAME}.log" 2>/dev/null || true
++    sudo rm -f "${DA_IMAGE_DIR}/da-master.raw" "${DA_IMAGE_DIR}/da-master.log" 2>/dev/null || true
++  fi
++
++  # Host MGT IP
++  : "${MGT_NIC:=mgt}"
++  local MGT_NIC_NAME="${MGT_NIC}"
++  local HOST_MGT_IP
++  HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
++
++  if [[ -z "${HOST_MGT_IP}" ]]; then
++    HOST_MGT_IP="$(whiptail_inputbox "STEP 11 - DA deploy" "Enter host management (${MGT_NIC_NAME}) interface IP.\n(Example: 10.4.0.210)" "" 12 80)"
++    if [[ $? -ne 0 ]] || [[ -z "${HOST_MGT_IP}" ]]; then
++      whiptail_msgbox "STEP 11 - DA deploy" "Host management IP not available.\nSkipping DA-master deploy." 10 70
++      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] HOST_MGT_IP not available. Skipping."
++      return 0
++    fi
++  fi
++
++  # cm_fqdn (DL cluster IP, CM address)
++  : "${DL_IP:=192.168.122.2}"
++  local CM_FQDN="${CM_FQDN:-${DL_IP}}"
++
++  # Locate virt_deploy_uvp_centos.sh
++  local DP_SCRIPT_PATH_CANDIDATES=()
++  [[ -n "${DP_SCRIPT_PATH:-}" ]] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
++  DP_SCRIPT_PATH_CANDIDATES+=("${DA_IMAGE_DIR}/virt_deploy_uvp_centos.sh")
++  DP_SCRIPT_PATH_CANDIDATES+=("${DA_INSTALL_DIR}/virt_deploy_uvp_centos.sh")
++  DP_SCRIPT_PATH_CANDIDATES+=("./virt_deploy_uvp_centos.sh")
++  DP_SCRIPT_PATH_CANDIDATES+=("/root/virt_deploy_uvp_centos.sh")
++
++  local DP_SCRIPT_PATH=""
++  local c
++  for c in "${DP_SCRIPT_PATH_CANDIDATES[@]}"; do
++    if [[ -f "${c}" ]]; then
++      DP_SCRIPT_PATH="${c}"
++      break
++    fi
++  done
++
++  if [[ -z "${DP_SCRIPT_PATH}" ]]; then
++    whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nComplete STEP 09 first, then run again.\nSkipping this step." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] virt_deploy_uvp_centos.sh not found. Skipping."
++    return 0
++  fi
++
++  # Check DA image
++  local QCOW2_PATH="${DA_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
++  local DA_NODOWNLOAD="true"
++
++  if [[ ! -f "${QCOW2_PATH}" ]]; then
++    DA_NODOWNLOAD="false"
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA qcow2 image not found at ${QCOW2_PATH}. Will run with --nodownload=false."
++  fi
++
++  # Check mount
++  if ! mount | grep -q "on ${DA_INSTALL_DIR} "; then
++    whiptail_msgbox "STEP 11 - DA Deployment" "${DA_INSTALL_DIR} is not mounted.\nComplete STEP 07 first.\nSkipping this step." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] ${DA_INSTALL_DIR} not mounted. Skipping."
++    return 0
++  fi
++
++  # Check existing VM
++  if virsh dominfo "${DA_HOSTNAME}" >/dev/null 2>&1; then
++    if ! confirm_destroy_vm "${DA_HOSTNAME}" "STEP 11 - DA Deployment"; then
++      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Existing VM detected, user chose to keep it. Skipping."
++      return 0
++    fi
++
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Destroying and undefining existing ${DA_HOSTNAME}..."
++
++    if [[ "${_DRY_RUN}" -eq 1 ]]; then
++      echo "[DRY_RUN] virsh destroy '${DA_HOSTNAME}' || true"
++      echo "[DRY_RUN] virsh undefine '${DA_HOSTNAME}' --nvram || virsh undefine '${DA_HOSTNAME}' || true"
++    else
++      virsh destroy "${DA_HOSTNAME}" >/dev/null 2>&1 || true
++      virsh undefine "${DA_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${DA_HOSTNAME}" >/dev/null 2>&1 || true
++    fi
++  fi
++
++  # DA memory input
++  local _DA_MEM_INPUT
++  _DA_MEM_INPUT="$(whiptail_inputbox "STEP 11 - DA Memory Configuration" "Enter memory (GB) for DA-master VM.\n\nCurrent default: ${DA_MEMORY_GB} GB" "${DA_MEMORY_GB}" 12 70)"
++
++  if [[ $? -eq 0 ]] && [[ -n "${_DA_MEM_INPUT}" ]]; then
++    if [[ "${_DA_MEM_INPUT}" =~ ^[0-9]+$ ]] && [[ "${_DA_MEM_INPUT}" -gt 0 ]]; then
++      DA_MEMORY_GB="${_DA_MEM_INPUT}"
++    else
++      whiptail_msgbox "STEP 11 - DA Memory Configuration" "Invalid memory value.\nUsing current default (${DA_MEMORY_GB} GB)." 10 70
++    fi
++  fi
++
++  if type save_config >/dev/null 2>&1; then
++    save_config
++  fi
++
++  save_config_var "DA_MEMORY_GB" "${DA_MEMORY_GB}"
++
++  local DA_MEMORY_MB=$(( DA_MEMORY_GB * 1024 ))
++
++  # node_role = resource (DA node)
++  local DA_NODE_ROLE="resource"
++
++  # Build command
++  local CMD
++  CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
++--hostname=${DA_HOSTNAME} \
++--release=${_DP_VERSION} \
++--local-ip=${HOST_MGT_IP} \
++--cm_fqdn=${CM_FQDN} \
++--node-role=${DA_NODE_ROLE} \
++--bridge=${DA_BRIDGE} \
++--CPUS=${DA_VCPUS} \
++--MEM=${DA_MEMORY_MB} \
++--DISKSIZE=${DA_DISK_GB} \
++--nodownload=${DA_NODOWNLOAD} \
++--installdir=${DA_INSTALL_DIR} \
++--ip=${DA_IP} \
++--netmask=${DA_NETMASK} \
++--gw=${DA_GW} \
++--dns=${DA_DNS}"
++
++  # Final confirmation
++  local SUMMARY
++  SUMMARY="Deploy DA-master VM with:
++
++  Hostname        : ${DA_HOSTNAME}
++  DP Version      : ${_DP_VERSION}
++  Host MGT IP     : ${HOST_MGT_IP}
++  CM FQDN(DL IP)  : ${CM_FQDN}
++  Bridge          : ${DA_BRIDGE}
++  node_role       : ${DA_NODE_ROLE}
++  vCPU            : ${DA_VCPUS}
++  Memory          : ${DA_MEMORY_GB} GB (${DA_MEMORY_MB} MB)
++  Disk Size       : ${DA_DISK_GB} GB
++  installdir      : ${DA_INSTALL_DIR}
++  VM IP           : ${DA_IP}
++  Netmask         : ${DA_NETMASK}
++  Gateway         : ${DA_GW}
++  DNS             : ${DA_DNS}
++  nodownload      : ${DA_NODOWNLOAD}
++  Script Path     : ${DP_SCRIPT_PATH}
++
++Execute virt_deploy_uvp_centos.sh with the above settings?"
++
++  if ! whiptail_yesno "STEP 11 - DA Deployment" "${SUMMARY}"; then
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User cancelled DA-master deploy."
++    return 0
++  fi
++
++  echo
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Running DA-master deploy command:"
++  echo "  ${CMD}"
++  echo
++
++  if [[ "${_DRY_RUN}" -eq 1 ]]; then
++    echo "[DRY_RUN] Command not executed (DRY_RUN=1)."
++    whiptail_msgbox "STEP 11 - DA Deployment (DRY RUN)" "DRY_RUN mode.\n\nCommand printed but not executed:\n\n${CMD}" 20 80
++    if type mark_step_done >/dev/null 2>&1; then
++      mark_step_done "${STEP_ID}"
++    fi
++    return 0
++  fi
++
++  # Actual execution
++  eval "${CMD}"
++  local RC=$?
++
++  if [[ ${RC} -ne 0 ]]; then
++    whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nCheck status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
++    return ${RC}
++  fi
++
++  # Validation
++  if virsh dominfo "${DA_HOSTNAME}" >/dev/null 2>&1; then
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master VM '${DA_HOSTNAME}' successfully created/updated."
++  else
++    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] WARNING: virt_deploy script finished, but virsh dominfo ${DA_HOSTNAME} failed."
++  fi
++
++  whiptail_msgbox "STEP 11 - DA Deployment Complete" "DA-master VM (UEFI) deployment completed.\n\nInitial boot may take time due to Cloud-Init operations.\n\nCheck logs and virsh list / virsh console ${DA_HOSTNAME} for status." 14 80
++
++  if type mark_step_done >/dev/null 2>&1; then
++    mark_step_done "${STEP_ID}"
++  fi
++
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 11. DA-master VM deployment (v621) ====="
++  echo
++}
++
++step_12_sriov_cpu_affinity_v621() {
++  local STEP_ID="12_sriov_cpu_affinity"
++
++  echo
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV (v621) ====="
++
++  # Load config
++  if type load_config >/dev/null 2>&1; then
++    load_config
++  fi
++
++  local _DRY="${DRY_RUN:-0}"
++
++  # Use hostnames from Step 10/11 (dl-worker1, etc.)
++  local DL_VM="${DL_HOSTNAME:-dl-master}"
++  local DA_VM="${DA_HOSTNAME:-da-master}"
++
++  # Load memory values from CONFIG_FILE (KT v1.8 feature)
++  if [[ "${_DRY}" -eq 0 ]]; then
++    log "[STEP 12] Loading memory values from config file before UEFI/XML conversion"
++
++    if [[ -f "${CONFIG_FILE}" ]]; then
++      local cfg_dl_mem
++      cfg_dl_mem=$(grep "^DL_MEMORY_GB=" "${CONFIG_FILE}" | cut -d'=' -f2 | tr -d '"' || echo "")
++
++      if [[ -n "${cfg_dl_mem}" ]]; then
++        DL_MEMORY_GB="${cfg_dl_mem}"
++      fi
++
++      local cfg_da_mem
++      cfg_da_mem=$(grep "^DA_MEMORY_GB=" "${CONFIG_FILE}" | cut -d'=' -f2 | tr -d '"' || echo "")
++
++      if [[ -n "${cfg_da_mem}" ]]; then
++        DA_MEMORY_GB="${cfg_da_mem}"
++      fi
++    fi
++
++    # UEFI/XML conversion would go here (if apply_pdf_xml_patch function exists)
++    # For now, we skip it and proceed to SR-IOV/CPU affinity
++    log "[STEP 12] UEFI/XML conversion skipped (not implemented in v621). Proceeding to SR-IOV/CPU affinity."
++  else
++    log "[DRY-RUN] Step 12 UEFI/XML conversion and SR-IOV/CPU affinity simulation."
++  fi
++
++  ###########################################################################
++  # CPU PINNING RULES (NUMA separation)
++  # - DL: NUMA node0 (even cores) even numbers between 4~86 → 42 cores (4,6,...,86)
++  # - DA: NUMA node1 (odd cores) odd numbers between 5~95 → 46 cores (5,7,...,95)
++  ###########################################################################
++  local DL_CPUS_LIST=""
++  local DA_CPUS_LIST=""
++
++  # DL: even CPUs 4,6,...,86
++  local c
++  for (( c=4; c<=86; c+=2 )); do
++    DL_CPUS_LIST+="${c} "
++  done
++
++  # DA: odd CPUs 5,7,...,95
++  for (( c=5; c<=95; c+=2 )); do
++    DA_CPUS_LIST+="${c} "
++  done
++
++  log "[STEP 12] DL CPU LIST: ${DL_CPUS_LIST}"
++  log "[STEP 12] DA CPU LIST: ${DA_CPUS_LIST}"
++
++  ###########################################################################
++  # 1. SR-IOV VF PCI auto-detection
++  ###########################################################################
++  log "[STEP 12] Auto-detecting SR-IOV VF PCI devices"
++
++  local vf_list
++  vf_list="$(lspci | awk '/Ethernet/ && /Virtual Function/ {print $1}' || true)"
++
++  if [[ -z "${vf_list}" ]]; then
++    if [[ "${_DRY}" -eq 1 ]]; then
++      log "[DRY-RUN] No SR-IOV VF found, but continuing in DRY_RUN mode"
++      vf_list="0000:00:00.0 0000:00:00.1"  # Use placeholder VFs for dry run
++    else
++      whiptail_msgbox "STEP 12 - SR-IOV" "Failed to detect SR-IOV VF PCI devices.\nPlease check STEP 03 or BIOS settings." 12 70
++      log "[STEP 12] No SR-IOV VF found → aborting STEP"
++      return 1
++    fi
++  fi
++
++  log "[STEP 12] Detected VF list:\n${vf_list}"
++
++  local DL_VF DA_VF
++  DL_VF="$(echo "${vf_list}" | sed -n '1p')"
++  DA_VF="$(echo "${vf_list}" | sed -n '2p')"
++
++  if [[ -z "${DA_VF}" ]]; then
++    log "[WARN] Only 1 VF exists, applying VF Passthrough to DL only, DA will only have CPU Affinity without VF"
++  fi
++
++  ###########################################################################
++  # 2. DL/DA VM shutdown (wait until completely shut down)
++  ###########################################################################
++  log "[STEP 12] Requesting DL/DA VM shutdown"
++
++  for vm in "${DL_VM}" "${DA_VM}"; do
++    if virsh dominfo "${vm}" >/dev/null 2>&1; then
++      local state
++      state="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
++      if [[ "${state}" != "shut off" ]]; then
++        log "[STEP 12] Requesting ${vm} shutdown"
++        (( _DRY )) || virsh shutdown "${vm}" || log "[WARN] ${vm} shutdown failed (continuing anyway)"
++      else
++        log "[STEP 12] ${vm} is already in shut off state"
++      fi
++    else
++      log "[STEP 12] ${vm} VM not found → skipping shutdown"
++    fi
++  done
++
++  local timeout=180
++  local interval=5
++  local elapsed=0
++
++  while (( elapsed < timeout )); do
++    local all_off=1
++    for vm in "${DL_VM}" "${DA_VM}"; do
++      if virsh dominfo "${vm}" >/dev/null 2>&1; then
++        local st
++        st="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
++        if [[ "${st}" != "shut off" ]]; then
++          all_off=0
++        fi
++      fi
++    done
++
++    if (( all_off )); then
++      log "[STEP 12] All DL/DA VMs are now in shut off state."
++      break
++    fi
++
++    sleep "${interval}"
++    (( elapsed += interval ))
++  done
++
++  if (( elapsed >= timeout )); then
++    log "[WARN] [STEP 12] Some VMs did not shut off within timeout(${timeout}s). Continuing anyway."
++  fi
++
++  ###########################################################################
++  # 3. CD-ROM removal (detach-disk hda --config assumed)
++  ###########################################################################
++  _remove_cdrom() {
++    local vm="$1"
++    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
++      return 0
++    fi
++    if [[ "${_DRY}" -eq 1 ]]; then
++      log "[DRY-RUN] virsh detach-disk ${vm} hda --config"
++      return 0
++    fi
++    # Ignore failure as it's not critical
++    virsh detach-disk "${vm}" hda --config >/dev/null 2>&1 || true
++    log "[STEP 12] ${vm}: CD-ROM(hda) detach attempt completed"
++  }
++
++  _remove_cdrom "${DL_VM}"
++  _remove_cdrom "${DA_VM}"
++
++  ###########################################################################
++  # 4. VF PCI hostdev attach (virsh attach-device --config)
++  ###########################################################################
++  _attach_vf_to_vm() {
++    local vm="$1"
++    local pci="$2"
++
++    if [[ -z "${pci}" ]]; then
++      return 0
++    fi
++    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
++      return 0
++    fi
++
++    local domain bus slot func
++
++    # PCI format: DDDD:BB:SS.F  (e.g., 0000:8b:11.0)
++    if [[ "${pci}" =~ ^([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
++      domain="${BASH_REMATCH[1]}"
++      bus="${BASH_REMATCH[2]}"
++      slot="${BASH_REMATCH[3]}"
++      func="${BASH_REMATCH[4]}"
++    # Also handle BB:SS.F format (e.g., 8b:11.0)
++    elif [[ "${pci}" =~ ^([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])$ ]]; then
++      domain="0000"
++      bus="${BASH_REMATCH[1]}"
++      slot="${BASH_REMATCH[2]}"
++      func="${BASH_REMATCH[3]}"
++    else
++      log "[ERROR] ${vm}: Unsupported PCI address format: ${pci}"
++      return 1
++    fi
++
++    local d="0x${domain}"
++    local b="0x${bus}"
++    local s="0x${slot}"
++    local f="0x${func}"
++
++    local tmp_xml="/tmp/${vm}_vf.xml"
++    cat > "${tmp_xml}" <<EOF
++<hostdev mode='subsystem' type='pci' managed='yes'>
++  <driver name='vfio'/>
++  <source>
++    <address domain='${d}' bus='${b}' slot='${s}' function='${f}'/>
++  </source>
++</hostdev>
++EOF
++
++    if [[ "${_DRY}" -eq 1 ]]; then
++      log "[DRY-RUN] virsh attach-device ${vm} ${tmp_xml} --config"
++    else
++      local out
++      if ! out="$(virsh attach-device "${vm}" "${tmp_xml}" --config 2>&1)"; then
++        log "[ERROR] ${vm}: virsh attach-device failed (PCI=${pci})"
++        log "[ERROR] virsh message:"
++        while IFS= read -r line; do
++          log "  ${line}"
++        done <<< "${out}"
++      else
++        log "[STEP 12] ${vm}: VF PCI(${pci}) hostdev attach (--config) completed"
++      fi
++    fi
++  }
++
++  _attach_vf_to_vm "${DL_VM}" "${DL_VF}"
++  _attach_vf_to_vm "${DA_VM}" "${DA_VF}"
++
++  ###########################################################################
++  # 5. CPU Affinity (virsh vcpupin --config)
++  ###########################################################################
++  _apply_cpu_affinity_vm() {
++    local vm="$1"
++    local cpus_list="$2"
++
++    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
++      return 0
++    fi
++    [[ -n "${cpus_list}" ]] || return 0
++
++    # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
++    local max_vcpus
++    max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
++
++    if [[ "${max_vcpus}" -eq 0 ]]; then
++      log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
++      return 0
++    fi
++
++    # Convert cpus_list to array
++    local arr=()
++    local c
++    for c in ${cpus_list}; do
++      arr+=("${c}")
++    done
++
++    if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
++      log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
++      max_vcpus="${#arr[@]}"
++    fi
++
++    local i
++    for (( i=0; i<max_vcpus; i++ )); do
++      local pcpu="${arr[$i]}"
++      if [[ "${_DRY}" -eq 1 ]]; then
++        log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
++      else
++        if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
++          log "[STEP 12] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
++        else
++          log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
++        fi
++      fi
++    done
++  }
++
++  _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
++  _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
++
++  ###########################################################################
++  # 6. NUMA memory interleave (virsh numatune --config)
++  ###########################################################################
++  _apply_numatune_vm() {
++    local vm="$1"
++    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
++      return 0
++    fi
++
++    if [[ "${_DRY}" -eq 1 ]]; then
++      log "[DRY-RUN] virsh numatune ${vm} --mode interleave --nodeset 0-1 --config"
++    else
++      if virsh numatune "${vm}" --mode interleave --nodeset 0-1 --config >/dev/null 2>&1; then
++        log "[STEP 12] ${vm}: numatune mode=interleave nodeset=0-1 (--config) applied"
++      else
++        log "[WARN] ${vm}: numatune configuration failed (version/option may not be supported)"
++      fi
++    fi
++  }
++
++  _apply_numatune_vm "${DL_VM}"
++  _apply_numatune_vm "${DA_VM}"
++
++  ###########################################################################
++  # 7. DL data disk (LV) attach (vg_dl/lv_dl → vdb, --config)
++  ###########################################################################
++  local DATA_LV="/dev/mapper/vg_dl-lv_dl"
++
++  if [[ -e "${DATA_LV}" ]]; then
++    if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
++      if [[ "${_DRY}" -eq 1 ]]; then
++        log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
++      else
++        if virsh dumpxml "${DL_VM}" | grep -q "target dev='vdb'"; then
++          log "[STEP 12] ${DL_VM} vdb already exists → skipping data disk attach"
++        else
++          if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
++            log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
++          else
++            log "[WARN] ${DL_VM} data disk(${DATA_LV}) attach failed"
++          fi
++        fi
++      fi
++    else
++      log "[STEP 12] ${DL_VM} VM not found → skipping DL data disk attach"
++    fi
++  else
++    log "[STEP 12] ${DATA_LV} does not exist; skipping DL data disk attach."
++  fi
++
++  ###########################################################################
++  # 8. DL/DA VM restart
++  ###########################################################################
++  for vm in "${DL_VM}" "${DA_VM}"; do
++    if virsh dominfo "${vm}" >/dev/null 2>&1; then
++      log "[STEP 12] ${vm} start request"
++      (( _DRY )) || virsh start "${vm}" || log "[WARN] ${vm} start failed"
++    fi
++  done
++
++  # Wait 5 seconds after VM start
++  if [[ "${_DRY}" -eq 0 ]]; then
++    log "[STEP 12] Waiting 5 seconds after DL/DA VM start (vCPU state stabilization)"
++    sleep 5
++  fi
++
++  ###########################################################################
++  # 9. Basic verification results
++  ###########################################################################
++  if [[ "${_DRY}" -eq 0 ]]; then
++    local result_file="/tmp/step12_result.txt"
++    rm -f "${result_file}"
++
++    {
++      echo "===== DL vcpuinfo (${DL_VM}) ====="
++      if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
++        virsh vcpuinfo "${DL_VM}" 2>&1
++      else
++        echo "VM ${DL_VM} not found"
++      fi
++      echo
++
++      echo "===== DA vcpuinfo (${DA_VM}) ====="
++      if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
++        virsh vcpuinfo "${DA_VM}" 2>&1
++      else
++        echo "VM ${DA_VM} not found"
++      fi
++      echo
++
++      echo "===== DL XML (cputune / numatune / hostdev / vdb) ====="
++      if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
++        virsh dumpxml "${DL_VM}" 2>/dev/null | \
++          grep -E 'cputune|numatune|hostdev|target dev='\''vdb'\''' || true
++      else
++        echo "VM ${DL_VM} not found"
++      fi
++      echo
++
++      echo "===== DA XML (cputune / numatune / hostdev) ====="
++      if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
++        virsh dumpxml "${DA_VM}" 2>/dev/null | \
++          grep -E 'cputune|numatune|hostdev' || true
++      else
++        echo "VM ${DA_VM} not found"
++      fi
++      echo
++    } > "${result_file}"
++
++    show_paged "STEP 12 – SR-IOV / CPU Affinity / DL data LV verification results (v621)" "${result_file}"
++  fi
++
++  ###########################################################################
++  # 10. STEP completion marking
++  ###########################################################################
++  if type mark_step_done >/dev/null 2>&1; then
++    mark_step_done "${STEP_ID}"
++  fi
++
++  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV (v621) ====="
++  echo
+ }
+ 
+ 
+@@ -3626,6 +4876,15 @@
+   # 0) Check configuration values
+   #######################################
+   local ver="${DP_VERSION:-}"
++  
++  # DP_VERSION gate:
++  #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
++  #   - >= 6.2.1 : use KT v1.8 Step 09 behavior (v621)
++  if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
++    step_09_dp_download_v621
++    return
++  fi
++  
+   local acps_user="${ACPS_USERNAME:-}"
+   local acps_pass="${ACPS_PASSWORD:-}"
+   local acps_url="${ACPS_BASE_URL:-https://acps.stellarcyber.ai}"
+@@ -4220,6 +5479,15 @@
+         load_config
+     fi
+ 
++    # DP_VERSION gate:
++    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
++    #   - >= 6.2.1 : use KT v1.8 Step 10 behavior (v621)
++    local ver="${DP_VERSION:-}"
++    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
++      step_10_dl_master_deploy_v621
++      return
++    fi
++
+     # DRY_RUN default value guard
+     local _DRY_RUN="${DRY_RUN:-0}"
+ 
+@@ -4600,6 +5868,15 @@
+     # Load configuration
+     if type load_config >/dev/null 2>&1; then
+         load_config
++    fi
++
++    # DP_VERSION gate:
++    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
++    #   - >= 6.2.1 : use KT v1.8 Step 11 behavior (v621)
++    local ver="${DP_VERSION:-}"
++    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
++      step_11_da_master_deploy_v621
++      return
+     fi
+ 
+     # DRY_RUN default value guard
+@@ -4958,6 +6235,15 @@
+         load_config
+     fi
+ 
++    # DP_VERSION gate:
++    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
++    #   - >= 6.2.1 : use KT v1.8 Step 12 behavior (v621)
++    local ver="${DP_VERSION:-}"
++    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
++      step_12_sriov_cpu_affinity_v621
++      return
++    fi
++
+     local _DRY="${DRY_RUN:-0}"
+     local DL_VM="${DL_VM_NAME:-dl-master}"
+     local DA_VM="${DA_VM_NAME:-da-master}"

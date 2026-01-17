@@ -349,7 +349,7 @@ show_textbox() {
 #   2) Pass title and file path   : show_paged "Title" "/path/to/file"
 #######################################
 show_paged() {
-  local title file tmpfile
+  local title file tmpfile no_clear
 
   # ANSI color definitions
   local RED="\033[1;31m"
@@ -360,6 +360,7 @@ show_paged() {
   local RESET="\033[0m"
 
   # --- Argument handling (safe with set -u) ---
+  no_clear="0"
   if [[ $# -eq 1 ]]; then
     # Single argument: content string only
     title="XDR Installer info"
@@ -370,12 +371,17 @@ show_paged() {
     # Two or more args: 1 = title, 2 = file path
     title="$1"
     file="$2"
+    if [[ "${3:-}" == "no-clear" ]]; then
+      no_clear="1"
+    fi
   else
     echo "show_paged: no content provided" >&2
     return 1
   fi
 
-  clear
+  if [[ "${no_clear}" -eq 0 ]]; then
+    clear
+  fi
   echo -e "${CYAN}============================================================${RESET}"
   echo -e "  ${YELLOW}${title}${RESET}"
   echo -e "${CYAN}============================================================${RESET}"
@@ -436,6 +442,118 @@ append_fstab_if_missing() {
   fi
 }
 
+#######################################
+# Bridge runtime creation/UP guarantee (NO-CARRIER allowed)
+# Purpose: Ensure bridge exists and is admin UP for VM attach
+#          NO-CARRIER (operstate DOWN) is acceptable and not a failure condition
+#######################################
+ensure_bridge_up_no_carrier_ok() {
+  local bridge_name="$1"
+  local phys_nic="$2"
+  local _DRY="${DRY_RUN:-0}"
+
+  log "[Bridge Ensure] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
+
+  # 1) Bridge 존재 확인 및 생성
+  if ! ip link show dev "${bridge_name}" >/dev/null 2>&1; then
+    log "[Bridge Ensure] Bridge ${bridge_name} does not exist, creating it"
+    if [[ "${_DRY}" -eq 1 ]]; then
+      log "[DRY-RUN] ip link add name ${bridge_name} type bridge"
+    else
+      ip link add name "${bridge_name}" type bridge 2>/dev/null || {
+        log "[ERROR] Failed to create bridge ${bridge_name}"
+        return 1
+      }
+      log "[Bridge Ensure] Bridge ${bridge_name} created"
+    fi
+  else
+    log "[Bridge Ensure] Bridge ${bridge_name} already exists"
+  fi
+
+  # 2) Bridge admin UP 보장
+  if [[ "${_DRY}" -eq 1 ]]; then
+    log "[DRY-RUN] ip link set dev ${bridge_name} up"
+  else
+    ip link set dev "${bridge_name}" up 2>/dev/null || {
+      log "[ERROR] Failed to set bridge ${bridge_name} admin UP"
+      return 1
+    }
+    log "[Bridge Ensure] Bridge ${bridge_name} set to admin UP"
+  fi
+
+  # 3) 물리 NIC admin UP (enslave 전에 UP 상태로)
+  if [[ -n "${phys_nic}" ]]; then
+    if ip link show dev "${phys_nic}" >/dev/null 2>&1; then
+      if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] ip link set dev ${phys_nic} up"
+      else
+        ip link set dev "${phys_nic}" up 2>/dev/null || true
+        log "[Bridge Ensure] Physical NIC ${phys_nic} set to admin UP"
+      fi
+
+      # 4) 물리 NIC을 bridge에 master로 연결 (enslave)
+      local current_master
+      current_master="$(ip link show dev "${phys_nic}" 2>/dev/null | grep -oP 'master \K\w+' || echo "")"
+      if [[ "${current_master}" != "${bridge_name}" ]]; then
+        if [[ "${_DRY}" -eq 1 ]]; then
+          log "[DRY-RUN] ip link set dev ${phys_nic} master ${bridge_name}"
+        else
+          ip link set dev "${phys_nic}" master "${bridge_name}" 2>/dev/null || {
+            log "[WARN] Failed to enslave ${phys_nic} to ${bridge_name}, but continuing"
+          }
+          log "[Bridge Ensure] Physical NIC ${phys_nic} enslaved to bridge ${bridge_name}"
+        fi
+      else
+        log "[Bridge Ensure] Physical NIC ${phys_nic} is already enslaved to ${bridge_name}"
+      fi
+    else
+      log "[WARN] Physical NIC ${phys_nic} does not exist, skipping enslave"
+    fi
+  fi
+
+  # 5) STP/forward_delay 비활성화 (Sensor-Installer와 동일)
+  if [[ "${_DRY}" -eq 1 ]]; then
+    log "[DRY-RUN] echo 0 > /sys/class/net/${bridge_name}/bridge/stp_state"
+    log "[DRY-RUN] echo 0 > /sys/class/net/${bridge_name}/bridge/forward_delay"
+  else
+    if [[ -f "/sys/class/net/${bridge_name}/bridge/stp_state" ]]; then
+      echo 0 > "/sys/class/net/${bridge_name}/bridge/stp_state" 2>/dev/null || true
+      log "[Bridge Ensure] Bridge ${bridge_name} STP disabled"
+    fi
+    if [[ -f "/sys/class/net/${bridge_name}/bridge/forward_delay" ]]; then
+      echo 0 > "/sys/class/net/${bridge_name}/bridge/forward_delay" 2>/dev/null || true
+      log "[Bridge Ensure] Bridge ${bridge_name} forward_delay set to 0"
+    fi
+  fi
+
+  # 6) Admin UP 여부 최종 확인 (operstate는 확인하지 않음)
+  if [[ "${_DRY}" -eq 0 ]]; then
+    if ! ip -o link show dev "${bridge_name}" 2>/dev/null | grep -q "<.*UP.*>"; then
+      log "[ERROR] Bridge ${bridge_name} exists but cannot be set ADMIN-UP"
+      return 1
+    fi
+  fi
+
+  # 7) operstate 확인 (로그용, 실패 조건 아님)
+  if [[ "${_DRY}" -eq 0 ]]; then
+    local operstate
+    operstate="$(cat /sys/class/net/${bridge_name}/operstate 2>/dev/null || echo unknown)"
+    local admin_flags
+    admin_flags="$(ip -o link show dev "${bridge_name}" 2>/dev/null | grep -o '<.*>' || echo 'unknown')"
+
+    if [[ "${operstate}" != "up" ]]; then
+      log "[WARN] Bridge ${bridge_name} operstate=${operstate} (NO-CARRIER is acceptable for VM attach)"
+    else
+      log "[Bridge Ensure] Bridge ${bridge_name} operstate=up"
+    fi
+
+    log "[Bridge Ensure] Bridge ${bridge_name} - exists: yes, admin flags: ${admin_flags}, operstate: ${operstate} (acceptable)"
+  fi
+
+  log "[Bridge Ensure] Bridge ${bridge_name} is ready for VM attach"
+  return 0
+}
+
 
 #######################################
 # Config management (CONFIG_FILE)
@@ -465,6 +583,52 @@ load_config() {
   : "${CLTR0_NIC:=}"
   : "${HOST_NIC:=}"
   : "${DATA_SSD_LIST:=}"
+  
+  # Load renamed interface names if available
+  : "${MGT_NIC_RENAMED:=}"
+  : "${CLTR0_NIC_RENAMED:=}"
+  : "${HOST_NIC_RENAMED:=}"
+
+  # NIC identity (selected at STEP 01, stable across reboots)
+  : "${MGT_NIC_SELECTED:=}"
+  : "${CLTR0_NIC_SELECTED:=}"
+  : "${HOST_NIC_SELECTED:=}"
+
+  # NIC identity by PCI/MAC (stable hardware identifiers)
+  : "${MGT_NIC_PCI:=}"
+  : "${CLTR0_NIC_PCI:=}"
+  : "${HOST_NIC_PCI:=}"
+
+  : "${MGT_NIC_MAC:=}"
+  : "${CLTR0_NIC_MAC:=}"
+  : "${HOST_NIC_MAC:=}"
+
+  # Legacy compatibility (deprecated, use *_NIC_PCI/*_NIC_MAC instead)
+  : "${MGT_PCI:=}"
+  : "${CLTR0_PCI:=}"
+  : "${HOST_PCI:=}"
+  : "${MGT_MAC:=}"
+  : "${CLTR0_MAC:=}"
+  : "${HOST_MAC:=}"
+
+  # Effective alias identity (measured after STEP 03)
+  : "${MGT_EFFECTIVE_PCI:=}"
+  : "${CLTR0_EFFECTIVE_PCI:=}"
+  : "${HOST_EFFECTIVE_PCI:=}"
+  : "${MGT_EFFECTIVE_MAC:=}"
+  : "${CLTR0_EFFECTIVE_MAC:=}"
+  : "${HOST_EFFECTIVE_MAC:=}"
+
+  # Effective interface names (current names after STEP 03 rename)
+  : "${MGT_NIC_EFFECTIVE:=}"
+  : "${CLTR0_NIC_EFFECTIVE:=}"
+  : "${HOST_NIC_EFFECTIVE:=}"
+
+  : "${RENAMED_CONFLICT_IFACES:=}"
+
+  # Cluster Interface Type (SRIOV or BRIDGE)
+  : "${CLUSTER_NIC_TYPE:=BRIDGE}"
+  : "${CLUSTER_BRIDGE_NAME:=br-cluster}"
 
   # VM configuration defaults (can be overridden from config file)
   : "${DL_VCPUS:=42}"
@@ -488,11 +652,13 @@ save_config() {
   esc_acps_url=${ACPS_BASE_URL//\"/\\\"}
 
   # Also escape NIC / disk values
-  local esc_mgt_nic esc_cltr0_nic esc_host_nic esc_data_ssd
+  local esc_mgt_nic esc_cltr0_nic esc_host_nic esc_data_ssd esc_cluster_nic_type esc_cluster_bridge_name
   esc_mgt_nic=${MGT_NIC//\"/\\\"}
   esc_cltr0_nic=${CLTR0_NIC//\"/\\\"}
   esc_host_nic=${HOST_NIC//\"/\\\"}
   esc_data_ssd=${DATA_SSD_LIST//\"/\\\"}
+  esc_cluster_nic_type=${CLUSTER_NIC_TYPE//\"/\\\"}
+  esc_cluster_bridge_name=${CLUSTER_BRIDGE_NAME//\"/\\\"}
 
   # VM configuration values (set defaults if not already set)
   : "${DL_VCPUS:=42}"
@@ -517,6 +683,48 @@ MGT_NIC="${esc_mgt_nic}"
 CLTR0_NIC="${esc_cltr0_nic}"
 HOST_NIC="${esc_host_nic}"
 DATA_SSD_LIST="${esc_data_ssd}"
+
+# NIC identity (stable)
+MGT_NIC_SELECTED="${MGT_NIC_SELECTED//\"/\\\"}"
+CLTR0_NIC_SELECTED="${CLTR0_NIC_SELECTED//\"/\\\"}"
+HOST_NIC_SELECTED="${HOST_NIC_SELECTED//\"/\\\"}"
+
+# NIC identity by PCI/MAC (stable hardware identifiers)
+MGT_NIC_PCI="${MGT_NIC_PCI//\"/\\\"}"
+CLTR0_NIC_PCI="${CLTR0_NIC_PCI//\"/\\\"}"
+HOST_NIC_PCI="${HOST_NIC_PCI//\"/\\\"}"
+
+MGT_NIC_MAC="${MGT_NIC_MAC//\"/\\\"}"
+CLTR0_NIC_MAC="${CLTR0_NIC_MAC//\"/\\\"}"
+HOST_NIC_MAC="${HOST_NIC_MAC//\"/\\\"}"
+
+# Legacy compatibility (deprecated)
+MGT_PCI="${MGT_PCI//\"/\\\"}"
+CLTR0_PCI="${CLTR0_PCI//\"/\\\"}"
+HOST_PCI="${HOST_PCI//\"/\\\"}"
+MGT_MAC="${MGT_MAC//\"/\\\"}"
+CLTR0_MAC="${CLTR0_MAC//\"/\\\"}"
+HOST_MAC="${HOST_MAC//\"/\\\"}"
+
+# Effective alias identity (measured after STEP 03)
+MGT_EFFECTIVE_PCI="${MGT_EFFECTIVE_PCI//\"/\\\"}"
+CLTR0_EFFECTIVE_PCI="${CLTR0_EFFECTIVE_PCI//\"/\\\"}"
+HOST_EFFECTIVE_PCI="${HOST_EFFECTIVE_PCI//\"/\\\"}"
+MGT_EFFECTIVE_MAC="${MGT_EFFECTIVE_MAC//\"/\\\"}"
+CLTR0_EFFECTIVE_MAC="${CLTR0_EFFECTIVE_MAC//\"/\\\"}"
+HOST_EFFECTIVE_MAC="${HOST_EFFECTIVE_MAC//\"/\\\"}"
+
+# Effective interface names (current names after STEP 03 rename)
+MGT_NIC_EFFECTIVE="${MGT_NIC_EFFECTIVE//\"/\\\"}"
+CLTR0_NIC_EFFECTIVE="${CLTR0_NIC_EFFECTIVE//\"/\\\"}"
+HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE//\"/\\\"}"
+
+# Alias conflict rename history
+RENAMED_CONFLICT_IFACES="${RENAMED_CONFLICT_IFACES//\"/\\\"}"
+
+# Cluster Interface Type (SRIOV or BRIDGE)
+CLUSTER_NIC_TYPE="${esc_cluster_nic_type}"
+CLUSTER_BRIDGE_NAME="${esc_cluster_bridge_name}"
 
 # VM configuration (set in STEP 10/11)
 DL_VCPUS=${DL_VCPUS}
@@ -549,10 +757,70 @@ save_config_var() {
     CLTR0_NIC)      CLTR0_NIC="${value}" ;;
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_SSD_LIST)  DATA_SSD_LIST="${value}" ;;
+    CLUSTER_NIC_TYPE) CLUSTER_NIC_TYPE="${value}" ;;
+    CLUSTER_BRIDGE_NAME) CLUSTER_BRIDGE_NAME="${value}" ;;
+    MGT_NIC_RENAMED) MGT_NIC_RENAMED="${value}" ;;
+    CLTR0_NIC_RENAMED) CLTR0_NIC_RENAMED="${value}" ;;
+    HOST_NIC_RENAMED) HOST_NIC_RENAMED="${value}" ;;
+    # NIC selection and mapping info
+    MGT_SELECTED_IFNAME) MGT_SELECTED_IFNAME="${value}" ;;
+    MGT_SELECTED_PCI) MGT_SELECTED_PCI="${value}" ;;
+    MGT_SELECTED_MAC) MGT_SELECTED_MAC="${value}" ;;
+    MGT_TARGET_NAME) MGT_TARGET_NAME="${value}" ;;
+    MGT_EFFECTIVE_IFNAME) MGT_EFFECTIVE_IFNAME="${value}" ;;
+    MGT_NIC_SELECTED) MGT_NIC_SELECTED="${value}" ;;
+    CLTR0_NIC_SELECTED) CLTR0_NIC_SELECTED="${value}" ;;
+    HOST_NIC_SELECTED) HOST_NIC_SELECTED="${value}" ;;
+
+    MGT_NIC_PCI) MGT_NIC_PCI="${value}" ;;
+    CLTR0_NIC_PCI) CLTR0_NIC_PCI="${value}" ;;
+    HOST_NIC_PCI) HOST_NIC_PCI="${value}" ;;
+
+    MGT_NIC_MAC) MGT_NIC_MAC="${value}" ;;
+    CLTR0_NIC_MAC) CLTR0_NIC_MAC="${value}" ;;
+    HOST_NIC_MAC) HOST_NIC_MAC="${value}" ;;
+
+    # Legacy compatibility
+    MGT_PCI) MGT_PCI="${value}" ;;
+    CLTR0_PCI) CLTR0_PCI="${value}" ;;
+    HOST_PCI) HOST_PCI="${value}" ;;
+    MGT_MAC) MGT_MAC="${value}" ;;
+    CLTR0_MAC) CLTR0_MAC="${value}" ;;
+    HOST_MAC) HOST_MAC="${value}" ;;
+
+    MGT_EFFECTIVE_PCI) MGT_EFFECTIVE_PCI="${value}" ;;
+    CLTR0_EFFECTIVE_PCI) CLTR0_EFFECTIVE_PCI="${value}" ;;
+    HOST_EFFECTIVE_PCI) HOST_EFFECTIVE_PCI="${value}" ;;
+    MGT_EFFECTIVE_MAC) MGT_EFFECTIVE_MAC="${value}" ;;
+    CLTR0_EFFECTIVE_MAC) CLTR0_EFFECTIVE_MAC="${value}" ;;
+    HOST_EFFECTIVE_MAC) HOST_EFFECTIVE_MAC="${value}" ;;
+
+    MGT_NIC_EFFECTIVE) MGT_NIC_EFFECTIVE="${value}" ;;
+    CLTR0_NIC_EFFECTIVE) CLTR0_NIC_EFFECTIVE="${value}" ;;
+    HOST_NIC_EFFECTIVE) HOST_NIC_EFFECTIVE="${value}" ;;
+
+    RENAMED_CONFLICT_IFACES) RENAMED_CONFLICT_IFACES="${value}" ;;
+
+    # Legacy compatibility (keep for backward compatibility)
+    MGT_SELECTED_IFNAME) MGT_NIC_SELECTED="${value}" ;;
+    CLTR0_SELECTED_IFNAME) CLTR0_NIC_SELECTED="${value}" ;;
+    HOST_SELECTED_IFNAME) HOST_NIC_SELECTED="${value}" ;;
+    MGT_SELECTED_PCI) MGT_PCI="${value}" ;;
+    CLTR0_SELECTED_PCI) CLTR0_PCI="${value}" ;;
+    HOST_SELECTED_PCI) HOST_PCI="${value}" ;;
+    MGT_SELECTED_MAC) MGT_MAC="${value}" ;;
+    CLTR0_SELECTED_MAC) CLTR0_MAC="${value}" ;;
+    HOST_SELECTED_MAC) HOST_MAC="${value}" ;;
+    MGT_TARGET_NAME) ;; # Ignore, not needed
+    CLTR0_TARGET_NAME) ;; # Ignore, not needed
+    HOST_TARGET_NAME) ;; # Ignore, not needed
+    MGT_EFFECTIVE_IFNAME) ;; # Ignore, always "mgt"
+    CLTR0_EFFECTIVE_IFNAME) ;; # Ignore, always "cltr0"
+    HOST_EFFECTIVE_IFNAME) ;; # Ignore, always "hostmgmt"
     *)
       # Ignore unknown keys for now (extend here if needed)
       ;;
-  esac
+    esac
 
   save_config
 }
@@ -565,6 +833,120 @@ version_ge() { dpkg --compare-versions "$1" ge "$2"; }
 version_gt() { dpkg --compare-versions "$1" gt "$2"; }
 version_le() { dpkg --compare-versions "$1" le "$2"; }
 version_lt() { dpkg --compare-versions "$1" lt "$2"; }
+
+
+#######################################
+# NIC identity helpers (PCI/MAC/resolve)
+#######################################
+normalize_pci() {
+  # Accept "8b:00.1" or "0000:8b:00.1"
+  local p="$1"
+  if [[ -z "$p" ]]; then echo ""; return 0; fi
+  if [[ "$p" =~ ^0000: ]]; then echo "$p"; return 0; fi
+  echo "0000:${p}"
+}
+
+get_if_pci() {
+  local ifname="$1"
+  if [[ -z "$ifname" || ! -e "/sys/class/net/${ifname}/device" ]]; then
+    echo ""
+    return 0
+  fi
+  readlink -f "/sys/class/net/${ifname}/device" 2>/dev/null | awk -F/ '{print $NF}'
+}
+
+get_if_mac() {
+  local ifname="$1"
+  if [[ -z "$ifname" || ! -e "/sys/class/net/${ifname}/address" ]]; then
+    echo ""
+    return 0
+  fi
+  cat "/sys/class/net/${ifname}/address" 2>/dev/null || echo ""
+}
+
+resolve_ifname_by_pci() {
+  local pci
+  pci="$(normalize_pci "$1")"
+  [[ -z "$pci" ]] && { echo ""; return 0; }
+
+  local iface iface_pci
+  for iface in /sys/class/net/*; do
+    local name
+    name="$(basename "$iface")"
+    iface_pci="$(get_if_pci "$name")"
+    if [[ "$iface_pci" == "$pci" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# Free reserved alias name by renaming current holder to a short temp name.
+# This prevents: "Failed to rename ... to 'cltr0': File exists"
+free_reserved_name() {
+  local alias="$1"       # mgt|cltr0|hostmgmt
+  local desired_pci="$2" # 0000:xx:yy.z
+  local desired_mac="$3" # optional
+  local conflict_log_var="$4" # name of variable to append logs (RENAMED_CONFLICT_IFACES)
+
+  desired_pci="$(normalize_pci "$desired_pci")"
+
+  if ! ip link show "$alias" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local cur_pci cur_mac
+  cur_pci="$(get_if_pci "$alias")"
+  cur_mac="$(get_if_mac "$alias")"
+
+  # If current alias already points to desired NIC -> nothing to do
+  if [[ -n "$desired_pci" && "$cur_pci" == "$desired_pci" ]]; then
+    return 0
+  fi
+  if [[ -z "$desired_pci" && -n "$desired_mac" && "$cur_mac" == "$desired_mac" ]]; then
+    return 0
+  fi
+
+  # We must free the alias name by renaming the current holder.
+  # Linux IFNAME length limit is 15, so keep it short & deterministic.
+  local tmp=""
+  case "$alias" in
+    mgt) tmp="mgtold" ;;
+    cltr0) tmp="cltold" ;;
+    hostmgmt) tmp="hmgold" ;;
+    *) tmp="old" ;;
+  esac
+
+  # Find available tmp name (tmp0..tmp9)
+  local i candidate
+  for i in 0 1 2 3 4 5 6 7 8 9; do
+    candidate="${tmp}${i}"
+    if ! ip link show "$candidate" >/dev/null 2>&1; then
+      tmp="$candidate"
+      break
+    fi
+  done
+
+  log "[STEP 03] Alias name conflict: '${alias}' is held by PCI=${cur_pci:-?}, MAC=${cur_mac:-?} but desired PCI=${desired_pci:-?}, MAC=${desired_mac:-?}"
+  log "[STEP 03] Freeing alias '${alias}' by renaming it to '${tmp}'"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would run: ip link set ${alias} down; ip link set ${alias} name ${tmp}"
+  else
+    ip link set "$alias" down >/dev/null 2>&1 || true
+    ip link set "$alias" name "$tmp" >/dev/null 2>&1 || true
+  fi
+
+  # Append conflict record into RENAMED_CONFLICT_IFACES
+  # Format: alias:cur_pci->tmp
+  local rec="${alias}:${cur_pci:-unknown}->${tmp}"
+  if [[ -n "${!conflict_log_var:-}" ]]; then
+    eval "$conflict_log_var=\"${!conflict_log_var};${rec}\""
+  else
+    eval "$conflict_log_var=\"${rec}\""
+  fi
+}
 
 
 #######################################
@@ -693,8 +1075,18 @@ EOF
 
 load_state() {
   if [[ -f "${STATE_FILE}" ]]; then
+    local prev_opts="$-"
+    set +e
+    set +u
+    local tmp_state
+    tmp_state="$(mktemp)"
+    # Keep only simple KEY=VALUE lines, strip CRLF to avoid source errors.
+    tr -d '\r' < "${STATE_FILE}" | grep -E '^[A-Z0-9_]+=.*$' > "${tmp_state}" || true
     # shellcheck disable=SC1090
-    source "${STATE_FILE}"
+    source "${tmp_state}" 2>/dev/null || true
+    rm -f "${tmp_state}" || true
+    [[ "${prev_opts}" == *e* ]] && set -e || set +e
+    [[ "${prev_opts}" == *u* ]] && set -u || set +u
   else
     LAST_COMPLETED_STEP=""
     LAST_RUN_TIME=""
@@ -706,6 +1098,20 @@ save_state() {
   cat > "${STATE_FILE}" <<EOF
 LAST_COMPLETED_STEP="${step_id}"
 LAST_RUN_TIME="$(date '+%F %T')"
+
+# NIC identity and effective names (updated after STEP 01/03)
+MGT_NIC="${MGT_NIC}"
+CLTR0_NIC="${CLTR0_NIC}"
+HOST_NIC="${HOST_NIC}"
+MGT_NIC_PCI="${MGT_NIC_PCI}"
+CLTR0_NIC_PCI="${CLTR0_NIC_PCI}"
+HOST_NIC_PCI="${HOST_NIC_PCI}"
+MGT_NIC_MAC="${MGT_NIC_MAC}"
+CLTR0_NIC_MAC="${CLTR0_NIC_MAC}"
+HOST_NIC_MAC="${HOST_NIC_MAC}"
+MGT_NIC_EFFECTIVE="${MGT_NIC_EFFECTIVE}"
+CLTR0_NIC_EFFECTIVE="${CLTR0_NIC_EFFECTIVE}"
+HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE}"
 EOF
 }
 
@@ -753,6 +1159,11 @@ run_step() {
   local idx="$1"
   local step_id="${STEP_IDS[$idx]}"
   local step_name="${STEP_NAMES[$idx]}"
+
+  # STEP 06 always includes SR-IOV driver installation + NTPsec
+  if [[ "${step_id}" == "06_ntpsec" ]]; then
+    step_name="Configure SR-IOV drivers (iavf/i40evf) + NTPsec"
+  fi
 
   # Confirm whether to run this STEP
   # Calculate dialog size dynamically and center message
@@ -882,6 +1293,400 @@ list_nic_candidates() {
     || true
 }
 
+# Find interface name by PCI address
+# Excludes virtual interfaces (lo, virbr*, vnet*, docker*, br-*, ovs*)
+find_if_by_pci() {
+  local pci="$1"
+  [[ -z "$pci" ]] && { echo ""; return 0; }
+  
+  pci="$(normalize_pci "$pci")"
+  
+  local iface name iface_pci
+  for iface in /sys/class/net/*; do
+    name="$(basename "$iface")"
+    # Skip virtual interfaces
+    [[ "$name" =~ ^(lo|virbr|vnet|tap|docker|br-|ovs) ]] && continue
+    
+    iface_pci="$(get_if_pci "$name")"
+    if [[ "$iface_pci" == "$pci" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# Find interface name by MAC address
+# Excludes virtual interfaces (lo, virbr*, vnet*, docker*, br-*, ovs*)
+find_if_by_mac() {
+  local mac="$1"
+  [[ -z "$mac" ]] && { echo ""; return 0; }
+  
+  local iface name iface_mac
+  for iface in /sys/class/net/*; do
+    name="$(basename "$iface")"
+    # Skip virtual interfaces
+    [[ "$name" =~ ^(lo|virbr|vnet|tap|docker|br-|ovs) ]] && continue
+    
+    iface_mac="$(get_if_mac "$name")"
+    if [[ "$iface_mac" == "$mac" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+# Resolve interface name by preferred name, PCI, or MAC (in that order)
+# Returns the first available match
+resolve_if_name() {
+  local preferred_name="$1"
+  local pci="$2"
+  local mac="$3"
+  
+  # 1) Check preferred name first
+  if [[ -n "$preferred_name" ]] && [[ -e "/sys/class/net/$preferred_name" ]]; then
+    # Verify it's not a virtual interface
+    if [[ ! "$preferred_name" =~ ^(lo|virbr|vnet|tap|docker|br-|ovs) ]]; then
+      echo "$preferred_name"
+      return 0
+    fi
+  fi
+  
+  # 2) Try PCI
+  if [[ -n "$pci" ]]; then
+    local found_by_pci
+    found_by_pci="$(find_if_by_pci "$pci")"
+    if [[ -n "$found_by_pci" ]]; then
+      echo "$found_by_pci"
+      return 0
+    fi
+  fi
+  
+  # 3) Try MAC
+  if [[ -n "$mac" ]]; then
+    local found_by_mac
+    found_by_mac="$(find_if_by_mac "$mac")"
+    if [[ -n "$found_by_mac" ]]; then
+      echo "$found_by_mac"
+      return 0
+    fi
+  fi
+  
+  # 4) Not found
+  echo ""
+}
+
+# Normalize MAC address: convert to lowercase and remove spaces/colons normalization
+normalize_mac() {
+  local mac="$1"
+  [[ -z "$mac" ]] && { echo ""; return 0; }
+  # Convert to lowercase, remove spaces, ensure colon-separated format
+  echo "$mac" | tr '[:upper:]' '[:lower:]' | tr -d ' ' | sed 's/-/:/g'
+}
+
+# Resolve interface name by PCI/MAC identity (source of truth)
+# Priority: PCI first, then MAC, then empty string
+# Usage: resolve_ifname_by_identity <pci> <mac>
+resolve_ifname_by_identity() {
+  local pci="$1"
+  local mac="$2"
+  
+  # Normalize inputs
+  if [[ -n "$pci" ]]; then
+    pci="$(normalize_pci "$pci")"
+  fi
+  if [[ -n "$mac" ]]; then
+    mac="$(normalize_mac "$mac")"
+  fi
+  
+  # 1) Try PCI first (most reliable)
+  if [[ -n "$pci" ]]; then
+    local found_by_pci
+    found_by_pci="$(find_if_by_pci "$pci")"
+    if [[ -n "$found_by_pci" ]]; then
+      echo "$found_by_pci"
+      return 0
+    fi
+  fi
+  
+  # 2) Try MAC if PCI failed or not available
+  if [[ -n "$mac" ]]; then
+    local found_by_mac
+    found_by_mac="$(find_if_by_mac "$mac")"
+    if [[ -n "$found_by_mac" ]]; then
+      echo "$found_by_mac"
+      return 0
+    fi
+  fi
+  
+  # 3) Not found
+  echo ""
+}
+
+# Get effective NIC name for subsequent steps (STEP 12, etc.)
+# Priority: 1) EFFECTIVE, 2) resolve by identity, 3) fallback to original
+# Usage: get_effective_nic <NIC_TYPE> where NIC_TYPE is MGT, CLTR0, or HOST
+get_effective_nic() {
+  local nic_type="$1"
+  local effective_var="" pci_var="" mac_var="" fallback_var=""
+  
+  case "$nic_type" in
+    MGT)
+      effective_var="MGT_NIC_EFFECTIVE"
+      pci_var="MGT_NIC_PCI"
+      mac_var="MGT_NIC_MAC"
+      fallback_var="MGT_NIC"
+      ;;
+    CLTR0)
+      effective_var="CLTR0_NIC_EFFECTIVE"
+      pci_var="CLTR0_NIC_PCI"
+      mac_var="CLTR0_NIC_MAC"
+      fallback_var="CLTR0_NIC"
+      ;;
+    HOST)
+      effective_var="HOST_NIC_EFFECTIVE"
+      pci_var="HOST_NIC_PCI"
+      mac_var="HOST_NIC_MAC"
+      fallback_var="HOST_NIC"
+      ;;
+    *)
+      echo ""
+      return 1
+      ;;
+  esac
+  
+  # 1) Use EFFECTIVE if available and interface exists
+  local effective_name="${!effective_var:-}"
+  if [[ -n "$effective_name" ]] && ip link show "$effective_name" >/dev/null 2>&1; then
+    echo "$effective_name"
+    return 0
+  fi
+  
+  # 2) Resolve by identity (PCI/MAC)
+  local pci_val="${!pci_var:-}"
+  local mac_val="${!mac_var:-}"
+  if [[ -n "$pci_val" ]] || [[ -n "$mac_val" ]]; then
+    local resolved
+    resolved="$(resolve_ifname_by_identity "$pci_val" "$mac_val")"
+    if [[ -n "$resolved" ]]; then
+      echo "$resolved"
+      return 0
+    fi
+  fi
+  
+  # 3) Fallback to original variable
+  local fallback_name="${!fallback_var:-}"
+  if [[ -n "$fallback_name" ]] && ip link show "$fallback_name" >/dev/null 2>&1; then
+    echo "$fallback_name"
+    return 0
+  fi
+  
+  # 4) Not found
+  echo ""
+  return 1
+}
+
+# Build udev rule string for a given alias
+# Usage: build_udev_rule <alias> <pci> <mac> <extra_attrs>
+# Returns rule string, uses PCI if available, otherwise MAC
+build_udev_rule() {
+  local alias="$1"
+  local pci="$2"
+  local mac="$3"
+  local extra_attrs="$4"
+  
+  local rule=""
+  if [[ -n "$pci" ]]; then
+    pci="$(normalize_pci "$pci")"
+    rule="ACTION==\"add\", SUBSYSTEM==\"net\", KERNELS==\"${pci}\", NAME:=\"${alias}\""
+  elif [[ -n "$mac" ]]; then
+    mac="$(normalize_mac "$mac")"
+    rule="ACTION==\"add\", SUBSYSTEM==\"net\", ATTR{address}==\"${mac}\", NAME:=\"${alias}\""
+  else
+    echo ""
+    return 1
+  fi
+  
+  if [[ -n "$extra_attrs" ]]; then
+    rule="${rule}, ${extra_attrs}"
+  fi
+  
+  echo "$rule"
+}
+
+# Get interface identity (PCI and MAC) by interface name
+# Returns: "pci|mac" format
+get_if_identity_by_name() {
+  local ifname="$1"
+  [[ -z "$ifname" ]] && { echo "|"; return 0; }
+  
+  local pci mac
+  pci="$(get_if_pci "$ifname")"
+  mac="$(get_if_mac "$ifname")"
+  mac="$(normalize_mac "$mac")"
+  
+  echo "${pci}|${mac}"
+}
+
+# Check if target alias name is occupied by wrong NIC
+# Returns 0 if OK (free or correct), 1 if conflict
+check_name_conflict() {
+  local alias="$1"        # mgt|cltr0|hostmgmt
+  local desired_pci="$2"  # Expected PCI (normalized)
+  local desired_mac="$3"  # Expected MAC (normalized)
+  
+  if ! ip link show "$alias" >/dev/null 2>&1; then
+    return 0  # Name is free, no conflict
+  fi
+  
+  # Get current occupant's identity
+  local current_identity
+  current_identity="$(get_if_identity_by_name "$alias")"
+  local current_pci="${current_identity%%|*}"
+  local current_mac="${current_identity#*|}"
+  
+  # Normalize for comparison
+  if [[ -n "$desired_pci" ]]; then
+    desired_pci="$(normalize_pci "$desired_pci")"
+  fi
+  if [[ -n "$current_pci" ]]; then
+    current_pci="$(normalize_pci "$current_pci")"
+  fi
+  if [[ -n "$desired_mac" ]]; then
+    desired_mac="$(normalize_mac "$desired_mac")"
+  fi
+  if [[ -n "$current_mac" ]]; then
+    current_mac="$(normalize_mac "$current_mac")"
+  fi
+  
+  # Check if current occupant matches desired
+  local matches=0
+  if [[ -n "$desired_pci" && -n "$current_pci" && "$current_pci" == "$desired_pci" ]]; then
+    matches=1
+  elif [[ -z "$desired_pci" && -n "$desired_mac" && -n "$current_mac" && "$current_mac" == "$desired_mac" ]]; then
+    matches=1
+  fi
+  
+  if [[ $matches -eq 1 ]]; then
+    return 0  # Correct NIC already has this name
+  fi
+  
+  # Conflict: wrong NIC occupies the name
+  log "[ERROR] Name conflict: alias '${alias}' is occupied by PCI=${current_pci:-?}, MAC=${current_mac:-?}, but desired PCI=${desired_pci:-?}, MAC=${desired_mac:-?}"
+  return 1
+}
+
+# Check for external udev/systemd-networkd rules that conflict with our target names
+# Returns 0 if no conflict, 1 if conflict found
+check_external_rules_conflict() {
+  local udev_file="$1"  # Our managed udev file to exclude from search
+  local conflict_file="/tmp/xdr_nic_conflict.txt"
+  local conflicts_found=0
+  
+  > "$conflict_file"  # Clear conflict file
+  
+  # Check udev rules (exclude our managed file and backup files)
+  local udev_conflicts
+  udev_conflicts=$(
+    grep -rE 'NAME:="mgt"|NAME:="cltr0"|NAME:="hostmgmt"' /etc/udev/rules.d /lib/udev/rules.d 2>/dev/null \
+      | grep -v "^${udev_file}:" \
+      | grep -vE '\.bak(:|$)' \
+      || true
+  )
+  if [[ -n "$udev_conflicts" ]]; then
+    echo "=== udev rules conflicts ===" >> "$conflict_file"
+    echo "$udev_conflicts" >> "$conflict_file"
+    echo "" >> "$conflict_file"
+    conflicts_found=1
+  fi
+  
+  # Check systemd-networkd
+  if [[ -d /etc/systemd/network ]] || [[ -d /lib/systemd/network ]]; then
+    local systemd_conflicts
+    systemd_conflicts=$(grep -rE 'Name=mgt|Name=cltr0|Name=hostmgmt' /etc/systemd/network /lib/systemd/network 2>/dev/null || true)
+    if [[ -n "$systemd_conflicts" ]]; then
+      echo "=== systemd-networkd conflicts ===" >> "$conflict_file"
+      echo "$systemd_conflicts" >> "$conflict_file"
+      echo "" >> "$conflict_file"
+      conflicts_found=1
+    fi
+  fi
+  
+  if [[ $conflicts_found -eq 1 ]]; then
+    return 1
+  fi
+  
+  return 0
+}
+
+# Check that mgt/cltr0/hostmgmt have unique identities (no duplicate PCI/MAC)
+# Returns 0 if all unique, 1 if duplicates found
+check_unique_identities() {
+  local mgt_pci="$1"
+  local mgt_mac="$2"
+  local cltr0_pci="$3"
+  local cltr0_mac="$4"
+  local host_pci="$5"
+  local host_mac="$6"
+  
+  # Normalize all values
+  if [[ -n "$mgt_pci" ]]; then
+    mgt_pci="$(normalize_pci "$mgt_pci")"
+  fi
+  if [[ -n "$cltr0_pci" ]]; then
+    cltr0_pci="$(normalize_pci "$cltr0_pci")"
+  fi
+  if [[ -n "$host_pci" ]]; then
+    host_pci="$(normalize_pci "$host_pci")"
+  fi
+  if [[ -n "$mgt_mac" ]]; then
+    mgt_mac="$(normalize_mac "$mgt_mac")"
+  fi
+  if [[ -n "$cltr0_mac" ]]; then
+    cltr0_mac="$(normalize_mac "$cltr0_mac")"
+  fi
+  if [[ -n "$host_mac" ]]; then
+    host_mac="$(normalize_mac "$host_mac")"
+  fi
+  
+  # Check PCI duplicates (if PCI is available)
+  if [[ -n "$mgt_pci" && -n "$cltr0_pci" && "$mgt_pci" == "$cltr0_pci" ]]; then
+    log "[ERROR] Duplicate identity: mgt and cltr0 share the same PCI: ${mgt_pci}"
+    return 1
+  fi
+  if [[ -n "$mgt_pci" && -n "$host_pci" && "$mgt_pci" == "$host_pci" ]]; then
+    log "[ERROR] Duplicate identity: mgt and hostmgmt share the same PCI: ${mgt_pci}"
+    return 1
+  fi
+  if [[ -n "$cltr0_pci" && -n "$host_pci" && "$cltr0_pci" == "$host_pci" ]]; then
+    log "[ERROR] Duplicate identity: cltr0 and hostmgmt share the same PCI: ${cltr0_pci}"
+    return 1
+  fi
+  
+  # Check MAC duplicates (if PCI is not available, use MAC)
+  if [[ -z "$mgt_pci" && -z "$cltr0_pci" ]]; then
+    if [[ -n "$mgt_mac" && -n "$cltr0_mac" && "$mgt_mac" == "$cltr0_mac" ]]; then
+      log "[ERROR] Duplicate identity: mgt and cltr0 share the same MAC: ${mgt_mac}"
+      return 1
+    fi
+  fi
+  if [[ -z "$mgt_pci" && -z "$host_pci" ]]; then
+    if [[ -n "$mgt_mac" && -n "$host_mac" && "$mgt_mac" == "$host_mac" ]]; then
+      log "[ERROR] Duplicate identity: mgt and hostmgmt share the same MAC: ${mgt_mac}"
+      return 1
+    fi
+  fi
+  if [[ -z "$cltr0_pci" && -z "$host_pci" ]]; then
+    if [[ -n "$cltr0_mac" && -n "$host_mac" && "$cltr0_mac" == "$host_mac" ]]; then
+      log "[ERROR] Duplicate identity: cltr0 and hostmgmt share the same MAC: ${cltr0_mac}"
+      return 1
+    fi
+  fi
+  
+  return 0
+}
+
 list_disk_candidates() {
   # Exclude the physical disk hosting the root filesystem
   local root_src root_disk
@@ -922,10 +1727,15 @@ step_01_hw_detect() {
   ########################
   # 0) Reuse existing selections?
   ########################
+  local mgt_display cltr0_display host_display
+  mgt_display="${MGT_NIC_EFFECTIVE:-${MGT_NIC}}"
+  cltr0_display="${CLTR0_NIC_EFFECTIVE:-${CLTR0_NIC}}"
+  host_display="${HOST_NIC_EFFECTIVE:-${HOST_NIC}}"
+
   if [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
     # Temporarily disable set -e to handle cancel gracefully
     set +e
-    whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_NIC: ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC: ${HOST_NIC}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
+    whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_NIC: ${mgt_display}\n- CLTR0_NIC: ${cltr0_display}\n- HOST_NIC: ${host_display}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
     local reuse_rc=$?
     set -e
     
@@ -1002,7 +1812,7 @@ step_01_hw_detect() {
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message based on terminal height
-  local msg_content="Choose the management (mgt) NIC.\nCurrent: ${MGT_NIC:-<none>}\n"
+  local msg_content="Choose the management (mgt) NIC.\nCurrent: ${mgt_display:-<none>}\n"
   local centered_msg
   centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
   
@@ -1018,6 +1828,13 @@ step_01_hw_detect() {
   log "Selected mgt NIC: ${mgt_nic}"
   MGT_NIC="${mgt_nic}"
   save_config_var "MGT_NIC" "${MGT_NIC}"   ### Change 2: assign to variable before saving
+  # Save stable identity for mgt NIC (PCI/MAC - hardware identifiers)
+  save_config_var "MGT_NIC_SELECTED" "${mgt_nic}"
+  save_config_var "MGT_NIC_PCI" "$(get_if_pci "${mgt_nic}")"
+  save_config_var "MGT_NIC_MAC" "$(get_if_mac "${mgt_nic}")"
+  # Legacy compatibility
+  save_config_var "MGT_PCI" "$(get_if_pci "${mgt_nic}")"
+  save_config_var "MGT_MAC" "$(get_if_mac "${mgt_nic}")"
 
   ########################
   # 3) Select cltr0 NIC
@@ -1029,7 +1846,7 @@ step_01_hw_detect() {
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message based on terminal height
-  local msg_content="Select NIC for cluster/SR-IOV (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${CLTR0_NIC:-<none>}\n"
+  local msg_content="Select NIC for cluster (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${cltr0_display:-<none>}\n"
   local centered_msg
   centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
   
@@ -1059,6 +1876,13 @@ step_01_hw_detect() {
   log "Selected cltr0 NIC: ${cltr0_nic}"
   CLTR0_NIC="${cltr0_nic}"
   save_config_var "CLTR0_NIC" "${CLTR0_NIC}"   ### Change 3
+  # Save stable identity for cltr0 NIC (PCI/MAC - hardware identifiers)
+  save_config_var "CLTR0_NIC_SELECTED" "${cltr0_nic}"
+  save_config_var "CLTR0_NIC_PCI" "$(get_if_pci "${cltr0_nic}")"
+  save_config_var "CLTR0_NIC_MAC" "$(get_if_mac "${cltr0_nic}")"
+  # Legacy compatibility
+  save_config_var "CLTR0_PCI" "$(get_if_pci "${cltr0_nic}")"
+  save_config_var "CLTR0_MAC" "$(get_if_mac "${cltr0_nic}")"
 
   ########################
   # 3-1) Select HOST access NIC (for direct KVM host access only)
@@ -1092,6 +1916,13 @@ step_01_hw_detect() {
   log "Selected HOST_NIC: ${host_nic}"
   HOST_NIC="${host_nic}"
   save_config_var "HOST_NIC" "${HOST_NIC}"
+  # Save stable identity for hostmgmt NIC (PCI/MAC - hardware identifiers)
+  save_config_var "HOST_NIC_SELECTED" "${host_nic}"
+  save_config_var "HOST_NIC_PCI" "$(get_if_pci "${host_nic}")"
+  save_config_var "HOST_NIC_MAC" "$(get_if_mac "${host_nic}")"
+  # Legacy compatibility
+  save_config_var "HOST_PCI" "$(get_if_pci "${host_nic}")"
+  save_config_var "HOST_MAC" "$(get_if_mac "${host_nic}")"
 
   ########################
   # 4) Select SSDs for data
@@ -1409,219 +2240,398 @@ step_02_hwe_kernel() {
 }
 
 
-
-step_03_nic_ifupdown() {
-  log "[STEP 03] NIC naming / ifupdown switch and network config"
+#######################################
+# STEP 03 - Bridge Mode (Cluster Interface)
+#######################################
+step_03_bridge_mode() {
+  log "[STEP 03 Bridge Mode] Preparing persistent cluster bridge config (Declarative, no runtime network changes)"
   load_config
 
-  # Use :- to guard against unset vars under set -u
-  if [[ -z "${MGT_NIC:-}" || -z "${CLTR0_NIC:-}" || -z "${HOST_NIC:-}" ]]; then
-    whiptail_msgbox "STEP 03 - NIC not set" "MGT_NIC, CLTR0_NIC, or HOST_NIC is not configured.\n\nSelect NICs in STEP 01 first." 12 70
-    log "MGT_NIC, CLTR0_NIC, or HOST_NIC missing; skipping STEP 03."
-    return 0   # Skip only this STEP; installer continues
-  fi
-
-
-  #######################################
-  # 0) Check current NIC/PCI info
-  #######################################
-  local mgt_pci cltr0_pci host_pci
-  mgt_pci=$(readlink -f "/sys/class/net/${MGT_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-  cltr0_pci=$(readlink -f "/sys/class/net/${CLTR0_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-  host_pci=$(readlink -f "/sys/class/net/${HOST_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-
-  if [[ -z "${mgt_pci}" || -z "${cltr0_pci}" || -z "${host_pci}" ]]; then
-    whiptail_msgbox "STEP 03 - PCI info error" "Cannot fetch PCI bus info for selected NICs.\n\nCheck /sys/class/net/${MGT_NIC}/device, /sys/class/net/${CLTR0_NIC}/device, or /sys/class/net/${HOST_NIC}/device." 12 70
-    log "MGT_NIC=${MGT_NIC}(${mgt_pci}), CLTR0_NIC=${CLTR0_NIC}(${cltr0_pci}), HOST_NIC=${HOST_NIC}(${host_pci}) → insufficient PCI info."
+  if [[ -z "${CLTR0_NIC:-}" ]]; then
+    whiptail_msgbox "STEP 03 - Bridge Mode" "CLTR0_NIC is not configured.\n\nSelect cluster NIC in STEP 01 first." 12 70
+    log "CLTR0_NIC missing; cannot proceed."
     return 1
   fi
 
-  local tmp_pci="/tmp/xdr_step03_pci.txt"
-  {
-    echo "Selected NICs and PCI info"
-    echo "----------------------"
-    echo "MGT_NIC   : ${MGT_NIC}"
-    echo "  -> PCI  : ${mgt_pci}"
-    echo
-    echo "CLTR0_NIC : ${CLTR0_NIC}"
-    echo "  -> PCI  : ${cltr0_pci}"
-    echo
-    echo "HOST_NIC  : ${HOST_NIC}"
-    echo "  -> PCI  : ${host_pci}"
-  } > "${tmp_pci}"
+  local bridge_name="${CLUSTER_BRIDGE_NAME:-br-cluster}"
 
-  show_textbox "STEP 03 - NIC/PCI review" "${tmp_pci}"
-  
   #######################################
-  # Roughly detect if desired network config already exists
+  # 1) Resolve selected NICs by identity (sysfs-only presence check)
+  # NOTE: Do NOT use ip/link/addr/route/ifup/ifdown in STEP 03.
   #######################################
-  local maybe_done=0
-  local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
-  local iface_file="/etc/network/interfaces"
-  local host_cfg="/etc/network/interfaces.d/02-hostmgmt.cfg"
+  local desired_cltr0_if desired_mgt_if
+  desired_cltr0_if="$(resolve_ifname_by_identity "${CLTR0_NIC_PCI:-}" "${CLTR0_NIC_MAC:-}")"
+  desired_mgt_if="$(resolve_ifname_by_identity "${MGT_NIC_PCI:-}" "${MGT_NIC_MAC:-}")"
 
-  if [[ -f "${udev_file}" ]] && \
-     grep -q "KERNELS==\"${mgt_pci}\".*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null && \
-     grep -q "KERNELS==\"${cltr0_pci}\".*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null && \
-     grep -q "KERNELS==\"${host_pci}\".*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null; then
-    if [[ -f "${iface_file}" ]] && \
-       grep -q "^auto mgt" "${iface_file}" 2>/dev/null && \
-       grep -q "iface mgt inet static" "${iface_file}" 2>/dev/null && \
-       [[ -f "${host_cfg}" ]] && \
-       grep -q "^auto hostmgmt" "${host_cfg}" 2>/dev/null && \
-       grep -q "address 192\.168\.0\.100" "${host_cfg}" 2>/dev/null; then
-      maybe_done=1
+  [[ -z "${desired_cltr0_if}" ]] && desired_cltr0_if="${CLTR0_NIC}"
+  [[ -z "${desired_mgt_if}" ]] && desired_mgt_if="${MGT_NIC:-}"
+
+  if [[ ! -d "/sys/class/net/${desired_cltr0_if}" ]]; then
+    whiptail_msgbox "STEP 03 - Bridge Mode" "Cannot find selected cluster NIC in the system.\n\nSelected: ${CLTR0_NIC}\nResolved: ${desired_cltr0_if}\nPCI: ${CLTR0_NIC_PCI:-<none>}\nMAC: ${CLTR0_NIC_MAC:-<none>}\n\nRe-run STEP 01 and select the correct NIC." 16 85
+    log "[ERROR] Cluster NIC not found in /sys/class/net: ${desired_cltr0_if}"
+    return 1
+  fi
+
+  # Prevent selecting the same physical NIC for mgt and cluster (prefer identity compare)
+  if [[ -n "${MGT_NIC_PCI:-}" && -n "${CLTR0_NIC_PCI:-}" && "${MGT_NIC_PCI}" == "${CLTR0_NIC_PCI}" ]]; then
+    whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same physical NIC (same PCI).\n\nMGT PCI: ${MGT_NIC_PCI}\nCLTR0 PCI: ${CLTR0_NIC_PCI}\n\nPlease select different NICs in STEP 01." 14 80
+    log "[ERROR] Duplicate PCI selection: mgt and cltr0 are the same (${MGT_NIC_PCI})"
+    return 1
+  fi
+  if [[ -z "${MGT_NIC_PCI:-}" && -n "${desired_mgt_if}" && "${desired_mgt_if}" == "${desired_cltr0_if}" ]]; then
+    whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same interface.\n\nMGT: ${desired_mgt_if}\nCLTR0: ${desired_cltr0_if}\n\nPlease select different NICs in STEP 01." 12 75
+    log "[ERROR] Duplicate ifname selection: mgt=${desired_mgt_if} cltr0=${desired_cltr0_if}"
+    return 1
+  fi
+
+  #######################################
+  # 2) Write persistent bridge configuration (interfaces.d)
+  # - Use 'cltr0' as the port name because udev will rename the chosen NIC to cltr0 after reboot.
+  # - Do NOT embed ip commands (pre-up/post-up) here to keep the config clean.
+  #######################################
+  log "[STEP 03 Bridge Mode] Writing persistent bridge config under /etc/network/interfaces.d"
+
+  local iface_dir="/etc/network/interfaces.d"
+  local bridge_cfg="${iface_dir}/03-${bridge_name}.cfg"
+  local bridge_bak="${bridge_cfg}.$(date +%Y%m%d-%H%M%S).bak"
+
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mkdir -p "${iface_dir}"
+    if [[ -f "${bridge_cfg}" ]]; then
+      cp -a "${bridge_cfg}" "${bridge_bak}" || true
+      log "Backed up existing ${bridge_cfg}: ${bridge_bak}"
     fi
   fi
 
-  if [[ "${maybe_done}" -eq 1 ]]; then
-    # Temporarily disable set -e to handle cancel gracefully
-    set +e
-    whiptail_yesno "STEP 03 - Already Configured" "Looking at udev rules and /etc/network/interfaces, hostmgmt settings, it appears to be already configured.\n\nDo you want to skip this STEP?" 18 80
-    local skip_rc=$?
-    set -e
-    
-    if [[ ${skip_rc} -eq 0 ]]; then
-      log "User chose to skip STEP 03 entirely based on 'already configured' judgment."
-      return 0
-    fi
-    log "User chose to force re-execution of STEP 03."
-  fi
+  local bridge_content
+  bridge_content=$(cat <<EOF
+ auto cltr0
+ iface cltr0 inet manual
 
+ auto ${bridge_name}
+ iface ${bridge_name} inet manual
+     bridge_ports cltr0
+     bridge_stp off
+     bridge_fd 0
+EOF
+)
 
-  #######################################
-  # 1) Collect mgt IP settings (defaults from current state)
-  #######################################
-  local cur_cidr cur_ip cur_prefix cur_gw cur_dns
-  cur_cidr=$(ip -4 -o addr show dev "${MGT_NIC}" 2>/dev/null | awk '{print $4}' | head -n1)
-  if [[ -n "${cur_cidr}" ]]; then
-    cur_ip="${cur_cidr%/*}"
-    cur_prefix="${cur_cidr#*/}"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will write to ${bridge_cfg}:\n${bridge_content}"
   else
-    cur_ip=""
-    cur_prefix="24"
-  fi
-  cur_gw=$(ip route show default 0.0.0.0/0 dev "${MGT_NIC}" 2>/dev/null | awk '{print $3}' | head -n1)
-  if [[ -z "${cur_gw}" ]]; then
-    cur_gw=$(ip route show default 0.0.0.0/0 | awk '{print $3}' | head -n1)
-  fi
-  # DNS defaults per docs
-  cur_dns="8.8.8.8 8.8.4.4"
-
-  # IP address
-  local new_ip
-  new_ip=$(whiptail_inputbox "STEP 03 - mgt IP setup" "Enter IP address for mgt interface.\nExample: 10.4.0.210" "${cur_ip}" 10 60)
-  if [[ $? -ne 0 ]] || [[ -z "${new_ip}" ]]; then
-    return 0
+    printf "%s\n" "${bridge_content}" > "${bridge_cfg}"
+    log "[STEP 03 Bridge Mode] Persistent bridge config saved to ${bridge_cfg}"
   fi
 
-  # Prefix
-  local new_prefix
-  new_prefix=$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${cur_prefix}" 10 60)
-  if [[ $? -ne 0 ]] || [[ -z "${new_prefix}" ]]; then
-    return 0
-  fi
-
-  # Gateway
-  local new_gw
-  new_gw=$(whiptail_inputbox "STEP 03 - gateway" "Enter default gateway IP.\nExample: 10.4.0.254" "${cur_gw}" 10 60)
-  if [[ $? -ne 0 ]] || [[ -z "${new_gw}" ]]; then
-    return 0
-  fi
-
-  # DNS
-  local new_dns
-  new_dns=$(whiptail_inputbox "STEP 03 - DNS" "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" "${cur_dns}" 10 70)
-  if [[ $? -ne 0 ]] || [[ -z "${new_dns}" ]]; then
-    return 0
-  fi
-
-  # Simple prefix → netmask conversion (common cases)
-  local netmask
-  case "${new_prefix}" in
-    8)  netmask="255.0.0.0" ;;
-    16) netmask="255.255.0.0" ;;
-    24) netmask="255.255.255.0" ;;
-    25) netmask="255.255.255.128" ;;
-    26) netmask="255.255.255.192" ;;
-    27) netmask="255.255.255.224" ;;
-    28) netmask="255.255.255.240" ;;
-    29) netmask="255.255.255.248" ;;
-    30) netmask="255.255.255.252" ;;
-    *)
-      # Unknown prefix → ask user for netmask directly
-      netmask=$(whiptail_inputbox "STEP 03 - Enter netmask manually" "Unknown prefix: /${new_prefix}.\nEnter netmask manually.\nExample: 255.255.255.0" "255.255.255.0" 10 70)
-      if [[ $? -ne 0 ]] || [[ -z "${netmask}" ]]; then
-        return 1
+  #######################################
+  # 3) Ensure /etc/network/interfaces sources interfaces.d
+  #######################################
+  local iface_file="/etc/network/interfaces"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    if [[ ! -f "${iface_file}" ]]; then
+      printf "%s\n" "source /etc/network/interfaces.d/*" > "${iface_file}"
+      printf "%s\n" "" >> "${iface_file}"
+      printf "%s\n" "auto lo" >> "${iface_file}"
+      printf "%s\n" "iface lo inet loopback" >> "${iface_file}"
+      log "[STEP 03 Bridge Mode] Created ${iface_file} with source line"
+    else
+      if ! grep -qE '^[[:space:]]*source[[:space:]]+/etc/network/interfaces\.d/\*' "${iface_file}" 2>/dev/null; then
+        # Insert at top for deterministic include
+        sed -i '1i source /etc/network/interfaces.d/*' "${iface_file}" 2>/dev/null || true
+        log "[STEP 03 Bridge Mode] Added source line to ${iface_file}"
       fi
-      ;;
-  esac
+    fi
+  fi
 
   #######################################
-  # 2) Create udev 99-custom-ifnames.rules
+  # 4) Summary (declarative)
   #######################################
-  log "[STEP 03] Create /etc/udev/rules.d/99-custom-ifnames.rules"
+  local summary
+  summary=$(cat <<EOF
+ ═══════════════════════════════════════════════════════════
+   STEP 03: Bridge Mode Configuration - Prepared
+ ═══════════════════════════════════════════════════════════
 
+ ✅ FILES WRITTEN (no runtime network changes):
+   • ${bridge_cfg}
+     - bridge: ${bridge_name}
+     - port  : cltr0 (udev will rename the selected NIC to cltr0 after reboot)
+
+ ✅ NOTES:
+   • This step only prepares persistent configuration.
+   • The bridge will be created/activated after reboot (or networking restart).
+   • VM bridge attach occurs in STEP 12.
+EOF
+)
+
+  whiptail_msgbox "STEP 03 Bridge Mode prepared" "${summary}"
+
+  log "[STEP 03 Bridge Mode] Declarative bridge configuration finished."
+  return 0
+}
+
+
+step_03_nic_ifupdown() {
+  log "[STEP 03] NIC naming / ifupdown switch and network config (Declarative, no runtime ip changes)"
+  load_config
+
+  #######################################
+  # Design goal:
+  # - DO NOT run: ip link / ip addr / ip route (no runtime network changes)
+  # - Only write udev + ifupdown config files
+  # - Validate by file checks + sysfs presence only
+  #######################################
+
+  # Basic sanity checks (must have NIC selections from STEP 01)
+  if [[ -z "${MGT_NIC:-}" || -z "${CLTR0_NIC:-}" || -z "${HOST_NIC:-}" ]]; then
+    whiptail_msgbox "STEP 03 - Missing NIC settings" "MGT_NIC/CLTR0_NIC/HOST_NIC is not configured.\n\nSelect NICs in STEP 01 first." 12 70
+    log "ERROR: Missing NIC settings. Run STEP 01 first."
+    return 1
+  fi
+
+  local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
+  : "${CLUSTER_BRIDGE_NAME:=br-cluster}"
+
+  #######################################
+  # Helpers (NO ip command usage)
+  #######################################
+  cidr_to_netmask() {
+    local pfx="$1"
+    local mask=$(( 0xffffffff << (32-pfx) & 0xffffffff ))
+    printf "%d.%d.%d.%d\n" \
+      $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
+  }
+
+  # Parse existing mgt config from files (best-effort)
+  parse_mgt_from_interfaces() {
+    local f="/etc/network/interfaces"
+    local fd="/etc/network/interfaces.d"
+    local ip="" netmask="" gw="" dns=""
+
+    if [[ -f "${fd}/01-mgt.cfg" ]]; then
+      ip="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${ip}" && -f "${f}" ]]; then
+      # if mgt stanza exists in /etc/network/interfaces
+      ip="$(awk '
+        $1=="iface" && $2=="mgt" {in=1}
+        in && $1=="address" {print $2; exit}
+      ' "${f}" 2>/dev/null || true)"
+      netmask="$(awk '
+        $1=="iface" && $2=="mgt" {in=1}
+        in && $1=="netmask" {print $2; exit}
+      ' "${f}" 2>/dev/null || true)"
+      gw="$(awk '
+        $1=="iface" && $2=="mgt" {in=1}
+        in && $1=="gateway" {print $2; exit}
+      ' "${f}" 2>/dev/null || true)"
+      dns="$(awk '
+        $1=="iface" && $2=="mgt" {in=1}
+        in && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}
+      ' "${f}" 2>/dev/null || true)"
+    fi
+
+    echo "${ip}|${netmask}|${gw}|${dns}"
+  }
+
+  #######################################
+  # 1) Resolve desired interfaces by identity (PCI/MAC) using sysfs-only helpers
+  #######################################
+  local resolved_mgt resolved_cltr0 resolved_host
+  resolved_mgt="$(resolve_ifname_by_identity "${MGT_NIC_PCI:-}" "${MGT_NIC_MAC:-}")"
+  resolved_cltr0="$(resolve_ifname_by_identity "${CLTR0_NIC_PCI:-}" "${CLTR0_NIC_MAC:-}")"
+  resolved_host="$(resolve_ifname_by_identity "${HOST_NIC_PCI:-}" "${HOST_NIC_MAC:-}")"
+
+  local desired_mgt_if="${resolved_mgt:-${MGT_NIC}}"
+  local desired_cltr0_if="${resolved_cltr0:-${CLTR0_NIC}}"
+  local desired_host_if="${resolved_host:-${HOST_NIC}}"
+
+  # Validate existence via sysfs only
+  if [[ ! -d "/sys/class/net/${desired_mgt_if}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC Not Found" "MGT_NIC '${desired_mgt_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+    log "ERROR: MGT_NIC '${desired_mgt_if}' not found in /sys/class/net"
+    return 1
+  fi
+  if [[ ! -d "/sys/class/net/${desired_host_if}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC Not Found" "HOST_NIC '${desired_host_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+    log "ERROR: HOST_NIC '${desired_host_if}' not found in /sys/class/net"
+    return 1
+  fi
+  if [[ ! -d "/sys/class/net/${desired_cltr0_if}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC Not Found" "CLTR0_NIC '${desired_cltr0_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+    log "ERROR: CLTR0_NIC '${desired_cltr0_if}' not found in /sys/class/net"
+    return 1
+  fi
+
+  #######################################
+  # 2) Collect mgt IP settings (NO runtime detection; parse from files/config or ask)
+  #######################################
+  local parsed ip0 nm0 gw0 dns0
+  parsed="$(parse_mgt_from_interfaces)"
+  ip0="${parsed%%|*}"; parsed="${parsed#*|}"
+  nm0="${parsed%%|*}"; parsed="${parsed#*|}"
+  gw0="${parsed%%|*}"; parsed="${parsed#*|}"
+  dns0="${parsed}"
+
+  # Config file values override parsed if present (optional)
+  local def_ip="${MGT_IP_ADDR:-$ip0}"
+  local def_prefix="${MGT_IP_PREFIX:-}"
+  local def_gw="${MGT_GW:-$gw0}"
+  local def_dns="${MGT_DNS:-$dns0}"
+
+  # If netmask exists but prefix not, infer common /24 else ask
+  if [[ -z "${def_prefix}" ]]; then
+    def_prefix="24"
+  fi
+  if [[ -z "${def_dns}" ]]; then
+    def_dns="8.8.8.8 8.8.4.4"
+  fi
+
+  local new_ip new_prefix new_gw new_dns
+  new_ip="$(whiptail_inputbox "STEP 03 - mgt IP setup" "Enter IP address for mgt interface.\nExample: 10.4.0.210" "${def_ip}" 10 70)" || return 1
+  [[ -z "${new_ip}" ]] && return 1
+
+  new_prefix="$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${def_prefix}" 10 70)" || return 1
+  [[ -z "${new_prefix}" ]] && return 1
+
+  new_gw="$(whiptail_inputbox "STEP 03 - gateway" "Enter default gateway IP.\nExample: 10.4.0.254" "${def_gw}" 10 70)" || return 1
+  [[ -z "${new_gw}" ]] && return 1
+
+  new_dns="$(whiptail_inputbox "STEP 03 - DNS" "Enter DNS servers separated by spaces.\nExample: 8.8.8.8 8.8.4.4" "${def_dns}" 10 80)" || return 1
+  [[ -z "${new_dns}" ]] && return 1
+
+  local netmask
+  netmask="$(cidr_to_netmask "${new_prefix}")"
+
+  # Save user-entered values into config/state (for re-run consistency)
+  save_config_var "MGT_IP_ADDR" "${new_ip}"
+  save_config_var "MGT_IP_PREFIX" "${new_prefix}"
+  save_config_var "MGT_GW" "${new_gw}"
+  save_config_var "MGT_DNS" "${new_dns}"
+
+  #######################################
+  # 3) Build udev rules (declarative only)
+  #######################################
   local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
-  local udev_bak="${udev_file}.$(date +%Y%m%d-%H%M%S).bak"
+  local udev_lib_file="/usr/lib/udev/rules.d/99-custom-ifnames.rules"
 
-  if [[ -f "${udev_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${udev_file}" "${udev_bak}"
-    log "Backed up existing ${udev_file}: ${udev_bak}"
+  # Determine PCI for udev matching (use stored PCI from STEP 01; fallback to sysfs path)
+  local mgt_pci cltr0_pci host_pci
+  mgt_pci="${MGT_NIC_PCI:-}"
+  cltr0_pci="${CLTR0_NIC_PCI:-}"
+  host_pci="${HOST_NIC_PCI:-}"
+
+  if [[ -z "${mgt_pci}" ]]; then
+    mgt_pci="$(readlink -f "/sys/class/net/${desired_mgt_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+  fi
+  if [[ -z "${cltr0_pci}" ]]; then
+    cltr0_pci="$(readlink -f "/sys/class/net/${desired_cltr0_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+  fi
+  if [[ -z "${host_pci}" ]]; then
+    host_pci="$(readlink -f "/sys/class/net/${desired_host_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+  fi
+
+  if [[ -z "${mgt_pci}" || -z "${cltr0_pci}" || -z "${host_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - PCI info error" "Cannot fetch PCI bus info for selected NICs.\n\nmgt=${desired_mgt_if} pci=${mgt_pci:-?}\ncltr0=${desired_cltr0_if} pci=${cltr0_pci:-?}\nhostmgmt=${desired_host_if} pci=${host_pci:-?}\n\nCheck hardware/BIOS or re-run STEP 01." 14 80
+    log "ERROR: PCI info missing for one or more NICs."
+    return 1
+  fi
+
+  # Uniqueness check (no duplicate identity)
+  if ! check_unique_identities "${mgt_pci}" "" "${cltr0_pci}" "" "${host_pci}" ""; then
+    whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "선택한 NIC들이 중복되었습니다.\n\n같은 NIC이 2개 이상의 역할(mgt/cltr0/hostmgmt)에 지정되었습니다.\n\nSTEP 01에서 서로 다른 NIC을 선택해주세요." 12 70
+    log "[ERROR] Duplicate identity detected - STEP 03 failed"
+    return 1
+  fi
+
+  local numvfs cltr0_extra is_sriov_mode
+  numvfs="${CLTR0_NUMVFS:-2}"
+  cltr0_extra=""
+  is_sriov_mode=1
+  if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+    is_sriov_mode=0
+  fi
+  if [[ "${is_sriov_mode}" -eq 1 ]]; then
+    cltr0_extra=", ATTR{device/sriov_numvfs}=\"${numvfs}\""
   fi
 
   local udev_content
   udev_content=$(cat <<EOF
-# Management & Cluster & HostMgmt Interface custom names (auto-generated)
-# MGT_NIC=${MGT_NIC}, PCI=${mgt_pci}
+# XDR Installer persistent interface names (declarative)
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${mgt_pci}", NAME:="mgt"
-
-# Cluster Interface PCI-bus ${cltr0_pci}, Create 2 SR-IOV VFs
-ACTION=="add", SUBSYSTEM=="net", KERNELS=="${cltr0_pci}", NAME:="cltr0", ATTR{device/sriov_numvfs}="2"
-
-# Host direct management interface (no gateway) PCI-bus ${host_pci}
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${cltr0_pci}", NAME:="cltr0"${cltr0_extra}
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${host_pci}", NAME:="hostmgmt"
 EOF
 )
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Will write to ${udev_file}:\n${udev_content}"
+    log "[DRY-RUN] Will write to ${udev_lib_file}:\n${udev_content}"
+    log "[DRY-RUN] Would run: sudo udevadm control --reload-rules"
+    log "[DRY-RUN] Would run: sudo update-initramfs -u -k all"
   else
     printf "%s\n" "${udev_content}" > "${udev_file}"
+    printf "%s\n" "${udev_content}" > "${udev_lib_file}"
+    chmod 644 "${udev_file}" || true
+    chmod 644 "${udev_lib_file}" || true
+    run_cmd "sudo udevadm control --reload-rules || true"
+    log "[STEP 03] Updating initramfs to apply udev rename on reboot"
+    run_cmd "sudo update-initramfs -u -k all"
+
+    if command -v lsinitramfs >/dev/null 2>&1; then
+      log "[STEP 03] Checking initramfs for ${udev_lib_file}"
+      lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null | grep -F "${udev_lib_file}" >/dev/null || true
+    fi
   fi
 
-  # udev reload
-  run_cmd "sudo udevadm control --reload"
-  run_cmd "sudo udevadm trigger --type=devices --action=add"
+  if [[ "${is_sriov_mode}" -eq 1 ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would verify cltr0 sriov_numvfs in ${udev_file}"
+      log "[DRY-RUN] Would verify cltr0 sriov_numvfs in ${udev_lib_file}"
+    else
+      local etc_has="no" lib_has="no"
+      if [[ -f "${udev_file}" ]] && grep -q "NAME:=\"cltr0\".*sriov_numvfs" "${udev_file}" 2>/dev/null; then
+        etc_has="yes"
+      fi
+      if [[ -f "${udev_lib_file}" ]] && grep -q "NAME:=\"cltr0\".*sriov_numvfs" "${udev_lib_file}" 2>/dev/null; then
+        lib_has="yes"
+      fi
+      log "[STEP 03] SR-IOV udev rule check: ${udev_file} cltr0 sriov_numvfs=${etc_has}"
+      log "[STEP 03] SR-IOV udev rule check: ${udev_lib_file} cltr0 sriov_numvfs=${lib_has}"
+    fi
+    log "[STEP 03] SR-IOV VF creation applies at reboot (udev add). Reboot is required before STEP 12."
+  fi
+
+  # Save effective ifnames for later steps (state stability)
+  save_config_var "MGT_NIC_EFFECTIVE" "mgt"
+  save_config_var "CLTR0_NIC_EFFECTIVE" "cltr0"
+  save_config_var "HOST_NIC_EFFECTIVE" "hostmgmt"
 
   #######################################
-  # 3) Create /etc/network/interfaces
+  # 4) Write ifupdown config files (declarative only)
   #######################################
-  log "[STEP 03] Create /etc/network/interfaces"
-
   local iface_file="/etc/network/interfaces"
-  local iface_bak="${iface_file}.$(date +%Y%m%d-%H%M%S).bak"
+  local iface_dir="/etc/network/interfaces.d"
+  local mgt_cfg="${iface_dir}/01-mgt.cfg"
+  local host_cfg="${iface_dir}/02-hostmgmt.cfg"
+  local cltr0_cfg="${iface_dir}/00-cltr0.cfg"
+  local br_cfg="${iface_dir}/03-${CLUSTER_BRIDGE_NAME}.cfg"
 
-  if [[ -f "${iface_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${iface_file}" "${iface_bak}"
-    log "Backed up existing ${iface_file}: ${iface_bak}"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mkdir -p "${iface_dir}"
   fi
 
+  # Ensure /etc/network/interfaces has source line and lo only
   local iface_content
   iface_content=$(cat <<EOF
 source /etc/network/interfaces.d/*
 
-# The loopback network interface
 auto lo
 iface lo inet loopback
-
-# The management network interface
-auto mgt
-iface mgt inet static
-    address ${new_ip}
-    netmask ${netmask}
-    gateway ${new_gw}
-    dns-nameservers ${new_dns}
 EOF
 )
 
@@ -1631,98 +2641,272 @@ EOF
     printf "%s\n" "${iface_content}" > "${iface_file}"
   fi
 
-  #######################################
-  # 3-1) Create /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt, no gateway, fixed IP)
-  #######################################
-  log "[STEP 03] Creating /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt: 192.168.0.100/24, no gateway)"
-
-  local iface_dir="/etc/network/interfaces.d"
-  local host_cfg="${iface_dir}/02-hostmgmt.cfg"
-  local host_bak="${host_cfg}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ "${DRY_RUN}" -eq 0 ]]; then
-    mkdir -p "${iface_dir}"
+  # mgt config in interfaces.d (preferred)
+  local mgt_content
+  mgt_content=$(cat <<EOF
+auto mgt
+iface mgt inet static
+    address ${new_ip}
+    netmask ${netmask}
+    gateway ${new_gw}
+    dns-nameservers ${new_dns}
+EOF
+)
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will write to ${mgt_cfg}:\n${mgt_content}"
+  else
+    printf "%s\n" "${mgt_content}" > "${mgt_cfg}"
   fi
 
-  if [[ -f "${host_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${host_cfg}" "${host_bak}"
-    log "Backed up existing ${host_cfg}: ${host_bak}"
-  fi
-
+  # hostmgmt fixed IP (no gateway)
   local host_content
   host_content=$(cat <<EOF
-# Host direct management interface (no gateway)
 auto hostmgmt
 iface hostmgmt inet static
     address 192.168.0.100
     netmask 255.255.255.0
 EOF
 )
-
   if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] Will write the following content to ${host_cfg}:\n${host_content}"
+    log "[DRY-RUN] Will write to ${host_cfg}:\n${host_content}"
   else
     printf "%s\n" "${host_content}" > "${host_cfg}"
   fi
 
-  #######################################
-  # 4) Create /etc/network/interfaces.d/00-cltr0.cfg
-  #######################################
-  log "[STEP 03] Create /etc/network/interfaces.d/00-cltr0.cfg"
-
-  local cltr0_cfg="${iface_dir}/00-cltr0.cfg"
-  local cltr0_bak="${cltr0_cfg}.$(date +%Y%m%d-%H%M%S).bak"
-
-  if [[ -f "${cltr0_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
-    cp -a "${cltr0_cfg}" "${cltr0_bak}"
-    log "Backed up existing ${cltr0_cfg}: ${cltr0_bak}"
-  fi
-
+  # cltr0: manual
   local cltr0_content
   cltr0_content=$(cat <<EOF
 auto cltr0
 iface cltr0 inet manual
 EOF
 )
-
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Will write to ${cltr0_cfg}:\n${cltr0_content}"
   else
     printf "%s\n" "${cltr0_content}" > "${cltr0_cfg}"
   fi
 
-  #######################################
-  # 5) Register rt_mgt in /etc/iproute2/rt_tables
-  #######################################
-  log "[STEP 03] Add rt_mgt to /etc/iproute2/rt_tables"
-
-  local rt_file="/etc/iproute2/rt_tables"
-  if [[ ! -f "${rt_file}" && "${DRY_RUN}" -eq 0 ]]; then
-    touch "${rt_file}"
-  fi
-
-  if grep -qE '^[[:space:]]*1[[:space:]]+rt_mgt' "${rt_file}" 2>/dev/null; then
-    log "rt_tables: entry '1 rt_mgt' already exists."
-  else
-    local rt_line="1 rt_mgt"
+  # Bridge mode: create persistent bridge config ONLY (no runtime create/up)
+  if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+    local br_content
+    br_content=$(cat <<EOF
+auto ${CLUSTER_BRIDGE_NAME}
+iface ${CLUSTER_BRIDGE_NAME} inet manual
+    bridge_ports cltr0
+    bridge_stp off
+    bridge_fd 0
+EOF
+)
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "[DRY-RUN] Will append '${rt_line}' to ${rt_file}"
+      log "[DRY-RUN] Will write to ${br_cfg}:\n${br_content}"
     else
-      echo "${rt_line}" >> "${rt_file}"
-      log "Added '${rt_line}' to ${rt_file}"
+      printf "%s\n" "${br_content}" > "${br_cfg}"
+    fi
+  else
+    # If SR-IOV mode, remove stale bridge cfg if exists
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      rm -f "${br_cfg}" 2>/dev/null || true
     fi
   fi
 
+  #######################################
+  # 4-1) File-based verification (no runtime checks)
+  #######################################
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[STEP 03] DRY-RUN: Skipping file-based verification"
+  else
+    # Helper: extract value for a key within an iface stanza
+    extract_iface_value() {
+      local file="$1" iface="$2" key="$3"
+      awk -v iface="${iface}" -v key="${key}" '
+        $1=="iface" && $2==iface {in=1; next}
+        in && $1=="iface" {in=0}
+        in && $1==key {print $2; exit}
+      ' "${file}" 2>/dev/null || true
+    }
+
+    # Helper: extract full dns-nameservers line (can have multiple values)
+    extract_dns_list() {
+      local file="$1" iface="$2"
+      awk -v iface="${iface}" '
+        $1=="iface" && $2==iface {in=1; next}
+        in && $1=="iface" {in=0}
+        in && $1=="dns-nameservers" {$1=""; sub(/^[[:space:]]+/,""); print; exit}
+      ' "${file}" 2>/dev/null || true
+    }
+
+    normalize_value() {
+      echo "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    }
+
+    normalize_list() {
+      echo "$1" | tr '\t' ' ' | tr -d '\r' | sed 's/[[:space:]]\+/ /g;s/^[[:space:]]*//;s/[[:space:]]*$//'
+    }
+
+    # Helper: ensure all expected dns tokens are present
+    dns_contains_all() {
+      local expected="$1" actual="$2"
+      local token
+      for token in ${expected}; do
+        if ! echo " ${actual} " | grep -q " ${token} "; then
+          return 1
+        fi
+      done
+      return 0
+    }
+
+    # Helper: list missing dns tokens for error reporting
+    dns_missing_tokens() {
+      local expected="$1" actual="$2"
+      local token missing=""
+      for token in ${expected}; do
+        if ! echo " ${actual} " | grep -q " ${token} "; then
+          missing="${missing} ${token}"
+        fi
+      done
+      echo "${missing# }"
+    }
+
+    local verify_failed=0
+    local verify_errors=""
+
+    if [[ ! -f "${udev_file}" ]] || [[ ! -f "${udev_lib_file}" ]] || \
+       ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_lib_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_file}"
+      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_lib_file}"
+      verify_errors="${verify_errors}\n  expected: mgt=${mgt_pci}, cltr0=${cltr0_pci}, hostmgmt=${host_pci}"
+    fi
+
+    if [[ ! -f "${iface_file}" ]] || \
+       ! grep -qE '^[[:space:]]*source[[:space:]]+/etc/network/interfaces\.d/\*' "${iface_file}" 2>/dev/null || \
+       ! grep -qE '^[[:space:]]*auto[[:space:]]+lo([[:space:]]|$)' "${iface_file}" 2>/dev/null || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+lo[[:space:]]+inet[[:space:]]+loopback([[:space:]]|$)' "${iface_file}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- /etc/network/interfaces is missing required base content"
+      verify_errors="${verify_errors}\n  expected: source line + lo stanza"
+    fi
+
+    local mgt_addr mgt_netmask mgt_gw mgt_dns
+    mgt_addr="$(extract_iface_value "${mgt_cfg}" "mgt" "address")"
+    mgt_netmask="$(extract_iface_value "${mgt_cfg}" "mgt" "netmask")"
+    mgt_gw="$(extract_iface_value "${mgt_cfg}" "mgt" "gateway")"
+    mgt_dns="$(extract_dns_list "${mgt_cfg}" "mgt")"
+    if [[ -z "${mgt_addr}" ]]; then
+      mgt_addr="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${mgt_netmask}" ]]; then
+      mgt_netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${mgt_gw}" ]]; then
+      mgt_gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${mgt_dns}" ]]; then
+      mgt_dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+    fi
+    mgt_addr="$(normalize_value "${mgt_addr}")"
+    mgt_netmask="$(normalize_value "${mgt_netmask}")"
+    mgt_gw="$(normalize_value "${mgt_gw}")"
+    mgt_dns="$(normalize_list "${mgt_dns}")"
+
+    if [[ ! -f "${mgt_cfg}" ]] || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+mgt[[:space:]]+inet[[:space:]]+static' "${mgt_cfg}" 2>/dev/null || \
+       [[ "${mgt_addr}" != "${new_ip}" ]] || \
+       [[ "${mgt_netmask}" != "${netmask}" ]] || \
+       [[ "${mgt_gw}" != "${new_gw}" ]] || \
+       [[ -z "${mgt_dns}" ]] || ! dns_contains_all "${new_dns}" "${mgt_dns}"; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- mgt config invalid: ${mgt_cfg}"
+      verify_errors="${verify_errors}\n  expected: address=${new_ip} netmask=${netmask} gateway=${new_gw} dns=${new_dns}"
+      verify_errors="${verify_errors}\n  actual  : address=${mgt_addr:-<empty>} netmask=${mgt_netmask:-<empty>} gateway=${mgt_gw:-<empty>} dns=${mgt_dns:-<empty>}"
+      if [[ -n "${mgt_dns}" ]]; then
+        local dns_missing
+        dns_missing="$(dns_missing_tokens "${new_dns}" "${mgt_dns}")"
+        if [[ -n "${dns_missing}" ]]; then
+          verify_errors="${verify_errors}\n  dns missing: ${dns_missing}"
+        fi
+      fi
+    fi
+
+    local host_addr host_netmask
+    host_addr="$(extract_iface_value "${host_cfg}" "hostmgmt" "address")"
+    host_netmask="$(extract_iface_value "${host_cfg}" "hostmgmt" "netmask")"
+    if [[ -z "${host_addr}" ]]; then
+      host_addr="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${host_cfg}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${host_netmask}" ]]; then
+      host_netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${host_cfg}" 2>/dev/null || true)"
+    fi
+    host_addr="$(normalize_value "${host_addr}")"
+    host_netmask="$(normalize_value "${host_netmask}")"
+    if [[ ! -f "${host_cfg}" ]] || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+hostmgmt[[:space:]]+inet[[:space:]]+static' "${host_cfg}" 2>/dev/null || \
+       [[ "${host_addr}" != "192.168.0.100" ]] || \
+       [[ "${host_netmask}" != "255.255.255.0" ]]; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- hostmgmt config invalid: ${host_cfg}"
+      verify_errors="${verify_errors}\n  expected: address=192.168.0.100 netmask=255.255.255.0"
+      verify_errors="${verify_errors}\n  actual  : address=${host_addr:-<empty>} netmask=${host_netmask:-<empty>}"
+    fi
+
+    if [[ ! -f "${cltr0_cfg}" ]] || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+cltr0[[:space:]]+inet[[:space:]]+manual([[:space:]]|$)' "${cltr0_cfg}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- cltr0 config invalid: ${cltr0_cfg}"
+      verify_errors="${verify_errors}\n  expected: iface cltr0 inet manual"
+    fi
+
+    if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+      local br_ports
+      br_ports="$(extract_iface_value "${br_cfg}" "${CLUSTER_BRIDGE_NAME}" "bridge_ports")"
+      if [[ -z "${br_ports}" ]]; then
+        br_ports="$(awk '/^[[:space:]]*bridge_ports[[:space:]]+/{sub(/^[[:space:]]*bridge_ports[[:space:]]+/,""); print; exit}' "${br_cfg}" 2>/dev/null || true)"
+      fi
+      br_ports="$(normalize_list "${br_ports}")"
+      if [[ ! -f "${br_cfg}" ]] || \
+         ! grep -qE "^[[:space:]]*iface[[:space:]]+${CLUSTER_BRIDGE_NAME}[[:space:]]+inet[[:space:]]+manual([[:space:]]|$)" "${br_cfg}" 2>/dev/null || \
+         [[ -z "${br_ports}" ]] || ! echo " ${br_ports} " | grep -q " cltr0 "; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- bridge config invalid: ${br_cfg}"
+        verify_errors="${verify_errors}\n  expected: iface ${CLUSTER_BRIDGE_NAME} inet manual + bridge_ports cltr0"
+        verify_errors="${verify_errors}\n  actual  : bridge_ports=${br_ports:-<empty>}"
+      fi
+    else
+      if [[ -f "${br_cfg}" ]]; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- stale bridge config exists in SR-IOV mode: ${br_cfg}"
+      fi
+    fi
+
+    if [[ "${verify_failed}" -eq 1 ]]; then
+      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      log "[ERROR] STEP 03 file verification failed:${verify_errors}"
+      return 1
+    fi
+
+    log "[STEP 03] File-based verification passed"
+  fi
 
   #######################################
-  # 6) Disable netplan and switch to ifupdown
+  # 5) Disable netplan, enable ifupdown (no network restart here)
   #######################################
-  log "[STEP 03] Install ifupdown and disable netplan"
+  log "[STEP 03] Install ifupdown and disable netplan (no restart)"
+  local missing_pkgs=()
+  dpkg -s ifupdown >/dev/null 2>&1 || missing_pkgs+=("ifupdown")
+  dpkg -s net-tools >/dev/null 2>&1 || missing_pkgs+=("net-tools")
+  if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+    log "[STEP 03] Missing packages: ${missing_pkgs[*]} (apt update required)"
+    run_cmd "sudo apt update"
+    run_cmd "sudo apt install -y ${missing_pkgs[*]}"
+  else
+    log "[STEP 03] Packages already installed (skip apt update/install)"
+  fi
 
-  run_cmd "sudo apt update"
-  run_cmd "sudo apt install -y ifupdown net-tools"
-
-  # Move netplan config files
   if compgen -G "/etc/netplan/*.yaml" > /dev/null; then
     log "[STEP 03] Moving netplan config files to /etc/netplan/disabled"
     run_cmd "sudo mkdir -p /etc/netplan/disabled"
@@ -1731,90 +2915,154 @@ EOF
     log "No netplan yaml files to move (may already be relocated)."
   fi
 
-  #######################################
-  # 6-1) Disable systemd-networkd/netplan services and enable legacy networking
-  #######################################
-  log "[STEP 03] Disable systemd-networkd/netplan services; enable networking service"
-
-  # Disable systemd-networkd / netplan related services
+  log "[STEP 03] Disable systemd-networkd/netplan services; enable legacy networking service (no restart)"
   run_cmd "sudo systemctl stop systemd-networkd || true"
   run_cmd "sudo systemctl disable systemd-networkd || true"
   run_cmd "sudo systemctl mask systemd-networkd || true"
   run_cmd "sudo systemctl mask systemd-networkd-wait-online || true"
   run_cmd "sudo systemctl mask netplan-* || true"
-
-  # Enable legacy networking service
   run_cmd "sudo systemctl unmask networking || true"
   run_cmd "sudo systemctl enable networking || true"
 
-
   #######################################
-  # 8) Summary and reboot recommendation
+  # 6) Summary (reboot required for udev rename + ifupdown apply)
   #######################################
   local summary
   summary=$(cat <<EOF
 ═══════════════════════════════════════════════════════════
-  STEP 03: Network Configuration - Complete
+  STEP 03: Network Configuration - Complete (Declarative)
 ═══════════════════════════════════════════════════════════
 
-✅ CONFIGURATION COMPLETED:
-  • udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
-    - mgt NIC → PCI ${mgt_pci} → renamed to "mgt"
-    - cltr0 NIC → PCI ${cltr0_pci} → renamed to "cltr0" (SR-IOV VFs=2)
-    - hostmgmt NIC → PCI ${host_pci} → renamed to "hostmgmt"
+✅ FILES WRITTEN (no runtime network changes performed):
+  • udev rules: ${udev_file}
+    - ${mgt_pci}   → mgt
+    - ${cltr0_pci} → cltr0
+    - ${host_pci}  → hostmgmt
 
-  • Network interfaces: /etc/network/interfaces
-    - mgt IP:      ${new_ip}/${new_prefix} (netmask ${netmask})
-    - Gateway:     ${new_gw}
-    - DNS:         ${new_dns}
-
-  • hostmgmt interface: /etc/network/interfaces.d/02-hostmgmt.cfg
-    - hostmgmt IP: 192.168.0.100/24 (no gateway)
-
-  • cltr0 interface: /etc/network/interfaces.d/00-cltr0.cfg
-    - Mode: manual (for SR-IOV passthrough)
-
-  • Routing table: /etc/iproute2/rt_tables
-    - Added: 1 rt_mgt
-
-  • Network stack: netplan → ifupdown
-    - netplan disabled
-    - ifupdown enabled
-
-⚠️  IMPORTANT NOTES:
-  • Network configuration changes require reboot to take effect
-  • Network services may fail if restarted immediately
-  • Automatic reboot will occur after this step completes
-    (if AUTO_REBOOT_AFTER_STEP_ID includes '03_nic_ifupdown')
-  • A second reboot will occur after STEP 05 completes
-    (if AUTO_REBOOT_AFTER_STEP_ID includes '05_kernel_tuning')
-
-🔧 TROUBLESHOOTING:
-  • If network fails after reboot:
-    1. Check /etc/network/interfaces syntax
-    2. Verify NIC PCI addresses match hardware
-    3. Check udev rules: /etc/udev/rules.d/99-custom-ifnames.rules
-    4. Review logs: ${LOG_FILE}
-
-📝 NEXT STEPS:
-  • System will reboot automatically after this step (if configured)
-  • After reboot, proceed to STEP 04 (KVM/Libvirt Installation)
+  • ifupdown:
+    - ${iface_file}
+    - ${mgt_cfg}
+    - ${host_cfg}
+    - ${cltr0_cfg}
 EOF
 )
 
+  if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+    summary="${summary}
+    - ${br_cfg} (bridge ${CLUSTER_BRIDGE_NAME} uses cltr0)"
+  fi
+
+  summary="${summary}
+
+✅ mgt IP plan (applied after reboot / networking restart):
+  - mgt: ${new_ip}/${new_prefix} (netmask ${netmask})
+  - gw : ${new_gw}
+  - dns: ${new_dns}
+
+✅ hostmgmt (applied after reboot / networking restart):
+  - hostmgmt: 192.168.0.100/24 (no gateway)
+
+⚠️ REBOOT REQUIRED:
+  - udev rename + ifupdown config are applied on reboot (or explicit networking restart).
+  - This step intentionally does NOT restart networking to avoid SSH disruption.
+"
+
   whiptail_msgbox "STEP 03 complete" "${summary}"
 
-    # Reboot handled in common logic (AUTO_REBOOT_AFTER_STEP_ID)
-    log "[STEP 03] NIC ifupdown switch and network configuration finished."
-    log "[STEP 03] This STEP (03_nic_ifupdown) is included for auto reboot."
-
-    return 0
-  }
+  log "[STEP 03] Declarative network configuration finished. Reboot required for apply."
+  return 0
+}
   
 
 step_04_kvm_libvirt() {
   log "[STEP 04] Install KVM / Libvirt and pin default network (virbr0)"
   load_config
+
+  #######################################
+  # Helper functions for STEP 04
+  #######################################
+  
+  # Check if systemd unit is active (service or socket)
+  is_systemd_unit_active_or_socket() {
+    local svc="$1"
+    # svc: libvirtd or virtlogd
+    if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+      return 0
+    fi
+    if systemctl is-active --quiet "${svc}.socket" 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  }
+
+  # Check if default network is in desired state (virsh-based)
+  is_default_net_desired_state() {
+    # Active check (with space tolerance and net-list fallback)
+    local active_check=0
+    if virsh net-info default 2>/dev/null | grep -qiE '^[[:space:]]*Active:[[:space:]]*yes'; then
+      active_check=1
+    else
+      # Fallback: check net-list --all for active status
+      if virsh net-list --all 2>/dev/null | awk 'NR>2 {print $1,$2}' | grep -qiE '^default[[:space:]]+active'; then
+        active_check=1
+      fi
+    fi
+    
+    if [[ ${active_check} -eq 0 ]]; then
+      return 1
+    fi
+
+    local xml
+    xml="$(virsh net-dumpxml default 2>/dev/null)" || return 1
+
+    # Required: IP address and netmask
+    if ! echo "$xml" | grep -q "ip address='192.168.122.1'"; then
+      return 1
+    fi
+    if ! echo "$xml" | grep -q "netmask='255.255.255.0'"; then
+      return 1
+    fi
+
+    # Required: DHCP must NOT exist
+    if echo "$xml" | grep -qi "<dhcp"; then
+      return 1
+    fi
+
+    # Optional checks (warn only, not failure conditions)
+    if ! echo "$xml" | grep -qi "<forward mode='nat'"; then
+      log "[STEP 04] Warning: default network XML may not have forward mode='nat' (continuing anyway)"
+    fi
+    if ! echo "$xml" | grep -qi "<bridge name='virbr0'"; then
+      log "[STEP 04] Warning: default network XML may not have bridge name='virbr0' (continuing anyway)"
+    fi
+
+    return 0
+  }
+
+  # Wait for default network to reach desired state (polling)
+  wait_for_default_net_desired_state() {
+    local timeout_sec="${1:-30}"
+    local interval_sec="${2:-1}"
+    local waited=0
+
+    while (( waited < timeout_sec )); do
+      if is_default_net_desired_state; then
+        return 0
+      fi
+      sleep "$interval_sec"
+      waited=$((waited + interval_sec))
+    done
+
+    # Debug outputs (do not exit here; caller decides)
+    log "[STEP 04] default network not in desired state after ${timeout_sec}s. Debug:"
+    log "[STEP 04] virsh net-list --all:"
+    virsh net-list --all 2>&1 | sed 's/^/[STEP 04]   /' || true
+    log "[STEP 04] virsh net-info default:"
+    virsh net-info default 2>&1 | sed 's/^/[STEP 04]   /' || true
+    log "[STEP 04] virsh net-dumpxml default (first 200 lines):"
+    virsh net-dumpxml default 2>&1 | sed -n '1,200p' | sed 's/^/[STEP 04]   /' || true
+    return 1
+  }
 
   local tmp_info="/tmp/xdr_step04_info.txt"
   : > "${tmp_info}"
@@ -1915,44 +3163,29 @@ qemu-utils virt-viewer genisoimage net-tools cpu-checker ipset make gcc ipcalc-n
   run_cmd "sudo systemctl enable --now libvirtd"
   run_cmd "sudo systemctl enable --now virtlogd"
 
-  # Wait for services to become active (with retry logic)
+  # Wait for services to become active (with retry logic, considering socket-activation)
   if [[ "${DRY_RUN}" -eq 0 ]]; then
-    log "[STEP 04] Waiting for libvirtd service to become active..."
-    local max_wait=15  # Maximum wait time in seconds
-    local wait_interval=1  # Check every 1 second
-    local waited=0
-    local libvirtd_active=0
-    local virtlogd_active=0
-
-    # Wait for libvirtd
-    while [[ ${waited} -lt ${max_wait} ]]; do
-      if systemctl is-active --quiet libvirtd 2>/dev/null; then
-        libvirtd_active=1
-        log "[STEP 04] libvirtd service is now active (waited ${waited} seconds)"
+    log "[STEP 04] Waiting for libvirtd/virtlogd to become active (service or socket)..."
+    local tries=10
+    local i
+    for i in $(seq 1 "$tries"); do
+      if is_systemd_unit_active_or_socket libvirtd && is_systemd_unit_active_or_socket virtlogd; then
+        log "[STEP 04] libvirtd/virtlogd are active (service or socket)"
         break
       fi
-      sleep "${wait_interval}"
-      ((waited += wait_interval))
+      sleep 1
     done
 
-    if [[ ${libvirtd_active} -eq 0 ]]; then
-      log "[WARN] libvirtd service did not become active within ${max_wait} seconds"
+    if ! is_systemd_unit_active_or_socket libvirtd; then
+      log "[WARN] libvirtd not active (service/socket) after wait"
+      log "[STEP 04] Debug: systemctl status libvirtd --no-pager:"
+      systemctl status libvirtd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
     fi
 
-    # Wait for virtlogd (reset wait counter)
-    waited=0
-    while [[ ${waited} -lt ${max_wait} ]]; do
-      if systemctl is-active --quiet virtlogd 2>/dev/null; then
-        virtlogd_active=1
-        log "[STEP 04] virtlogd service is now active (waited ${waited} seconds)"
-        break
-      fi
-      sleep "${wait_interval}"
-      ((waited += wait_interval))
-    done
-
-    if [[ ${virtlogd_active} -eq 0 ]]; then
-      log "[WARN] virtlogd service did not become active within ${max_wait} seconds"
+    if ! is_systemd_unit_active_or_socket virtlogd; then
+      log "[WARN] virtlogd not active (service/socket) after wait"
+      log "[STEP 04] Debug: systemctl status virtlogd --no-pager:"
+      systemctl status virtlogd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
     fi
   else
     log "[DRY-RUN] Would wait for libvirtd/virtlogd services to become active"
@@ -1970,19 +3203,12 @@ qemu-utils virt-viewer genisoimage net-tools cpu-checker ipset make gcc ipcalc-n
   local default_net_xml_final="/etc/libvirt/qemu/networks/default.xml"
   local need_redefine=0
 
-  if [[ -f "${default_net_xml_final}" ]]; then
-    # Determine if already 192.168.122.1/24 with no DHCP
-    if grep -q "<ip address='192.168.122.1' netmask='255.255.255.0'" "${default_net_xml_final}" 2>/dev/null && \
-       ! grep -q "<dhcp>" "${default_net_xml_final}" 2>/dev/null; then
-      need_redefine=0
-      log "[STEP 04] ${default_net_xml_final} already defines default network as 192.168.122.1/24 without DHCP."
-    else
-      need_redefine=1
-      log "[STEP 04] Detected DHCP or other settings in ${default_net_xml_final} → needs redefine."
-    fi
+  if is_default_net_desired_state; then
+    need_redefine=0
+    log "[STEP 04] Default network already in desired state (virsh). Skipping redefine."
   else
     need_redefine=1
-    log "[STEP 04] ${default_net_xml_final} not found → default network must be defined."
+    log "[STEP 04] Default network NOT in desired state (virsh). Redefining..."
   fi
 
   #######################################
@@ -2034,13 +3260,20 @@ EOF
     run_cmd "virsh net-autostart default"
     run_cmd "virsh net-start default || true"
 
-	# Extra: wait for settings to flush to disk and stabilize
-	log "[STEP 04] Waiting for settings to apply (5s)..."
-	sleep 10
-	sync	
+    # Wait for default network settings to apply (polling)
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      log "[STEP 04] Waiting for default network settings to apply (polling)..."
+      if ! wait_for_default_net_desired_state 30 1; then
+        log "[STEP 04] Prerequisite validation failed (default network not stabilized) -> rc=1"
+        return 1
+      fi
+      log "[STEP 04] Default network settings applied successfully."
+    else
+      log "[DRY-RUN] Would wait for default network settings to apply (polling)"
+    fi
 	
   else
-    log "[STEP 04] Default network already in desired state; skipping redefine."
+    log "[STEP 04] Default network already in desired state (virsh). Skipping redefine."
   fi
 
   #######################################
@@ -2127,60 +3360,18 @@ EOF
       fail_reasons+=(" - kvm kernel module is not loaded.")
     fi
 
-    # 3) libvirtd / virtlogd service state (with retry logic)
-    local libvirtd_check=0
-    local virtlogd_check=0
-    local retry_count=0
-    local max_retries=3
-    local retry_delay=2
-
-    # Retry check for libvirtd (service may need a moment to fully start)
-    while [[ ${retry_count} -lt ${max_retries} ]]; do
-      if systemctl is-active --quiet libvirtd 2>/dev/null; then
-        libvirtd_check=1
-        break
-      fi
-      if [[ ${retry_count} -lt $((max_retries - 1)) ]]; then
-        log "[STEP 04] libvirtd not yet active, waiting ${retry_delay} seconds before retry ($((retry_count + 1))/${max_retries})..."
-        sleep "${retry_delay}"
-      fi
-      ((retry_count++))
-    done
-
-    if [[ ${libvirtd_check} -eq 0 ]]; then
-      fail_reasons+=(" - libvirtd service is not active (checked ${max_retries} times with ${retry_delay}s intervals).")
+    # 3) libvirtd / virtlogd service state (considering socket-activation)
+    if ! is_systemd_unit_active_or_socket libvirtd; then
+      fail_reasons+=(" - libvirtd service/socket is not active.")
     fi
 
-    # Retry check for virtlogd
-    retry_count=0
-    while [[ ${retry_count} -lt ${max_retries} ]]; do
-      if systemctl is-active --quiet virtlogd 2>/dev/null; then
-        virtlogd_check=1
-        break
-      fi
-      if [[ ${retry_count} -lt $((max_retries - 1)) ]]; then
-        log "[STEP 04] virtlogd not yet active, waiting ${retry_delay} seconds before retry ($((retry_count + 1))/${max_retries})..."
-        sleep "${retry_delay}"
-      fi
-      ((retry_count++))
-    done
-
-    if [[ ${virtlogd_check} -eq 0 ]]; then
-      fail_reasons+=(" - virtlogd service is not active (checked ${max_retries} times with ${retry_delay}s intervals).")
+    if ! is_systemd_unit_active_or_socket virtlogd; then
+      fail_reasons+=(" - virtlogd service/socket is not active.")
     fi
 
-    # 4) default network (virbr0) configuration state
-    local default_net_xml_final="/etc/libvirt/qemu/networks/default.xml"
-
-    if [[ ! -f "${default_net_xml_final}" ]]; then
-      fail_reasons+=(" - ${default_net_xml_final} file does not exist.")
-    else
-      if ! grep -q "<ip address='192.168.122.1' netmask='255.255.255.0'>" "${default_net_xml_final}" 2>/dev/null; then
-        fail_reasons+=(" - default network IP is not 192.168.122.1/24.")
-      fi
-      if grep -q "<dhcp>" "${default_net_xml_final}" 2>/dev/null; then
-        fail_reasons+=(" - DHCP block remains in default network XML.")
-      fi
+    # 4) default network (virbr0) configuration state (virsh-based)
+    if ! is_default_net_desired_state; then
+      fail_reasons+=(" - default network is not in desired state (virsh check failed).")
     fi
 
     # 5) Guidance on failure and return rc=1
@@ -2193,6 +3384,19 @@ EOF
       msg+="\n[STEP 04] Rerun KVM / Libvirt installation and default network (virbr0) setup, then check logs."
 
       log "[STEP 04] Prerequisite validation failed → returning rc=1"
+      
+      # Debug outputs for troubleshooting
+      log "[STEP 04] Debug: systemctl status libvirtd --no-pager:"
+      systemctl status libvirtd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
+      log "[STEP 04] Debug: systemctl status virtlogd --no-pager:"
+      systemctl status virtlogd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
+      log "[STEP 04] Debug: virsh net-list --all:"
+      virsh net-list --all 2>&1 | sed 's/^/[STEP 04]   /' || true
+      log "[STEP 04] Debug: virsh net-info default:"
+      virsh net-info default 2>&1 | sed 's/^/[STEP 04]   /' || true
+      log "[STEP 04] Debug: virsh net-dumpxml default (first 200 lines):"
+      virsh net-dumpxml default 2>&1 | sed -n '1,200p' | sed 's/^/[STEP 04]   /' || true
+      
       whiptail_msgbox "STEP 04 validation failed" "${msg}"
       return 1
     fi
@@ -2469,6 +3673,19 @@ EOF
     log "[STEP 05] ${QEMU_DEFAULT} not found → skip KSM setting"
   fi
 
+  # Disable KSM immediately by writing 0 to /sys/kernel/mm/ksm/run
+  if [[ -f /sys/kernel/mm/ksm/run ]]; then
+    log "[STEP 05] Disabling KSM immediately by writing 0 to /sys/kernel/mm/ksm/run"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would run: echo 0 | sudo tee /sys/kernel/mm/ksm/run"
+    else
+      echo 0 | sudo tee /sys/kernel/mm/ksm/run >/dev/null
+      log "Disabled KSM: /sys/kernel/mm/ksm/run = 0"
+    fi
+  else
+    log "[STEP 05] /sys/kernel/mm/ksm/run not found → skip immediate KSM disable"
+  fi
+
   # Restart qemu-kvm to apply KSM setting
   if systemctl list-unit-files 2>/dev/null | grep -q '^qemu-kvm\.service'; then
     log "[STEP 05] Restarting qemu-kvm to apply KSM setting."
@@ -2478,8 +3695,15 @@ EOF
 
     # Check KSM state after restart
     if [[ -f /sys/kernel/mm/ksm/run ]]; then
-      log "[STEP 05] qemu-kvm restart → current /sys/kernel/mm/ksm/run:"
-      cat /sys/kernel/mm/ksm/run >> "${LOG_FILE}" 2>&1
+      local ksm_after_restart
+      ksm_after_restart=$(cat /sys/kernel/mm/ksm/run 2>/dev/null)
+      log "[STEP 05] qemu-kvm restart → current /sys/kernel/mm/ksm/run: ${ksm_after_restart}"
+      # If KSM is still enabled after restart, disable it again
+      if [[ "${ksm_after_restart}" != "0" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
+        log "[STEP 05] KSM was re-enabled after qemu-kvm restart, disabling again"
+        echo 0 | sudo tee /sys/kernel/mm/ksm/run >/dev/null
+        log "Disabled KSM again: /sys/kernel/mm/ksm/run = 0"
+      fi
     fi
   else
     log "[STEP 05] qemu-kvm service unit not found; skip restart."
@@ -2647,9 +3871,10 @@ EOF
 
 
 step_06_ntpsec() {
-  log "[STEP 06] Install SR-IOV driver (iavf/i40evf) + configure NTPsec"
   load_config
 
+  log "[STEP 06] Install SR-IOV driver (iavf/i40evf) + configure NTPsec"
+  
   local tmp_info="/tmp/xdr_step06_info.txt"
   : > "${tmp_info}"
 
@@ -2959,6 +4184,10 @@ step_07_lvm_storage() {
 
   load_config
 
+  local _DRY_RUN="${DRY_RUN:-0}"
+  local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
+  local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
+
   # Auto-detect OS VG name
   local root_dev
   root_dev=$(findmnt -n -o SOURCE /)
@@ -3095,6 +4324,27 @@ step_07_lvm_storage() {
   if [[ ${confirm_rc} -ne 0 ]]; then
     log "User canceled STEP 07 disk initialization."
     return 2  # Return 2 to indicate cancellation
+  fi
+
+  #######################################
+  # Stop and remove running DL/DA VMs (avoid busy volumes)
+  #######################################
+  local -a dl_vms da_vms cluster_vms
+  mapfile -t dl_vms < <(list_dl_domains)
+  mapfile -t da_vms < <(list_da_domains)
+  cluster_vms=("${dl_vms[@]}" "${da_vms[@]}")
+
+  if [[ ${#cluster_vms[@]} -gt 0 ]]; then
+    local vm_list_str
+    vm_list_str=$(printf '%s\n' "${cluster_vms[@]}")
+    if ! confirm_destroy_vm_batch "STEP 07 - LVM Storage" "${vm_list_str}" "DL/DA"; then
+      log "[STEP 07] VM cleanup canceled by user."
+      return 2
+    fi
+    local vm
+    for vm in "${cluster_vms[@]}"; do
+      cleanup_dl_da_vm_and_images "${vm}" "${DL_INSTALL_DIR}" "${DA_INSTALL_DIR}" "${_DRY_RUN}"
+    done
   fi
 
   #######################################
@@ -4209,11 +5459,30 @@ step_10_dl_master_deploy_v621() {
   local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
   local DL_BRIDGE="${DL_BRIDGE:-virbr0}"
   local DL_IMAGE_DIR="${DL_INSTALL_DIR}/images"
+  local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
 
   local DL_IP="${DL_IP:-192.168.122.2}"
   local DL_NETMASK="${DL_NETMASK:-255.255.255.0}"
   local DL_GW="${DL_GW:-192.168.122.1}"
   local DL_DNS="${DL_DNS:-8.8.8.8}"
+
+  ############################################################
+  # Cleanup existing DL cluster VMs (dl-*)
+  ############################################################
+  local -a cluster_vms
+  mapfile -t cluster_vms < <(list_dl_domains)
+  if [[ ${#cluster_vms[@]} -gt 0 ]]; then
+    local vm_list_str
+    vm_list_str=$(printf '%s\n' "${cluster_vms[@]}")
+    if ! confirm_destroy_vm_batch "STEP 10 - DL deploy" "${vm_list_str}" "DL"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Redeploy canceled by user. Skipping."
+      return 0
+    fi
+    local vm
+    for vm in "${cluster_vms[@]}"; do
+      cleanup_dl_da_vm_and_images "${vm}" "${DL_INSTALL_DIR}" "${DA_INSTALL_DIR}" "${_DRY_RUN}"
+    done
+  fi
 
   # DP_VERSION check
   local _DP_VERSION="${DP_VERSION:-}"
@@ -4503,11 +5772,30 @@ step_11_da_master_deploy_v621() {
   local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
   local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
   local DA_IMAGE_DIR="${DA_INSTALL_DIR}/images"
+  local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
 
   local DA_IP="${DA_IP:-192.168.122.3}"
   local DA_NETMASK="${DA_NETMASK:-255.255.255.0}"
   local DA_GW="${DA_GW:-192.168.122.1}"
   local DA_DNS="${DA_DNS:-8.8.8.8}"
+
+  ############################################################
+  # Cleanup existing DA cluster VMs (da-*)
+  ############################################################
+  local -a cluster_vms
+  mapfile -t cluster_vms < <(list_da_domains)
+  if [[ ${#cluster_vms[@]} -gt 0 ]]; then
+    local vm_list_str
+    vm_list_str=$(printf '%s\n' "${cluster_vms[@]}")
+    if ! confirm_destroy_vm_batch "STEP 11 - DA Deployment" "${vm_list_str}" "DA"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Redeploy canceled by user. Skipping."
+      return 0
+    fi
+    local vm
+    for vm in "${cluster_vms[@]}"; do
+      cleanup_dl_da_vm_and_images "${vm}" "${DL_INSTALL_DIR}" "${DA_INSTALL_DIR}" "${_DRY_RUN}"
+    done
+  fi
 
   # DP_VERSION check
   local _DP_VERSION="${DP_VERSION:-}"
@@ -4756,6 +6044,637 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
   echo
 }
 
+#######################################
+# STEP 12 - Bridge Mode Attach (v621)
+#######################################
+step_12_bridge_attach_v621() {
+  local STEP_ID="12_bridge_attach"
+
+  echo
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (v621) ====="
+
+  # Load config
+  if type load_config >/dev/null 2>&1; then
+    load_config
+  fi
+
+  local _DRY="${DRY_RUN:-0}"
+  
+  # VM 이름 자동 감지: DL_HOSTNAME/DA_HOSTNAME이 없으면 virsh list에서 찾기
+  local DL_VM="${DL_HOSTNAME:-}"
+  local DA_VM="${DA_HOSTNAME:-}"
+  
+  # DL_VM 자동 감지
+  if [[ -z "${DL_VM}" ]]; then
+    log "[STEP 12 Bridge] DL_HOSTNAME not set, auto-detecting DL VM from virsh list"
+    DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
+    if [[ -n "${DL_VM}" ]]; then
+      log "[STEP 12 Bridge] Auto-detected DL VM: ${DL_VM}"
+    else
+      DL_VM="dl-master"
+      log "[STEP 12 Bridge] No DL VM found, using default: ${DL_VM}"
+    fi
+  fi
+  
+  # DA_VM 자동 감지
+  if [[ -z "${DA_VM}" ]]; then
+    log "[STEP 12 Bridge] DA_HOSTNAME not set, auto-detecting DA VM from virsh list"
+    DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
+    if [[ -n "${DA_VM}" ]]; then
+      log "[STEP 12 Bridge] Auto-detected DA VM: ${DA_VM}"
+    else
+      DA_VM="da-master"
+      log "[STEP 12 Bridge] No DA VM found, using default: ${DA_VM}"
+    fi
+  fi
+  
+  local bridge_name="${CLUSTER_BRIDGE_NAME:-br-cluster}"
+  local cluster_nic="${CLTR0_NIC:-}"
+
+  # Execution start confirmation
+  local start_msg
+  if [[ "${_DRY}" -eq 1 ]]; then
+    start_msg="STEP 12: Bridge Attach + CPU Affinity Configuration (DRY RUN)
+
+This will simulate the following operations:
+  • Bridge interface (${bridge_name}) attach to ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration (CPU pinning)
+  • NUMA memory interleave configuration
+  • DL data disk attach (if applicable)
+  • CD-ROM removal
+
+⚠️  DRY RUN MODE: No actual changes will be made.
+
+Do you want to continue?"
+  else
+    start_msg="STEP 12: Bridge Attach + CPU Affinity Configuration
+
+This will perform the following operations:
+  • Attach bridge interface (${bridge_name}) to ${DL_VM} and ${DA_VM}
+  • Configure CPU pinning (CPU Affinity)
+  • Apply NUMA memory interleave configuration
+  • Attach DL data disk (if applicable)
+  • Remove CD-ROM devices
+
+⚠️  IMPORTANT: VMs will be shut down during this process.
+
+Do you want to continue?"
+  fi
+
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 18 85)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "${start_msg}")
+
+  if ! whiptail --title "STEP 12 Execution Confirmation" \
+                --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+  then
+    log "User canceled STEP 12 execution."
+    return 0
+  fi
+
+  ###########################################################################
+  # 1. DL/DA VM shutdown (wait until completely shut down)
+  ###########################################################################
+  log "[STEP 12 Bridge] Requesting DL/DA VM shutdown"
+
+  for vm in "${DL_VM}" "${DA_VM}"; do
+    if virsh dominfo "${vm}" >/dev/null 2>&1; then
+      local state
+      state="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
+      if [[ "${state}" != "shut off" ]]; then
+        log "[STEP 12 Bridge] Requesting shutdown of ${vm}"
+        if [[ "${_DRY}" -eq 1 ]]; then
+          log "[DRY-RUN] virsh shutdown ${vm}"
+        else
+          virsh shutdown "${vm}" || log "[WARN] ${vm} shutdown failed (continuing anyway)"
+        fi
+      else
+        log "[STEP 12 Bridge] ${vm} is already in shut off state"
+      fi
+    else
+      log "[STEP 12 Bridge] ${vm} VM not found → skipping shutdown"
+    fi
+  done
+
+  local timeout=180
+  local interval=5
+  local elapsed=0
+
+  while (( elapsed < timeout )); do
+    local all_off=1
+    for vm in "${DL_VM}" "${DA_VM}"; do
+      if virsh dominfo "${vm}" >/dev/null 2>&1; then
+        local st
+        st="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
+        if [[ "${st}" != "shut off" ]]; then
+          all_off=0
+        fi
+      fi
+    done
+
+    if (( all_off )); then
+      log "[STEP 12 Bridge] All DL/DA VMs are now in shut off state."
+      break
+    fi
+
+    sleep "${interval}"
+    (( elapsed += interval ))
+  done
+
+  if (( elapsed >= timeout )); then
+    log "[WARN] [STEP 12 Bridge] Some VMs did not shut off within timeout(${timeout}s). Continuing anyway."
+  fi
+
+  ###########################################################################
+  # 2. CD-ROM removal (detach all CD-ROM devices)
+  ###########################################################################
+  _list_non_seed_cdrom_targets() {
+    local vm="$1"
+    # Extract cdrom disk sections, exclude seed ISO (required for Cloud-Init)
+    # Process each CD-ROM section: if it contains seed ISO, skip it
+    virsh dumpxml "${vm}" --inactive 2>/dev/null \
+      | grep -B 5 -A 10 -E "device=['\"]cdrom['\"]" \
+      | awk '
+        BEGIN { in_cdrom=0; is_seed=0; target_dev="" }
+        /device=['\''"]cdrom['\''"]/ { in_cdrom=1; is_seed=0; target_dev="" }
+        /<source.*-seed\.iso/ { is_seed=1 }
+        /<target/ {
+          if (match($0, /dev=['\''"]([^'\''"]*)['\''"]/, arr)) {
+            target_dev=arr[1]
+          }
+        }
+        /<\/disk>/ {
+          if (in_cdrom && !is_seed && target_dev != "") {
+            print target_dev
+          }
+          in_cdrom=0
+          is_seed=0
+          target_dev=""
+        }
+      ' | sort -u
+  }
+
+  _detach_all_cdroms_config() {
+    local vm="$1"
+    [[ -n "${vm}" ]] || return 0
+    virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
+
+    # Get only non-seed CD-ROM devices (seed ISO is required for Cloud-Init)
+    local devs
+    devs="$(_list_non_seed_cdrom_targets "${vm}" || true)"
+    [[ -n "${devs}" ]] || return 0
+
+    local dev
+    while IFS= read -r dev; do
+      [[ -n "${dev}" ]] || continue
+      if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] virsh detach-disk ${vm} ${dev} --config"
+      else
+        virsh detach-disk "${vm}" "${dev}" --config >/dev/null 2>&1 || true
+        log "[STEP 12 Bridge] ${vm}: CD-ROM(${dev}) detach attempt completed (seed ISO preserved)"
+      fi
+    done <<< "${devs}"
+  }
+
+  _detach_all_cdroms_config "${DL_VM}"
+  _detach_all_cdroms_config "${DA_VM}"
+
+  ###########################################################################
+  # 2.2. Detach all hostdev devices (SR-IOV remnants)
+  ###########################################################################
+  _detach_all_hostdevs_config() {
+    local vm="$1"
+    [[ -n "${vm}" ]] || return 0
+    virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
+
+    local xml tmpdir files
+    xml="$(virsh dumpxml "${vm}" --inactive 2>/dev/null || true)"
+    [[ -n "${xml}" ]] || return 0
+
+    tmpdir="$(mktemp -d)"
+    echo "${xml}" | awk -v dir="${tmpdir}" '
+      /<hostdev / { in_block=1; c++; file=dir "/hostdev_" c ".xml" }
+      in_block { print > file }
+      /<\/hostdev>/ { in_block=0 }
+    '
+
+    files="$(ls -1 "${tmpdir}"/hostdev_*.xml 2>/dev/null || true)"
+    if [[ -z "${files}" ]]; then
+      rm -rf "${tmpdir}"
+      return 0
+    fi
+
+    local f
+    for f in ${files}; do
+      if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] virsh detach-device ${vm} ${f} --config"
+      else
+        if virsh detach-device "${vm}" "${f}" --config >/dev/null 2>&1; then
+          log "[STEP 12 Bridge] ${vm}: hostdev detach (--config) completed"
+        else
+          log "[WARN] ${vm}: hostdev detach failed (config)"
+        fi
+      fi
+    done
+
+    rm -rf "${tmpdir}"
+  }
+
+  _detach_all_hostdevs_config "${DL_VM}"
+  _detach_all_hostdevs_config "${DA_VM}"
+
+  ###########################################################################
+  # 2.5. Bridge runtime creation/UP guarantee (NO-CARRIER allowed)
+  # VM attach 직전에 bridge를 런타임으로 생성/UP 보장
+  ###########################################################################
+  log "[STEP 12 Bridge] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
+
+  if ! ensure_bridge_up_no_carrier_ok "${bridge_name}" "${cluster_nic}"; then
+    log "[ERROR] Failed to ensure bridge ${bridge_name} is ready for VM attach"
+    whiptail_msgbox "STEP 12 - Bridge Mode Error" \
+      "Failed to ensure bridge ${bridge_name} is ready for VM attach.\n\nPlease check bridge configuration and permissions." \
+      12 80
+    return 1
+  fi
+
+  ###########################################################################
+  # 3. Bridge attach (virsh attach-interface --type bridge)
+  ###########################################################################
+  _attach_bridge_to_vm() {
+    local vm="$1"
+    local bridge="$2"
+
+    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    # Check if bridge interface is already attached
+    if virsh dumpxml "${vm}" 2>/dev/null | grep -q "source bridge='${bridge}'"; then
+      log "[STEP 12 Bridge] ${vm}: Bridge ${bridge} is already attached → skipping"
+      return 0
+    fi
+
+    if [[ "${_DRY}" -eq 1 ]]; then
+      log "[DRY-RUN] virsh attach-interface ${vm} --type bridge --source ${bridge} --model virtio --config"
+    else
+      local out
+      if ! out="$(virsh attach-interface "${vm}" --type bridge --source "${bridge}" --model virtio --config 2>&1)"; then
+        log "[ERROR] ${vm}: virsh attach-interface failed (bridge=${bridge})"
+        log "[ERROR] virsh message:"
+        while IFS= read -r line; do
+          log "  ${line}"
+        done <<< "${out}"
+        return 1
+      else
+        log "[STEP 12 Bridge] ${vm}: Bridge ${bridge} attach (--config) completed"
+      fi
+    fi
+  }
+
+  _attach_bridge_to_vm "${DL_VM}" "${bridge_name}"
+  _attach_bridge_to_vm "${DA_VM}" "${bridge_name}"
+
+  ###########################################################################
+  # 4. CPU Affinity (virsh vcpupin --config)
+  ###########################################################################
+  # Check NUMA node count - skip CPU Affinity if only 1 NUMA node exists
+  local numa_node_count
+  numa_node_count=$(lscpu 2>/dev/null | grep -i "NUMA node(s)" | awk '{print $3}' || echo "0")
+  
+  if [[ -z "${numa_node_count}" ]] || [[ "${numa_node_count}" == "0" ]]; then
+    # Fallback: try numactl if available
+    if command -v numactl >/dev/null 2>&1; then
+      numa_node_count=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+    else
+      numa_node_count="1"
+    fi
+  fi
+  
+  if [[ "${numa_node_count}" == "1" ]]; then
+    log "[STEP 12 Bridge] System has only 1 NUMA node → skipping CPU Affinity configuration"
+  else
+    local DL_CPUS_LIST=""
+    local DA_CPUS_LIST=""
+
+    # DL: even CPUs 4,6,...,86
+    local c
+    for (( c=4; c<=86; c+=2 )); do
+      DL_CPUS_LIST+="${c} "
+    done
+
+    # DA: odd CPUs 5,7,...,95
+    for (( c=5; c<=95; c+=2 )); do
+      DA_CPUS_LIST+="${c} "
+    done
+
+    _apply_cpu_affinity_vm() {
+      local vm="$1"
+      local cpus_list="$2"
+
+      if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+        return 0
+      fi
+      [[ -n "${cpus_list}" ]] || return 0
+
+      # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
+      local max_vcpus
+      max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
+
+      if [[ "${max_vcpus}" -eq 0 ]]; then
+        log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
+        return 0
+      fi
+
+      # Convert cpus_list to array
+      local arr=()
+      for c in ${cpus_list}; do
+        arr+=("${c}")
+      done
+
+      if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
+        log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
+        max_vcpus="${#arr[@]}"
+      fi
+
+      local i
+      for (( i=0; i<max_vcpus; i++ )); do
+        local pcpu="${arr[$i]}"
+        if [[ "${_DRY}" -eq 1 ]]; then
+          log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
+        else
+          if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+            log "[STEP 12 Bridge] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+          else
+            log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+          fi
+        fi
+      done
+    }
+
+    _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
+    _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+  fi
+
+  ###########################################################################
+  # 5. NUMA memory interleave (virsh numatune --config)
+  ###########################################################################
+  _apply_numatune_vm() {
+    local vm="$1"
+    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if [[ "${_DRY}" -eq 1 ]]; then
+      log "[DRY-RUN] virsh numatune ${vm} --mode interleave --nodeset 0-1 --config"
+    else
+      if virsh numatune "${vm}" --mode interleave --nodeset 0-1 --config >/dev/null 2>&1; then
+        log "[STEP 12 Bridge] ${vm}: numatune mode=interleave nodeset=0-1 (--config) applied"
+      else
+        log "[WARN] ${vm}: numatune configuration failed (version/option may not be supported)"
+      fi
+    fi
+  }
+
+  _apply_numatune_vm "${DL_VM}"
+  _apply_numatune_vm "${DA_VM}"
+
+  ###########################################################################
+  # 6. DL data disk (LV) attach (vg_dl/lv_dl → vdb, --config)
+  ###########################################################################
+  local DATA_LV="/dev/mapper/vg_dl-lv_dl"
+
+  # Helper: extract the full <disk>...</disk> XML block that contains target dev='vdb'
+  # NOTE: In libvirt XML, <source ...> often appears BEFORE <target ...>,
+  # so parsing with `grep -A ... "target dev='vdb'"` is unreliable.
+  # Args:
+  #   $1: vm name
+  #   $2: 0=live XML, 1=inactive XML
+  get_vdb_disk_block() {
+    local vm_name="$1"
+    local inactive="${2:-0}"
+    if [[ -z "${vm_name}" ]]; then
+      return 1
+    fi
+
+    local dump_cmd=(virsh dumpxml "${vm_name}")
+    if [[ "${inactive}" -eq 1 ]]; then
+      dump_cmd+=(--inactive)
+    fi
+
+    "${dump_cmd[@]}" 2>/dev/null | awk '
+      BEGIN { in_disk=0; buf="" }
+      /<disk[ >]/ { in_disk=1; buf=$0 ORS; next }
+      in_disk {
+        buf = buf $0 ORS
+        if ($0 ~ /<\/disk>/) {
+          if (buf ~ /<target[[:space:]]+dev=.vdb./) { print buf; exit }
+          in_disk=0; buf=""
+        }
+      }
+    '
+  }
+
+  if [[ -e "${DATA_LV}" ]]; then
+    if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+      if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
+      else
+        if [[ -n "$(get_vdb_disk_block "${DL_VM}" 0 || true)" ]]; then
+          log "[STEP 12 Bridge] ${DL_VM} vdb already exists → skipping data disk attach"
+        else
+          if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+            log "[STEP 12 Bridge] ${DL_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+          else
+            log "[WARN] ${DL_VM} data disk(${DATA_LV}) attach failed"
+          fi
+        fi
+      fi
+    else
+      log "[STEP 12 Bridge] ${DL_VM} VM not found → skipping DL data disk attach"
+    fi
+  else
+    log "[STEP 12 Bridge] ${DATA_LV} does not exist; skipping DL data disk attach."
+  fi
+
+  ###########################################################################
+  # 7. DL/DA VM restart
+  ###########################################################################
+  ensure_vm_bridges_ready() {
+    local vm_name="$1"
+    local bridges
+    if ! virsh dominfo "${vm_name}" >/dev/null 2>&1; then
+      return 0
+    fi
+    bridges="$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -o "bridge='[^']*'" | cut -d"'" -f2 | sort -u || true)"
+    if [[ -z "${bridges}" ]]; then
+      return 0
+    fi
+    local br
+    for br in ${bridges}; do
+      if ! ip link show dev "${br}" >/dev/null 2>&1; then
+        log "[STEP 12 Bridge] Bridge ${br} required by ${vm_name} but missing; creating it"
+        ensure_bridge_up_no_carrier_ok "${br}" "" || return 1
+      fi
+    done
+    return 0
+  }
+
+  ensure_vm_bridges_ready "${DL_VM}" || return 1
+  ensure_vm_bridges_ready "${DA_VM}" || return 1
+
+  for vm in "${DL_VM}" "${DA_VM}"; do
+    if virsh dominfo "${vm}" >/dev/null 2>&1; then
+      log "[STEP 12 Bridge] ${vm} start request"
+      (( _DRY )) || virsh start "${vm}" || log "[WARN] ${vm} start failed"
+    fi
+  done
+
+  # Wait 5 seconds after VM start
+  if [[ "${_DRY}" -eq 0 ]]; then
+    log "[STEP 12 Bridge] Waiting 5 seconds after DL/DA VM start (vCPU state stabilization)"
+    sleep 5
+  fi
+
+  ###########################################################################
+  # 8. Basic verification results
+  ###########################################################################
+  local result_file="/tmp/step12_bridge_result.txt"
+  rm -f "${result_file}"
+
+  if [[ "${_DRY}" -eq 1 ]]; then
+    {
+      echo "===== DRY-RUN MODE: Simulation Results ====="
+      echo
+      echo "📊 SIMULATED OPERATIONS:"
+      echo "  • Bridge interface attach to ${DL_VM} and ${DA_VM}"
+      echo "  • CPU Affinity configuration"
+      echo "  • NUMA memory interleave configuration"
+      echo "  • DL data disk attach (if applicable)"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. Bridge ${bridge_name} would be attached to ${DL_VM} and ${DA_VM}"
+      echo "  2. CPU pinning would be applied"
+      echo "  3. NUMA configuration would be applied"
+      echo "  4. Data disk would be attached to ${DL_VM} (if available)"
+      echo
+      echo "📋 EXPECTED CONFIGURATION:"
+      echo "  • Bridge: ${bridge_name}"
+      echo "  • DL VM: ${DL_VM}"
+      echo "  • DA VM: ${DA_VM}"
+    } > "${result_file}"
+  else
+    {
+      echo "===== DL vcpuinfo (${DL_VM}) ====="
+      if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+        virsh vcpuinfo "${DL_VM}" 2>&1
+      else
+        echo "VM ${DL_VM} not found"
+      fi
+      echo
+      echo "===== DA vcpuinfo (${DA_VM}) ====="
+      if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
+        virsh vcpuinfo "${DA_VM}" 2>&1
+      else
+        echo "VM ${DA_VM} not found"
+      fi
+      echo
+      echo "===== DL bridge interface (${DL_VM}) ====="
+      if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+        virsh dumpxml "${DL_VM}" | grep -A 5 "source bridge='${bridge_name}'" || echo "Bridge ${bridge_name} not found in XML"
+      else
+        echo "VM ${DL_VM} not found"
+      fi
+      echo
+      echo "===== DA bridge interface (${DA_VM}) ====="
+      if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
+        virsh dumpxml "${DA_VM}" | grep -A 5 "source bridge='${bridge_name}'" || echo "Bridge ${bridge_name} not found in XML"
+      else
+        echo "VM ${DA_VM} not found"
+      fi
+    } > "${result_file}"
+  fi
+
+  # Execution completion message box
+  local completion_msg
+  if [[ "${_DRY}" -eq 1 ]]; then
+    completion_msg="STEP 12: Bridge Attach + CPU Affinity Configuration (DRY RUN) Completed
+
+✅ Simulation Summary:
+  • Bridge interface (${bridge_name}) attach simulation for ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration simulation
+  • NUMA memory interleave configuration simulation
+  • DL data disk attach simulation (if applicable)
+  • CD-ROM removal simulation
+
+⚠️  DRY RUN MODE: No actual changes were made.
+
+📋 What Would Have Been Applied:
+  • Bridge interface (${bridge_name}) would be attached to VMs
+  • CPU pinning would be configured
+  • NUMA memory interleave would be applied
+  • Data disk would be attached to ${DL_VM} (if available)
+  • CD-ROM devices would be removed
+
+💡 Next Steps:
+  Set DRY_RUN=0 and rerun STEP 12 to apply actual configurations.
+  Detailed simulation results are available in the log."
+  else
+    completion_msg="STEP 12: Bridge Attach + CPU Affinity Configuration Completed
+
+✅ Configuration Summary:
+  • Bridge interface (${bridge_name}) attached to ${DL_VM} and ${DA_VM}
+  • CPU Affinity (CPU pinning) configured
+  • NUMA memory interleave applied
+  • DL data disk attached (if applicable)
+  • CD-ROM devices removed
+
+✅ VMs Status:
+  • ${DL_VM} and ${DA_VM} have been restarted with new configurations
+  • All bridge and CPU affinity settings are now active
+
+📋 Verification:
+  • Check VM CPU pinning: virsh vcpuinfo ${DL_VM}
+  • Check bridge interface: virsh dumpxml ${DL_VM} | grep '${bridge_name}'
+  • Check NUMA configuration: virsh numatune ${DL_VM}
+  • Verify data disk: virsh dumpxml ${DL_VM} | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'
+
+💡 Note:
+  Detailed verification results are shown below.
+  VMs are ready for use with bridge interface and CPU affinity enabled."
+  fi
+
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 22 90)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+  whiptail_msgbox "STEP 12 - Configuration Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
+  if [[ "${_DRY}" -eq 1 ]]; then
+    # Read result file content and display in message box
+    local dry_run_content
+    if [[ -f "${result_file}" ]]; then
+      dry_run_content=$(cat "${result_file}")
+      # Calculate dialog size dynamically
+      local dry_dialog_dims
+      dry_dialog_dims=$(calc_dialog_size 20 90)
+      local dry_dialog_height dry_dialog_width
+      read -r dry_dialog_height dry_dialog_width <<< "${dry_dialog_dims}"
+      whiptail_msgbox "STEP 12 – Bridge Attach / CPU Affinity / DL data LV (DRY-RUN)" "${dry_run_content}" "${dry_dialog_height}" "${dry_dialog_width}"
+    fi
+  else
+    show_paged "STEP 12 – Bridge Attach / CPU Affinity / DL data LV verification results (v621)" "${result_file}" "no-clear"
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (v621) ====="
+  echo
+}
+
 step_12_sriov_cpu_affinity_v621() {
   local STEP_ID="12_sriov_cpu_affinity"
 
@@ -4769,9 +6688,78 @@ step_12_sriov_cpu_affinity_v621() {
 
   local _DRY="${DRY_RUN:-0}"
 
-  # Use hostnames from Step 10/11 (dl-worker1, etc.)
-  local DL_VM="${DL_HOSTNAME:-dl-master}"
-  local DA_VM="${DA_HOSTNAME:-da-master}"
+  # VM 이름 자동 감지: DL_HOSTNAME/DA_HOSTNAME이 없으면 virsh list에서 찾기
+  local DL_VM="${DL_HOSTNAME:-}"
+  local DA_VM="${DA_HOSTNAME:-}"
+  
+  # DL_VM 자동 감지
+  if [[ -z "${DL_VM}" ]]; then
+    log "[STEP 12] DL_HOSTNAME not set, auto-detecting DL VM from virsh list"
+    DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
+    if [[ -n "${DL_VM}" ]]; then
+      log "[STEP 12] Auto-detected DL VM: ${DL_VM}"
+    else
+      DL_VM="dl-master"
+      log "[STEP 12] No DL VM found, using default: ${DL_VM}"
+    fi
+  fi
+  
+  # DA_VM 자동 감지
+  if [[ -z "${DA_VM}" ]]; then
+    log "[STEP 12] DA_HOSTNAME not set, auto-detecting DA VM from virsh list"
+    DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
+    if [[ -n "${DA_VM}" ]]; then
+      log "[STEP 12] Auto-detected DA VM: ${DA_VM}"
+    else
+      DA_VM="da-master"
+      log "[STEP 12] No DA VM found, using default: ${DA_VM}"
+    fi
+  fi
+
+  # Execution start confirmation
+  local start_msg
+  if [[ "${_DRY}" -eq 1 ]]; then
+    start_msg="STEP 12: SR-IOV + CPU Affinity Configuration (DRY RUN)
+
+This will simulate the following operations:
+  • SR-IOV VF PCI passthrough to ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration (CPU pinning)
+  • NUMA memory interleave configuration
+  • DL data disk attach (if applicable)
+  • CD-ROM removal
+
+⚠️  DRY RUN MODE: No actual changes will be made.
+
+Do you want to continue?"
+  else
+    start_msg="STEP 12: SR-IOV + CPU Affinity Configuration
+
+This will perform the following operations:
+  • Attach SR-IOV VF PCI devices to ${DL_VM} and ${DA_VM}
+  • Configure CPU pinning (CPU Affinity)
+  • Apply NUMA memory interleave configuration
+  • Attach DL data disk (if applicable)
+  • Remove CD-ROM devices
+
+⚠️  IMPORTANT: VMs will be shut down during this process.
+
+Do you want to continue?"
+  fi
+
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 18 85)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_msg
+  centered_msg=$(center_message "${start_msg}")
+
+  if ! whiptail --title "STEP 12 Execution Confirmation" \
+                --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+  then
+    log "User canceled STEP 12 execution."
+    return 0
+  fi
 
   # =========================================================================
   # [Moved from Step 10/11] UEFI/XML conversion and partition expansion logic (modified version)
@@ -4926,22 +6914,59 @@ CLOUD
   # - DL: NUMA node0 (even cores) even numbers between 4~86 → 42 cores (4,6,...,86)
   # - DA: NUMA node1 (odd cores) odd numbers between 5~95 → 46 cores (5,7,...,95)
   ###########################################################################
+  # Check NUMA node count - skip CPU list generation if only 1 NUMA node exists
+  local numa_node_count
+  numa_node_count=$(lscpu 2>/dev/null | grep -i "NUMA node(s)" | awk '{print $3}' || echo "0")
+  
+  if [[ -z "${numa_node_count}" ]] || [[ "${numa_node_count}" == "0" ]]; then
+    # Fallback: try numactl if available
+    if command -v numactl >/dev/null 2>&1; then
+      numa_node_count=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+    else
+      numa_node_count="1"
+    fi
+  fi
+  
   local DL_CPUS_LIST=""
   local DA_CPUS_LIST=""
+  
+  if [[ "${numa_node_count}" != "1" ]]; then
+    # DL: even CPUs 4,6,...,86
+    local c
+    for (( c=4; c<=86; c+=2 )); do
+      DL_CPUS_LIST+="${c} "
+    done
 
-  # DL: even CPUs 4,6,...,86
-  local c
-  for (( c=4; c<=86; c+=2 )); do
-    DL_CPUS_LIST+="${c} "
-  done
+    # DA: odd CPUs 5,7,...,95
+    for (( c=5; c<=95; c+=2 )); do
+      DA_CPUS_LIST+="${c} "
+    done
 
-  # DA: odd CPUs 5,7,...,95
-  for (( c=5; c<=95; c+=2 )); do
-    DA_CPUS_LIST+="${c} "
-  done
+    log "[STEP 12] DL CPU LIST: ${DL_CPUS_LIST}"
+    log "[STEP 12] DA CPU LIST: ${DA_CPUS_LIST}"
+  else
+    log "[STEP 12] System has only 1 NUMA node → skipping CPU list generation for CPU Affinity"
+  fi
 
-  log "[STEP 12] DL CPU LIST: ${DL_CPUS_LIST}"
-  log "[STEP 12] DA CPU LIST: ${DA_CPUS_LIST}"
+  ###########################################################################
+  # Cluster Interface Type 분기 처리
+  ###########################################################################
+  local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
+  
+  if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+    log "[STEP 12] Cluster Interface Type: BRIDGE - Executing bridge attach only"
+    step_12_bridge_attach_v621
+    local v621_bridge_rc=$?
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV (v621) ====="
+    echo
+    return ${v621_bridge_rc}
+  elif [[ "${cluster_nic_type}" == "SRIOV" ]]; then
+    log "[STEP 12] Cluster Interface Type: SRIOV - Executing SR-IOV VF passthrough"
+    # Continue with existing SR-IOV logic below
+  else
+    log "[WARN] Unknown CLUSTER_NIC_TYPE: ${cluster_nic_type}, defaulting to SRIOV"
+    # Continue with existing SR-IOV logic below
+  fi
 
   ###########################################################################
   # 1. SR-IOV VF PCI auto-detection
@@ -5026,24 +7051,58 @@ CLOUD
   fi
 
   ###########################################################################
-  # 3. CD-ROM removal (detach-disk hda --config assumed)
+  # 3. CD-ROM removal (detach all CD-ROM devices, except seed ISO)
   ###########################################################################
-  _remove_cdrom() {
+  _list_non_seed_cdrom_targets() {
     local vm="$1"
-    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [[ "${_DRY}" -eq 1 ]]; then
-      log "[DRY-RUN] virsh detach-disk ${vm} hda --config"
-      return 0
-    fi
-    # Ignore failure as it's not critical
-    virsh detach-disk "${vm}" hda --config >/dev/null 2>&1 || true
-    log "[STEP 12] ${vm}: CD-ROM(hda) detach attempt completed"
+    # Extract cdrom disk sections, exclude seed ISO (required for Cloud-Init)
+    # Process each CD-ROM section: if it contains seed ISO, skip it
+    virsh dumpxml "${vm}" --inactive 2>/dev/null \
+      | grep -B 5 -A 10 -E "device=['\"]cdrom['\"]" \
+      | awk '
+        BEGIN { in_cdrom=0; is_seed=0; target_dev="" }
+        /device=['\''"]cdrom['\''"]/ { in_cdrom=1; is_seed=0; target_dev="" }
+        /<source.*-seed\.iso/ { is_seed=1 }
+        /<target/ {
+          if (match($0, /dev=['\''"]([^'\''"]*)['\''"]/, arr)) {
+            target_dev=arr[1]
+          }
+        }
+        /<\/disk>/ {
+          if (in_cdrom && !is_seed && target_dev != "") {
+            print target_dev
+          }
+          in_cdrom=0
+          is_seed=0
+          target_dev=""
+        }
+      ' | sort -u
   }
 
-  _remove_cdrom "${DL_VM}"
-  _remove_cdrom "${DA_VM}"
+  _detach_all_cdroms_config() {
+    local vm="$1"
+    [[ -n "${vm}" ]] || return 0
+    virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
+
+    # Get only non-seed CD-ROM devices (seed ISO is required for Cloud-Init)
+    local devs
+    devs="$(_list_non_seed_cdrom_targets "${vm}" || true)"
+    [[ -n "${devs}" ]] || return 0
+
+    local dev
+    while IFS= read -r dev; do
+      [[ -n "${dev}" ]] || continue
+      if [[ "${_DRY}" -eq 1 ]]; then
+        log "[DRY-RUN] virsh detach-disk ${vm} ${dev} --config"
+      else
+        virsh detach-disk "${vm}" "${dev}" --config >/dev/null 2>&1 || true
+        log "[STEP 12] ${vm}: CD-ROM(${dev}) detach attempt completed (seed ISO preserved)"
+      fi
+    done <<< "${devs}"
+  }
+
+  _detach_all_cdroms_config "${DL_VM}"
+  _detach_all_cdroms_config "${DA_VM}"
 
   ###########################################################################
   # 4. VF PCI hostdev attach (virsh attach-device --config)
@@ -5098,11 +7157,15 @@ EOF
     else
       local out
       if ! out="$(virsh attach-device "${vm}" "${tmp_xml}" --config 2>&1)"; then
-        log "[ERROR] ${vm}: virsh attach-device failed (PCI=${pci})"
-        log "[ERROR] virsh message:"
-        while IFS= read -r line; do
-          log "  ${line}"
-        done <<< "${out}"
+        if echo "${out}" | grep -q "already in the domain configuration"; then
+          log "[STEP 12] ${vm}: VF PCI(${pci}) already attached → skipping"
+        else
+          log "[ERROR] ${vm}: virsh attach-device failed (PCI=${pci})"
+          log "[ERROR] virsh message:"
+          while IFS= read -r line; do
+            log "  ${line}"
+          done <<< "${out}"
+        fi
       else
         log "[STEP 12] ${vm}: VF PCI(${pci}) hostdev attach (--config) completed"
       fi
@@ -5115,53 +7178,70 @@ EOF
   ###########################################################################
   # 5. CPU Affinity (virsh vcpupin --config)
   ###########################################################################
-  _apply_cpu_affinity_vm() {
-    local vm="$1"
-    local cpus_list="$2"
-
-    if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
-      return 0
+  # Check NUMA node count - skip CPU Affinity if only 1 NUMA node exists
+  local numa_node_count
+  numa_node_count=$(lscpu 2>/dev/null | grep -i "NUMA node(s)" | awk '{print $3}' || echo "0")
+  
+  if [[ -z "${numa_node_count}" ]] || [[ "${numa_node_count}" == "0" ]]; then
+    # Fallback: try numactl if available
+    if command -v numactl >/dev/null 2>&1; then
+      numa_node_count=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+    else
+      numa_node_count="1"
     fi
-    [[ -n "${cpus_list}" ]] || return 0
+  fi
+  
+  if [[ "${numa_node_count}" == "1" ]]; then
+    log "[STEP 12] System has only 1 NUMA node → skipping CPU Affinity configuration"
+  else
+    _apply_cpu_affinity_vm() {
+      local vm="$1"
+      local cpus_list="$2"
 
-    # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
-    local max_vcpus
-    max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
-
-    if [[ "${max_vcpus}" -eq 0 ]]; then
-      log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
-      return 0
-    fi
-
-    # Convert cpus_list to array
-    local arr=()
-    local c
-    for c in ${cpus_list}; do
-      arr+=("${c}")
-    done
-
-    if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
-      log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
-      max_vcpus="${#arr[@]}"
-    fi
-
-    local i
-    for (( i=0; i<max_vcpus; i++ )); do
-      local pcpu="${arr[$i]}"
-      if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
-      else
-        if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-          log "[STEP 12] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-        else
-          log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-        fi
+      if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+        return 0
       fi
-    done
-  }
+      [[ -n "${cpus_list}" ]] || return 0
 
-  _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
-  _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+      # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
+      local max_vcpus
+      max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
+
+      if [[ "${max_vcpus}" -eq 0 ]]; then
+        log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
+        return 0
+      fi
+
+      # Convert cpus_list to array
+      local arr=()
+      local c
+      for c in ${cpus_list}; do
+        arr+=("${c}")
+      done
+
+      if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
+        log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
+        max_vcpus="${#arr[@]}"
+      fi
+
+      local i
+      for (( i=0; i<max_vcpus; i++ )); do
+        local pcpu="${arr[$i]}"
+        if [[ "${_DRY}" -eq 1 ]]; then
+          log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
+        else
+          if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+            log "[STEP 12] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+          else
+            log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+          fi
+        fi
+      done
+    }
+
+    _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
+    _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+  fi
 
   ###########################################################################
   # 6. NUMA memory interleave (virsh numatune --config)
@@ -5191,12 +7271,43 @@ EOF
   ###########################################################################
   local DATA_LV="/dev/mapper/vg_dl-lv_dl"
 
+  # Helper: extract the full <disk>...</disk> XML block that contains target dev='vdb'
+  # NOTE: In libvirt XML, <source ...> often appears BEFORE <target ...>,
+  # so parsing with `grep -A ... "target dev='vdb'"` is unreliable.
+  # Args:
+  #   $1: vm name
+  #   $2: 0=live XML, 1=inactive XML
+  get_vdb_disk_block() {
+    local vm_name="$1"
+    local inactive="${2:-0}"
+    if [[ -z "${vm_name}" ]]; then
+      return 1
+    fi
+
+    local dump_cmd=(virsh dumpxml "${vm_name}")
+    if [[ "${inactive}" -eq 1 ]]; then
+      dump_cmd+=(--inactive)
+    fi
+
+    "${dump_cmd[@]}" 2>/dev/null | awk '
+      BEGIN { in_disk=0; buf="" }
+      /<disk[ >]/ { in_disk=1; buf=$0 ORS; next }
+      in_disk {
+        buf = buf $0 ORS
+        if ($0 ~ /<\/disk>/) {
+          if (buf ~ /<target[[:space:]]+dev=.vdb./) { print buf; exit }
+          in_disk=0; buf=""
+        }
+      }
+    '
+  }
+
   if [[ -e "${DATA_LV}" ]]; then
     if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
       if [[ "${_DRY}" -eq 1 ]]; then
         log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
       else
-        if virsh dumpxml "${DL_VM}" | grep -q "target dev='vdb'"; then
+        if [[ -n "$(get_vdb_disk_block "${DL_VM}" 0 || true)" ]]; then
           log "[STEP 12] ${DL_VM} vdb already exists → skipping data disk attach"
         else
           if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
@@ -5232,10 +7343,36 @@ EOF
   ###########################################################################
   # 9. Basic verification results
   ###########################################################################
-  if [[ "${_DRY}" -eq 0 ]]; then
-    local result_file="/tmp/step12_result.txt"
-    rm -f "${result_file}"
+  local result_file="/tmp/step12_result.txt"
+  rm -f "${result_file}"
 
+  if [[ "${_DRY}" -eq 1 ]]; then
+    {
+      echo "===== DRY-RUN MODE: Simulation Results ====="
+      echo
+      echo "📊 SIMULATED OPERATIONS:"
+      echo "  • SR-IOV VF PCI passthrough to ${DL_VM} and ${DA_VM}"
+      echo "  • CPU Affinity configuration"
+      echo "  • NUMA memory interleave configuration"
+      echo "  • DL data disk attach (if applicable)"
+      echo
+      echo "ℹ️  In real execution mode, the following would occur:"
+      echo "  1. SR-IOV VF PCI devices would be attached to ${DL_VM} and ${DA_VM}"
+      echo "  2. CPU pinning would be applied"
+      echo "  3. NUMA configuration would be applied"
+      echo "  4. Data disk would be attached to ${DL_VM} (if available)"
+      echo
+      echo "📋 EXPECTED CONFIGURATION:"
+      echo "  • DL VM: ${DL_VM}"
+      echo "  • DA VM: ${DA_VM}"
+      if [[ -n "${DL_VF:-}" ]]; then
+        echo "  • DL VF PCI: ${DL_VF}"
+      fi
+      if [[ -n "${DA_VF:-}" ]]; then
+        echo "  • DA VF PCI: ${DA_VF}"
+      fi
+    } > "${result_file}"
+  else
     {
       echo "===== DL vcpuinfo (${DL_VM}) ====="
       if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
@@ -5256,7 +7393,8 @@ EOF
       echo "===== DL XML (cputune / numatune / hostdev / vdb) ====="
       if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
         virsh dumpxml "${DL_VM}" 2>/dev/null | \
-          grep -E 'cputune|numatune|hostdev|target dev='\''vdb'\''' || true
+          grep -E 'cputune|numatune|hostdev' || true
+        get_vdb_disk_block "${DL_VM}" 0 2>/dev/null || true
       else
         echo "VM ${DL_VM} not found"
       fi
@@ -5271,8 +7409,79 @@ EOF
       fi
       echo
     } > "${result_file}"
+  fi
 
-    show_paged "STEP 12 – SR-IOV / CPU Affinity / DL data LV verification results (v621)" "${result_file}"
+  # Execution completion message box
+  local completion_msg
+  if [[ "${_DRY}" -eq 1 ]]; then
+    completion_msg="STEP 12: SR-IOV + CPU Affinity Configuration (DRY RUN) Completed
+
+✅ Simulation Summary:
+  • SR-IOV VF PCI passthrough simulation for ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration simulation
+  • NUMA memory interleave configuration simulation
+  • DL data disk attach simulation (if applicable)
+  • CD-ROM removal simulation
+
+⚠️  DRY RUN MODE: No actual changes were made.
+
+📋 What Would Have Been Applied:
+  • SR-IOV VF PCI devices would be attached to VMs
+  • CPU pinning would be configured
+  • NUMA memory interleave would be applied
+  • Data disk would be attached to ${DL_VM} (if available)
+  • CD-ROM devices would be removed
+
+💡 Next Steps:
+  Set DRY_RUN=0 and rerun STEP 12 to apply actual configurations.
+  Detailed simulation results are available in the log."
+  else
+    completion_msg="STEP 12: SR-IOV + CPU Affinity Configuration Completed
+
+✅ Configuration Summary:
+  • SR-IOV VF PCI passthrough applied to ${DL_VM} and ${DA_VM}
+  • CPU Affinity (CPU pinning) configured
+  • NUMA memory interleave applied
+  • DL data disk attached (if applicable)
+  • CD-ROM devices removed
+
+✅ VMs Status:
+  • ${DL_VM} and ${DA_VM} have been restarted with new configurations
+  • All SR-IOV and CPU affinity settings are now active
+
+📋 Verification:
+  • Check VM CPU pinning: virsh vcpuinfo ${DL_VM}
+  • Check SR-IOV devices: virsh dumpxml ${DL_VM} | grep hostdev
+  • Check NUMA configuration: virsh numatune ${DL_VM}
+  • Verify data disk: virsh dumpxml ${DL_VM} | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'
+
+💡 Note:
+  Detailed verification results are shown below.
+  VMs are ready for use with SR-IOV and CPU affinity enabled."
+  fi
+
+  # Calculate dialog size dynamically
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 22 90)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+  whiptail_msgbox "STEP 12 - Configuration Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
+  if [[ "${_DRY}" -eq 1 ]]; then
+    # Read result file content and display in message box
+    local dry_run_content
+    if [[ -f "${result_file}" ]]; then
+      dry_run_content=$(cat "${result_file}")
+      # Calculate dialog size dynamically
+      local dry_dialog_dims
+      dry_dialog_dims=$(calc_dialog_size 20 90)
+      local dry_dialog_height dry_dialog_width
+      read -r dry_dialog_height dry_dialog_width <<< "${dry_dialog_dims}"
+      whiptail_msgbox "STEP 12 – SR-IOV / CPU Affinity / DL data LV (DRY-RUN)" "${dry_run_content}" "${dry_dialog_height}" "${dry_dialog_width}"
+    fi
+  else
+    show_paged "STEP 12 – SR-IOV / CPU Affinity / DL data LV verification results (v621)" "${result_file}" "no-clear"
   fi
 
   ###########################################################################
@@ -5850,6 +8059,99 @@ Proceed with redeploy?"
   return 0
 }
 
+list_dl_domains() {
+  virsh list --all --name 2>/dev/null | awk 'NF' | grep -E '^dl-' || true
+}
+
+list_da_domains() {
+  virsh list --all --name 2>/dev/null | awk 'NF' | grep -E '^da-' || true
+}
+
+confirm_destroy_vm_batch() {
+  local step_name="$1"
+  local vm_list="$2"
+  local cluster_label="$3"
+  local label="${cluster_label:-DL/DA}"
+
+  if [[ -z "${vm_list}" ]]; then
+    return 0
+  fi
+
+  local msg="The following ${label} VMs are defined:\n\
+${vm_list}\n\
+\n\
+If you continue:\n\
+  - All listed VMs will be destroyed and undefined\n\
+  - Their disk image files (raw/log and VM directories) will be deleted\n\
+\n\
+This can heavily impact a running cluster (${label} service).\n\
+\n\
+Proceed with redeploy?"
+
+  if command -v whiptail >/dev/null 2>&1; then
+      # Temporarily disable set -e to handle cancel gracefully
+      set +e
+      whiptail_yesno "${step_name} - ${label} cluster redeploy confirmation" "${msg}"
+      local confirm_rc=$?
+      set -e
+      
+      if [[ ${confirm_rc} -ne 0 ]]; then
+          log "[${step_name}] Redeploy canceled by user."
+          return 1
+      fi
+  else
+    echo
+    echo "====================================================="
+    echo " ${step_name}: ${label} cluster redeploy warning"
+    echo "====================================================="
+    echo -e "${msg}"
+    echo
+    read -r -p "Continue? (type yes to proceed) [default: no] : " answer
+    case "${answer}" in
+      yes|y|Y) ;;
+      *)
+        log "[${step_name}] Redeploy canceled by user."
+        return 1
+        ;;
+    esac
+  fi
+}
+
+cleanup_dl_da_vm_and_images() {
+  local vm_name="$1"
+  local dl_install_dir="$2"
+  local da_install_dir="$3"
+  local dry_run="$4"
+
+  local install_dir=""
+  if [[ "${vm_name}" == dl-* ]]; then
+    install_dir="${dl_install_dir}"
+  elif [[ "${vm_name}" == da-* ]]; then
+    install_dir="${da_install_dir}"
+  else
+    return 0
+  fi
+
+  local image_dir="${install_dir}/images"
+  local vm_dir="${image_dir}/${vm_name}"
+  local vm_raw="${image_dir}/${vm_name}.raw"
+  local vm_log="${image_dir}/${vm_name}.log"
+
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "[DRY_RUN] virsh destroy ${vm_name} || true"
+    echo "[DRY_RUN] virsh undefine ${vm_name} --nvram || virsh undefine ${vm_name} || true"
+    echo "[DRY_RUN] rm -rf '${vm_dir}'"
+    echo "[DRY_RUN] rm -f '${vm_raw}' '${vm_log}'"
+  else
+    virsh destroy "${vm_name}" >/dev/null 2>&1 || true
+    virsh undefine "${vm_name}" --nvram >/dev/null 2>&1 || virsh undefine "${vm_name}" >/dev/null 2>&1 || true
+    if [ -d "${vm_dir}" ]; then
+      sudo rm -rf "${vm_dir}" 2>/dev/null || true
+    fi
+    sudo rm -f "${vm_raw}" "${vm_log}" 2>/dev/null || true
+  fi
+}
+
 ###############################################################################
 # DL / DA VM memory setting (GB) – user input
 ###############################################################################
@@ -5944,6 +8246,17 @@ step_10_dl_master_deploy() {
     local DL_GW="${DL_GW:-192.168.122.1}"
     local DL_DNS="${DL_DNS:-8.8.8.8}"
 
+    # Host MGT IP (required by virt_deploy_uvp_centos.sh)
+    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
+    local HOST_MGT_IP
+    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+    if [[ -z "${HOST_MGT_IP}" ]]; then
+        # NAT environment: reuse DL VM IP as local-ip
+        HOST_MGT_IP="${DL_IP}"
+        log "[STEP 10] HOST_MGT_IP empty; using DL_IP (${DL_IP}) for local-ip"
+    fi
+
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
     if [ -z "${_DP_VERSION}" ]; then
@@ -5959,6 +8272,26 @@ step_10_dl_master_deploy() {
 
     # DL image directory (same as STEP 09)
     local DL_IMAGE_DIR="${DL_INSTALL_DIR}/images"
+    # DA install dir for cleanup (DL/DA cluster VMs)
+    local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
+
+    ############################################################
+    # Cleanup existing DL cluster VMs (dl-*)
+    ############################################################
+    local -a cluster_vms
+    mapfile -t cluster_vms < <(list_dl_domains)
+    if [[ ${#cluster_vms[@]} -gt 0 ]]; then
+        local vm_list_str
+        vm_list_str=$(printf '%s\n' "${cluster_vms[@]}")
+        if ! confirm_destroy_vm_batch "STEP 10 - DL deploy" "${vm_list_str}" "DL"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Redeploy canceled by user. Skipping."
+            return 0
+        fi
+        local vm
+        for vm in "${cluster_vms[@]}"; do
+            cleanup_dl_da_vm_and_images "${vm}" "${DL_INSTALL_DIR}" "${DA_INSTALL_DIR}" "${_DRY_RUN}"
+        done
+    fi
 
     ############################################################
     # Clean up all VM directories in /stellar/dl/images/ before deployment
@@ -6164,6 +8497,7 @@ step_10_dl_master_deploy() {
 --hostname=${DL_HOSTNAME} \
 --cluster-size=${DL_CLUSTERSIZE} \
 --release=${_DP_VERSION} \
+--local-ip=${HOST_MGT_IP} \
 --node-role=DL-master \
 --bridge=${DL_BRIDGE} \
 --CPUS=${DL_VCPUS} \
@@ -6184,6 +8518,7 @@ step_10_dl_master_deploy() {
   Hostname      : ${DL_HOSTNAME}
   Cluster size  : ${DL_CLUSTERSIZE}
   DP version    : ${_DP_VERSION}
+  Host MGT IP   : ${HOST_MGT_IP}
   Bridge        : ${DL_BRIDGE}
   vCPU          : ${DL_VCPUS}
   Memory        : ${DL_MEMORY_GB} GB (${DL_MEMORY_MB} MB)
@@ -6333,6 +8668,25 @@ step_11_da_master_deploy() {
     local DA_INSTALL_DIR="${DA_INSTALL_DIR:-/stellar/da}"
     local DA_BRIDGE="${DA_BRIDGE:-virbr0}"
     local DA_IMAGE_DIR="${DA_INSTALL_DIR}/images"
+    local DL_INSTALL_DIR="${DL_INSTALL_DIR:-/stellar/dl}"
+
+    ############################################################
+    # Cleanup existing DA cluster VMs (da-*)
+    ############################################################
+    local -a cluster_vms
+    mapfile -t cluster_vms < <(list_da_domains)
+    if [[ ${#cluster_vms[@]} -gt 0 ]]; then
+        local vm_list_str
+        vm_list_str=$(printf '%s\n' "${cluster_vms[@]}")
+        if ! confirm_destroy_vm_batch "STEP 11 - DA Deployment" "${vm_list_str}" "DA"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Redeploy canceled by user. Skipping."
+            return 0
+        fi
+        local vm
+        for vm in "${cluster_vms[@]}"; do
+            cleanup_dl_da_vm_and_images "${vm}" "${DL_INSTALL_DIR}" "${DA_INSTALL_DIR}" "${_DRY_RUN}"
+        done
+    fi
 
     ############################################################
     # Clean up all VM directories in /stellar/da/images/ before deployment
@@ -6359,6 +8713,17 @@ step_11_da_master_deploy() {
     local DA_NETMASK="${DA_NETMASK:-255.255.255.0}"
     local DA_GW="${DA_GW:-192.168.122.1}"
     local DA_DNS="${DA_DNS:-8.8.8.8}"
+
+    # Host MGT IP (required by virt_deploy_uvp_centos.sh)
+    local MGT_NIC_NAME="${MGT_NIC:-mgt}"
+    local HOST_MGT_IP
+    HOST_MGT_IP="$(ip -o -4 addr show "${MGT_NIC_NAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)"
+
+    if [[ -z "${HOST_MGT_IP}" ]]; then
+        # NAT environment: reuse DA VM IP as local-ip
+        HOST_MGT_IP="${DA_IP}"
+        log "[STEP 11] HOST_MGT_IP empty; using DA_IP (${DA_IP}) for local-ip"
+    fi
 
     # DP_VERSION is managed in config
     local _DP_VERSION="${DP_VERSION:-}"
@@ -6532,10 +8897,11 @@ step_11_da_master_deploy() {
 
     # Build command to execute virt_deploy_uvp_centos.sh
     local CMD
-    CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
+CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
 --hostname=${DA_HOSTNAME} \
 --release=${_DP_VERSION} \
 --cm_fqdn=${CM_FQDN} \
+--local-ip=${HOST_MGT_IP} \
 --node-role=${DA_NODE_ROLE} \
 --bridge=${DA_BRIDGE} \
 --CPUS=${DA_VCPUS} \
@@ -6555,6 +8921,7 @@ step_11_da_master_deploy() {
   Hostname        : ${DA_HOSTNAME}
   DP Version      : ${_DP_VERSION}
   CM FQDN(DL IP)  : ${CM_FQDN}
+  Host MGT IP     : ${HOST_MGT_IP}
   Bridge          : ${DA_BRIDGE}
   node_role       : ${DA_NODE_ROLE}
   vCPU            : ${DA_VCPUS}
@@ -6672,6 +9039,632 @@ EOF
 ###############################################################################
 # STEP 12 – SR-IOV VF Passthrough + CPU Affinity + CD-ROM removal + DL data LV
 ###############################################################################
+#######################################
+# STEP 12 - Bridge Mode Attach (Legacy)
+#######################################
+step_12_bridge_attach_legacy() {
+    local STEP_ID="12_bridge_attach"
+
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (Legacy) ====="
+
+    # Load config
+    if type load_config >/dev/null 2>&1; then
+        load_config
+    fi
+
+    local _DRY="${DRY_RUN:-0}"
+    
+    # VM 이름 자동 감지: DL_HOSTNAME/DL_VM_NAME이 없으면 virsh list에서 찾기
+    local DL_VM="${DL_HOSTNAME:-${DL_VM_NAME:-}}"
+    local DA_VM="${DA_HOSTNAME:-${DA_VM_NAME:-}}"
+    
+    # DL_VM 자동 감지
+    if [[ -z "${DL_VM}" ]]; then
+        log "[STEP 12 Bridge Legacy] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
+        DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
+        if [[ -n "${DL_VM}" ]]; then
+            log "[STEP 12 Bridge Legacy] Auto-detected DL VM: ${DL_VM}"
+        else
+            DL_VM="dl-master"
+            log "[STEP 12 Bridge Legacy] No DL VM found, using default: ${DL_VM}"
+        fi
+    fi
+    
+    # DA_VM 자동 감지
+    if [[ -z "${DA_VM}" ]]; then
+        log "[STEP 12 Bridge Legacy] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
+        DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
+        if [[ -n "${DA_VM}" ]]; then
+            log "[STEP 12 Bridge Legacy] Auto-detected DA VM: ${DA_VM}"
+        else
+            DA_VM="da-master"
+            log "[STEP 12 Bridge Legacy] No DA VM found, using default: ${DA_VM}"
+        fi
+    fi
+    
+    local bridge_name="${CLUSTER_BRIDGE_NAME:-br-cluster}"
+    local cluster_nic="${CLTR0_NIC:-}"
+
+    # Execution start confirmation
+    local start_msg
+    if [[ "${_DRY}" -eq 1 ]]; then
+        start_msg="STEP 12: Bridge Attach + CPU Affinity Configuration (DRY RUN)
+
+This will simulate the following operations:
+  • Bridge interface (${bridge_name}) attach to ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration (CPU pinning)
+  • NUMA memory interleave configuration
+  • DL data disk attach (if applicable)
+  • CD-ROM removal
+
+⚠️  DRY RUN MODE: No actual changes will be made.
+
+Do you want to continue?"
+    else
+        start_msg="STEP 12: Bridge Attach + CPU Affinity Configuration
+
+This will perform the following operations:
+  • Attach bridge interface (${bridge_name}) to ${DL_VM} and ${DA_VM}
+  • Configure CPU pinning (CPU Affinity)
+  • Apply NUMA memory interleave configuration
+  • Attach DL data disk (if applicable)
+  • Remove CD-ROM devices
+
+⚠️  IMPORTANT: VMs will be shut down during this process.
+
+Do you want to continue?"
+    fi
+
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 18 85)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    local centered_msg
+    centered_msg=$(center_message "${start_msg}")
+
+    if ! whiptail --title "STEP 12 Execution Confirmation" \
+                  --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+    then
+        log "User canceled STEP 12 execution."
+        return 0
+    fi
+
+    ###########################################################################
+    # 1. DL/DA VM shutdown (wait until completely shut down)
+    ###########################################################################
+    log "[STEP 12 Bridge] Requesting DL/DA VM shutdown"
+
+    for vm in "${DL_VM}" "${DA_VM}"; do
+        if virsh dominfo "${vm}" >/dev/null 2>&1; then
+            local state
+            state="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
+            if [[ "${state}" != "shut off" ]]; then
+                log "[STEP 12 Bridge] Requesting ${vm} shutdown"
+                (( _DRY )) || virsh shutdown "${vm}" || log "[WARN] ${vm} shutdown failed (continuing anyway)"
+            else
+                log "[STEP 12 Bridge] ${vm} is already in shut off state"
+            fi
+        else
+            log "[STEP 12 Bridge] ${vm} VM not found → skipping shutdown"
+        fi
+    done
+
+    local timeout=180
+    local interval=5
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        local all_off=1
+        for vm in "${DL_VM}" "${DA_VM}"; do
+            if virsh dominfo "${vm}" >/dev/null 2>&1; then
+                local st
+                st="$(virsh dominfo "${vm}" | awk -F': +' '/State/ {print $2}')"
+                if [[ "${st}" != "shut off" ]]; then
+                    all_off=0
+                fi
+            fi
+        done
+
+        if (( all_off )); then
+            log "[STEP 12 Bridge] All DL/DA VMs are now in shut off state."
+            break
+        fi
+
+        sleep "${interval}"
+        (( elapsed += interval ))
+    done
+
+    if (( elapsed >= timeout )); then
+        log "[WARN] [STEP 12 Bridge] Some VMs did not shut off within timeout(${timeout}s). Continuing anyway."
+    fi
+
+    ###########################################################################
+    # 2. CD-ROM removal (detach all CD-ROM devices, except seed ISO)
+    ###########################################################################
+    _list_non_seed_cdrom_targets() {
+        local vm="$1"
+        # Extract cdrom disk sections, exclude seed ISO (required for Cloud-Init)
+        # Process each CD-ROM section: if it contains seed ISO, skip it
+        virsh dumpxml "${vm}" --inactive 2>/dev/null \
+          | grep -B 5 -A 10 -E "device=['\"]cdrom['\"]" \
+          | awk '
+            BEGIN { in_cdrom=0; is_seed=0; target_dev="" }
+            /device=['\''"]cdrom['\''"]/ { in_cdrom=1; is_seed=0; target_dev="" }
+            /<source.*-seed\.iso/ { is_seed=1 }
+            /<target/ {
+              if (match($0, /dev=['\''"]([^'\''"]*)['\''"]/, arr)) {
+                target_dev=arr[1]
+              }
+            }
+            /<\/disk>/ {
+              if (in_cdrom && !is_seed && target_dev != "") {
+                print target_dev
+              }
+              in_cdrom=0
+              is_seed=0
+              target_dev=""
+            }
+          ' | sort -u
+    }
+
+    _detach_all_cdroms_config() {
+        local vm="$1"
+        [[ -n "${vm}" ]] || return 0
+        virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
+
+        # Get only non-seed CD-ROM devices (seed ISO is required for Cloud-Init)
+        local devs
+        devs="$(_list_non_seed_cdrom_targets "${vm}" || true)"
+        [[ -n "${devs}" ]] || return 0
+
+        local dev
+        while IFS= read -r dev; do
+            [[ -n "${dev}" ]] || continue
+            if [[ "${_DRY}" -eq 1 ]]; then
+                log "[DRY-RUN] virsh detach-disk ${vm} ${dev} --config"
+            else
+                virsh detach-disk "${vm}" "${dev}" --config >/dev/null 2>&1 || true
+                log "[STEP 12 Bridge] ${vm}: CD-ROM(${dev}) detach attempt completed (seed ISO preserved)"
+            fi
+        done <<< "${devs}"
+    }
+
+    _detach_all_cdroms_config "${DL_VM}"
+    _detach_all_cdroms_config "${DA_VM}"
+
+    ###########################################################################
+    # 2.2. Detach all hostdev devices (SR-IOV remnants)
+    ###########################################################################
+    _detach_all_hostdevs_config() {
+        local vm="$1"
+        [[ -n "${vm}" ]] || return 0
+        virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
+
+        local xml tmpdir files
+        xml="$(virsh dumpxml "${vm}" --inactive 2>/dev/null || true)"
+        [[ -n "${xml}" ]] || return 0
+
+        tmpdir="$(mktemp -d)"
+        echo "${xml}" | awk -v dir="${tmpdir}" '
+          /<hostdev / { in_block=1; c++; file=dir "/hostdev_" c ".xml" }
+          in_block { print > file }
+          /<\/hostdev>/ { in_block=0 }
+        '
+
+        files="$(ls -1 "${tmpdir}"/hostdev_*.xml 2>/dev/null || true)"
+        if [[ -z "${files}" ]]; then
+            rm -rf "${tmpdir}"
+            return 0
+        fi
+
+        local f
+        for f in ${files}; do
+            if [[ "${_DRY}" -eq 1 ]]; then
+                log "[DRY-RUN] virsh detach-device ${vm} ${f} --config"
+            else
+                if virsh detach-device "${vm}" "${f}" --config >/dev/null 2>&1; then
+                    log "[STEP 12 Bridge] ${vm}: hostdev detach (--config) completed"
+                else
+                    log "[WARN] ${vm}: hostdev detach failed (config)"
+                fi
+            fi
+        done
+
+        rm -rf "${tmpdir}"
+    }
+
+    _detach_all_hostdevs_config "${DL_VM}"
+    _detach_all_hostdevs_config "${DA_VM}"
+
+    ###########################################################################
+    # 2.5. Bridge runtime creation/UP guarantee (NO-CARRIER allowed)
+    # VM attach 직전에 bridge를 런타임으로 생성/UP 보장
+    ###########################################################################
+    log "[STEP 12 Bridge] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
+
+    if ! ensure_bridge_up_no_carrier_ok "${bridge_name}" "${cluster_nic}"; then
+        log "[ERROR] Failed to ensure bridge ${bridge_name} is ready for VM attach"
+        whiptail_msgbox "STEP 12 - Bridge Mode Error" \
+          "Failed to ensure bridge ${bridge_name} is ready for VM attach.\n\nPlease check bridge configuration and permissions." \
+          12 80
+        return 1
+    fi
+
+    ###########################################################################
+    # 3. Bridge attach (virsh attach-interface --type bridge)
+    ###########################################################################
+    _attach_bridge_to_vm() {
+        local vm="$1"
+        local bridge="$2"
+
+        if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        # Check if bridge interface is already attached
+        if virsh dumpxml "${vm}" 2>/dev/null | grep -q "source bridge='${bridge}'"; then
+            log "[STEP 12 Bridge] ${vm}: Bridge ${bridge} is already attached → skipping"
+            return 0
+        fi
+
+        if [[ "${_DRY}" -eq 1 ]]; then
+            log "[DRY-RUN] virsh attach-interface ${vm} --type bridge --source ${bridge} --model virtio --config"
+        else
+            local out
+            if ! out="$(virsh attach-interface "${vm}" --type bridge --source "${bridge}" --model virtio --config 2>&1)"; then
+                log "[ERROR] ${vm}: virsh attach-interface failed (bridge=${bridge})"
+                log "[ERROR] virsh message:"
+                while IFS= read -r line; do
+                    log "  ${line}"
+                done <<< "${out}"
+                return 1
+            else
+                log "[STEP 12 Bridge] ${vm}: Bridge ${bridge} attach (--config) completed"
+            fi
+        fi
+    }
+
+    _attach_bridge_to_vm "${DL_VM}" "${bridge_name}"
+    _attach_bridge_to_vm "${DA_VM}" "${bridge_name}"
+
+    ###########################################################################
+    # 4. CPU Affinity (virsh vcpupin --config)
+    ###########################################################################
+    # Check NUMA node count - skip CPU Affinity if only 1 NUMA node exists
+    local numa_node_count
+    numa_node_count=$(lscpu 2>/dev/null | grep -i "NUMA node(s)" | awk '{print $3}' || echo "0")
+    
+    if [[ -z "${numa_node_count}" ]] || [[ "${numa_node_count}" == "0" ]]; then
+        # Fallback: try numactl if available
+        if command -v numactl >/dev/null 2>&1; then
+            numa_node_count=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+        else
+            numa_node_count="1"
+        fi
+    fi
+    
+    if [[ "${numa_node_count}" == "1" ]]; then
+        log "[STEP 12 Bridge] System has only 1 NUMA node → skipping CPU Affinity configuration"
+    else
+        local DL_CPUS_LIST=""
+        local DA_CPUS_LIST=""
+
+        # DL: even CPUs 4,6,...,86
+        local c
+        for (( c=4; c<=86; c+=2 )); do
+            DL_CPUS_LIST+="${c} "
+        done
+
+        # DA: odd CPUs 5,7,...,95
+        for (( c=5; c<=95; c+=2 )); do
+            DA_CPUS_LIST+="${c} "
+        done
+
+        _apply_cpu_affinity_vm() {
+            local vm="$1"
+            local cpus_list="$2"
+
+            if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+                return 0
+            fi
+            [[ -n "${cpus_list}" ]] || return 0
+
+            # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
+            local max_vcpus
+            max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
+
+            if [[ "${max_vcpus}" -eq 0 ]]; then
+                log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
+                return 0
+            fi
+
+            # Convert cpus_list to array
+            local arr=()
+            for c in ${cpus_list}; do
+                arr+=("${c}")
+            done
+
+            if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
+                log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
+                max_vcpus="${#arr[@]}"
+            fi
+
+            local i
+            for (( i=0; i<max_vcpus; i++ )); do
+                local pcpu="${arr[$i]}"
+                if [[ "${_DRY}" -eq 1 ]]; then
+                    log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
+                else
+                    if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+                        log "[STEP 12 Bridge] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+                    else
+                        log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+                    fi
+                fi
+            done
+        }
+
+        _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
+        _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+    fi
+
+    ###########################################################################
+    # 5. NUMA memory interleave (virsh numatune --config)
+    ###########################################################################
+    _apply_numatune_vm() {
+        local vm="$1"
+        if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if [[ "${_DRY}" -eq 1 ]]; then
+            log "[DRY-RUN] virsh numatune ${vm} --mode interleave --nodeset 0-1 --config"
+        else
+            if virsh numatune "${vm}" --mode interleave --nodeset 0-1 --config >/dev/null 2>&1; then
+                log "[STEP 12 Bridge] ${vm}: numatune mode=interleave nodeset=0-1 (--config) applied"
+            else
+                log "[WARN] ${vm}: numatune configuration failed (version/option may not be supported)"
+            fi
+        fi
+    }
+
+    _apply_numatune_vm "${DL_VM}"
+    _apply_numatune_vm "${DA_VM}"
+
+    ###########################################################################
+    # 6. DL data disk (LV) attach (vg_dl/lv_dl → vdb, --config)
+    ###########################################################################
+    local DATA_LV="/dev/mapper/vg_dl-lv_dl"
+
+    # Helper: extract the full <disk>...</disk> XML block that contains target dev='vdb'
+    # NOTE: In libvirt XML, <source ...> often appears BEFORE <target ...>,
+    # so parsing with `grep -A ... "target dev='vdb'"` is unreliable.
+    # Args:
+    #   $1: vm name
+    #   $2: 0=live XML, 1=inactive XML
+    get_vdb_disk_block() {
+        local vm_name="$1"
+        local inactive="${2:-0}"
+        if [[ -z "${vm_name}" ]]; then
+            return 1
+        fi
+
+        local dump_cmd=(virsh dumpxml "${vm_name}")
+        if [[ "${inactive}" -eq 1 ]]; then
+            dump_cmd+=(--inactive)
+        fi
+
+        "${dump_cmd[@]}" 2>/dev/null | awk '
+            BEGIN { in_disk=0; buf="" }
+            /<disk[ >]/ { in_disk=1; buf=$0 ORS; next }
+            in_disk {
+                buf = buf $0 ORS
+                if ($0 ~ /<\/disk>/) {
+                    if (buf ~ /<target[[:space:]]+dev=.vdb./) { print buf; exit }
+                    in_disk=0; buf=""
+                }
+            }
+        '
+    }
+
+    if [[ -e "${DATA_LV}" ]]; then
+        if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+            if [[ "${_DRY}" -eq 1 ]]; then
+                log "[DRY-RUN] virsh attach-disk ${DL_VM} ${DATA_LV} vdb --config"
+            else
+                if [[ -n "$(get_vdb_disk_block "${DL_VM}" 0 || true)" ]]; then
+                    log "[STEP 12 Bridge] ${DL_VM} vdb already exists → skipping data disk attach"
+                else
+                    if virsh attach-disk "${DL_VM}" "${DATA_LV}" vdb --config >/dev/null 2>&1; then
+                        log "[STEP 12 Bridge] ${DL_VM} data disk(${DATA_LV}) attached as vdb (--config) completed"
+                    else
+                        log "[WARN] ${DL_VM} data disk(${DATA_LV}) attach failed"
+                    fi
+                fi
+            fi
+        else
+            log "[STEP 12 Bridge] ${DL_VM} VM not found → skipping DL data disk attach"
+        fi
+    else
+        log "[STEP 12 Bridge] ${DATA_LV} does not exist; skipping DL data disk attach."
+    fi
+
+    ###########################################################################
+    # 7. DL/DA VM restart
+    ###########################################################################
+    ensure_vm_bridges_ready() {
+        local vm_name="$1"
+        local bridges
+        if ! virsh dominfo "${vm_name}" >/dev/null 2>&1; then
+            return 0
+        fi
+        bridges="$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -o "bridge='[^']*'" | cut -d"'" -f2 | sort -u || true)"
+        if [[ -z "${bridges}" ]]; then
+            return 0
+        fi
+        local br
+        for br in ${bridges}; do
+            if ! ip link show dev "${br}" >/dev/null 2>&1; then
+                log "[STEP 12 Bridge] Bridge ${br} required by ${vm_name} but missing; creating it"
+                ensure_bridge_up_no_carrier_ok "${br}" "" || return 1
+            fi
+        done
+        return 0
+    }
+
+    ensure_vm_bridges_ready "${DL_VM}" || return 1
+    ensure_vm_bridges_ready "${DA_VM}" || return 1
+
+    for vm in "${DL_VM}" "${DA_VM}"; do
+        if virsh dominfo "${vm}" >/dev/null 2>&1; then
+            log "[STEP 12 Bridge] ${vm} start request"
+            (( _DRY )) || virsh start "${vm}" || log "[WARN] ${vm} start failed"
+        fi
+    done
+
+    # Wait 5 seconds after VM start
+    if [[ "${_DRY}" -eq 0 ]]; then
+        log "[STEP 12 Bridge] Waiting 5 seconds after DL/DA VM start (vCPU state stabilization)"
+        sleep 5
+    fi
+
+    ###########################################################################
+    # 8. Basic verification results
+    ###########################################################################
+    local result_file="/tmp/step12_bridge_result.txt"
+    rm -f "${result_file}"
+
+    if [[ "${_DRY}" -eq 1 ]]; then
+        {
+            echo "===== DRY-RUN MODE: Simulation Results ====="
+            echo
+            echo "📊 SIMULATED OPERATIONS:"
+            echo "  • Bridge interface attach to ${DL_VM} and ${DA_VM}"
+            echo "  • CPU Affinity configuration"
+            echo "  • NUMA memory interleave configuration"
+            echo "  • DL data disk attach (if applicable)"
+            echo
+            echo "ℹ️  In real execution mode, the following would occur:"
+            echo "  1. Bridge ${bridge_name} would be attached to ${DL_VM} and ${DA_VM}"
+            echo "  2. CPU pinning would be applied"
+            echo "  3. NUMA configuration would be applied"
+            echo "  4. Data disk would be attached to ${DL_VM} (if available)"
+            echo
+            echo "📋 EXPECTED CONFIGURATION:"
+            echo "  • Bridge: ${bridge_name}"
+            echo "  • DL VM: ${DL_VM}"
+            echo "  • DA VM: ${DA_VM}"
+        } > "${result_file}"
+    else
+        {
+            echo "===== DL vcpuinfo (${DL_VM}) ====="
+            if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+                virsh vcpuinfo "${DL_VM}" 2>&1
+            else
+                echo "VM ${DL_VM} not found"
+            fi
+            echo
+            echo "===== DA vcpuinfo (${DA_VM}) ====="
+            if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
+                virsh vcpuinfo "${DA_VM}" 2>&1
+            else
+                echo "VM ${DA_VM} not found"
+            fi
+            echo
+            echo "===== DL bridge interface (${DL_VM}) ====="
+            if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
+                virsh dumpxml "${DL_VM}" | grep -A 5 "source bridge='${bridge_name}'" || echo "Bridge ${bridge_name} not found in XML"
+            else
+                echo "VM ${DL_VM} not found"
+            fi
+            echo
+            echo "===== DA bridge interface (${DA_VM}) ====="
+            if virsh dominfo "${DA_VM}" >/dev/null 2>&1; then
+                virsh dumpxml "${DA_VM}" | grep -A 5 "source bridge='${bridge_name}'" || echo "Bridge ${bridge_name} not found in XML"
+            else
+                echo "VM ${DA_VM} not found"
+            fi
+        } > "${result_file}"
+    fi
+
+    # Execution completion message box
+    local completion_msg
+    if [[ "${_DRY}" -eq 1 ]]; then
+        completion_msg="STEP 12: Bridge Attach + CPU Affinity Configuration (DRY RUN) Completed
+
+✅ Simulation Summary:
+  • Bridge interface (${bridge_name}) attach simulation for ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration simulation
+  • NUMA memory interleave configuration simulation
+  • DL data disk attach simulation (if applicable)
+  • CD-ROM removal simulation
+
+⚠️  DRY RUN MODE: No actual changes were made.
+
+📋 What Would Have Been Applied:
+  • Bridge interface (${bridge_name}) would be attached to VMs
+  • CPU pinning would be configured
+  • NUMA memory interleave would be applied
+  • Data disk would be attached to ${DL_VM} (if available)
+  • CD-ROM devices would be removed
+
+💡 Next Steps:
+  Set DRY_RUN=0 and rerun STEP 12 to apply actual configurations.
+  Detailed simulation results are available in the log."
+    else
+        completion_msg="STEP 12: Bridge Attach + CPU Affinity Configuration Completed
+
+✅ Configuration Summary:
+  • Bridge interface (${bridge_name}) attached to ${DL_VM} and ${DA_VM}
+  • CPU Affinity (CPU pinning) configured
+  • NUMA memory interleave applied
+  • DL data disk attached (if applicable)
+  • CD-ROM devices removed
+
+✅ VMs Status:
+  • ${DL_VM} and ${DA_VM} have been restarted with new configurations
+  • All bridge and CPU affinity settings are now active
+
+📋 Verification:
+  • Check VM CPU pinning: virsh vcpuinfo ${DL_VM}
+  • Check bridge interface: virsh dumpxml ${DL_VM} | grep '${bridge_name}'
+  • Check NUMA configuration: virsh numatune ${DL_VM}
+  • Verify data disk: virsh dumpxml ${DL_VM} | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'
+
+💡 Note:
+  VMs are ready for use with bridge interface and CPU affinity enabled."
+    fi
+
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 22 90)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+    whiptail_msgbox "STEP 12 - Configuration Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
+    if [[ "${_DRY}" -eq 1 ]]; then
+        # Read result file content and display in message box
+        local dry_run_content
+        if [[ -f "${result_file}" ]]; then
+            dry_run_content=$(cat "${result_file}")
+            # Calculate dialog size dynamically
+            local dry_dialog_dims
+            dry_dialog_dims=$(calc_dialog_size 20 90)
+            local dry_dialog_height dry_dialog_width
+            read -r dry_dialog_height dry_dialog_width <<< "${dry_dialog_dims}"
+            whiptail_msgbox "STEP 12 – Bridge Attach / CPU Affinity / DL data LV (DRY-RUN)" "${dry_run_content}" "${dry_dialog_height}" "${dry_dialog_width}"
+        fi
+    else
+        show_paged "STEP 12 – Bridge Attach / CPU Affinity / DL data LV verification results (Legacy)" "${result_file}" "no-clear"
+    fi
+
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (Legacy) ====="
+    echo
+}
+
 step_12_sriov_cpu_affinity() {
     local STEP_ID="12_sriov_cpu_affinity"
 
@@ -6700,7 +9693,10 @@ step_12_sriov_cpu_affinity() {
     # Compare version (after sanitization)
     if version_ge "${ver}" "6.2.1"; then
       step_12_sriov_cpu_affinity_v621
-      return
+      local v621_rc=$?
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV ====="
+      echo
+      return ${v621_rc}
     fi
     
     # Safety check: if version comparison failed but we're here, log warning
@@ -6710,8 +9706,142 @@ step_12_sriov_cpu_affinity() {
     fi
 
     local _DRY="${DRY_RUN:-0}"
-    local DL_VM="${DL_VM_NAME:-dl-master}"
-    local DA_VM="${DA_VM_NAME:-da-master}"
+    
+    # VM 이름 자동 감지: DL_HOSTNAME/DL_VM_NAME이 없으면 virsh list에서 찾기
+    local DL_VM="${DL_HOSTNAME:-${DL_VM_NAME:-}}"
+    local DA_VM="${DA_HOSTNAME:-${DA_VM_NAME:-}}"
+    
+    # DL_VM 자동 감지
+    if [[ -z "${DL_VM}" ]]; then
+        log "[STEP 12 Legacy] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
+        DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
+        if [[ -n "${DL_VM}" ]]; then
+            log "[STEP 12 Legacy] Auto-detected DL VM: ${DL_VM}"
+        else
+            DL_VM="dl-master"
+            log "[STEP 12 Legacy] No DL VM found, using default: ${DL_VM}"
+        fi
+    fi
+    
+    # DA_VM 자동 감지
+    if [[ -z "${DA_VM}" ]]; then
+        log "[STEP 12 Legacy] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
+        DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
+        if [[ -n "${DA_VM}" ]]; then
+            log "[STEP 12 Legacy] Auto-detected DA VM: ${DA_VM}"
+        else
+            DA_VM="da-master"
+            log "[STEP 12 Legacy] No DA VM found, using default: ${DA_VM}"
+        fi
+    fi
+
+    ###########################################################################
+    # Cluster Interface Type 분기 처리 (Legacy)
+    ###########################################################################
+    local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
+    
+    if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+      log "[STEP 12] Cluster Interface Type: BRIDGE - Executing bridge attach only (Legacy)"
+      step_12_bridge_attach_legacy
+      local legacy_bridge_rc=$?
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV ====="
+      echo
+      return ${legacy_bridge_rc}
+    elif [[ "${cluster_nic_type}" == "SRIOV" ]]; then
+      log "[STEP 12] Cluster Interface Type: SRIOV - Executing SR-IOV VF passthrough (Legacy)"
+      # Execution start confirmation
+      local start_msg
+      if [[ "${_DRY}" -eq 1 ]]; then
+        start_msg="STEP 12: SR-IOV + CPU Affinity Configuration (DRY RUN)
+
+This will simulate the following operations:
+  • SR-IOV VF PCI passthrough to ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration (CPU pinning)
+  • NUMA memory interleave configuration
+  • DL data disk attach (if applicable)
+  • CD-ROM removal
+
+⚠️  DRY RUN MODE: No actual changes will be made.
+
+Do you want to continue?"
+      else
+        start_msg="STEP 12: SR-IOV + CPU Affinity Configuration
+
+This will perform the following operations:
+  • Attach SR-IOV VF PCI devices to ${DL_VM} and ${DA_VM}
+  • Configure CPU pinning (CPU Affinity)
+  • Apply NUMA memory interleave configuration
+  • Attach DL data disk (if applicable)
+  • Remove CD-ROM devices
+
+⚠️  IMPORTANT: VMs will be shut down during this process.
+
+Do you want to continue?"
+      fi
+
+      # Calculate dialog size dynamically
+      local dialog_dims
+      dialog_dims=$(calc_dialog_size 18 85)
+      local dialog_height dialog_width
+      read -r dialog_height dialog_width <<< "${dialog_dims}"
+      local centered_msg
+      centered_msg=$(center_message "${start_msg}")
+
+      if ! whiptail --title "STEP 12 Execution Confirmation" \
+                    --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+      then
+        log "User canceled STEP 12 execution."
+        return 0
+      fi
+      # Continue with existing SR-IOV logic below
+    else
+      log "[WARN] Unknown CLUSTER_NIC_TYPE: ${cluster_nic_type}, defaulting to SRIOV"
+      # Execution start confirmation
+      local start_msg
+      if [[ "${_DRY}" -eq 1 ]]; then
+        start_msg="STEP 12: SR-IOV + CPU Affinity Configuration (DRY RUN)
+
+This will simulate the following operations:
+  • SR-IOV VF PCI passthrough to ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration (CPU pinning)
+  • NUMA memory interleave configuration
+  • DL data disk attach (if applicable)
+  • CD-ROM removal
+
+⚠️  DRY RUN MODE: No actual changes will be made.
+
+Do you want to continue?"
+      else
+        start_msg="STEP 12: SR-IOV + CPU Affinity Configuration
+
+This will perform the following operations:
+  • Attach SR-IOV VF PCI devices to ${DL_VM} and ${DA_VM}
+  • Configure CPU pinning (CPU Affinity)
+  • Apply NUMA memory interleave configuration
+  • Attach DL data disk (if applicable)
+  • Remove CD-ROM devices
+
+⚠️  IMPORTANT: VMs will be shut down during this process.
+
+Do you want to continue?"
+      fi
+
+      # Calculate dialog size dynamically
+      local dialog_dims
+      dialog_dims=$(calc_dialog_size 18 85)
+      local dialog_height dialog_width
+      read -r dialog_height dialog_width <<< "${dialog_dims}"
+      local centered_msg
+      centered_msg=$(center_message "${start_msg}")
+
+      if ! whiptail --title "STEP 12 Execution Confirmation" \
+                    --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+      then
+        log "User canceled STEP 12 execution."
+        return 0
+      fi
+      # Continue with existing SR-IOV logic below
+    fi
 
     ###########################################################################
     # PRE-CHECK: cloud-init seed ISO existence (dl-master-seed.iso / da-master-seed.iso)
@@ -6740,14 +9870,30 @@ step_12_sriov_cpu_affinity() {
         return 0
     }
 
-    _list_cdrom_targets_inactive() {
+    _list_non_seed_cdrom_targets() {
         local vm="$1"
-        # Extract cdrom disk sections using grep, then find target dev (handles both quote styles)
+        # Extract cdrom disk sections, exclude seed ISO (required for Cloud-Init)
+        # Process each CD-ROM section: if it contains seed ISO, skip it
         virsh dumpxml "${vm}" --inactive 2>/dev/null \
-          | grep -A 10 -E "device=['\"]cdrom['\"]" \
-          | grep "<target" \
-          | sed -n "s/.*dev=['\"]\([^'\"]*\)['\"].*/\1/p" \
-          | sort -u
+          | grep -B 5 -A 10 -E "device=['\"]cdrom['\"]" \
+          | awk '
+            BEGIN { in_cdrom=0; is_seed=0; target_dev="" }
+            /device=['\''"]cdrom['\''"]/ { in_cdrom=1; is_seed=0; target_dev="" }
+            /<source.*-seed\.iso/ { is_seed=1 }
+            /<target/ {
+              if (match($0, /dev=['\''"]([^'\''"]*)['\''"]/, arr)) {
+                target_dev=arr[1]
+              }
+            }
+            /<\/disk>/ {
+              if (in_cdrom && !is_seed && target_dev != "") {
+                print target_dev
+              }
+              in_cdrom=0
+              is_seed=0
+              target_dev=""
+            }
+          ' | sort -u
     }
 
     _detach_all_cdroms_config() {
@@ -6755,8 +9901,9 @@ step_12_sriov_cpu_affinity() {
         [[ -n "${vm}" ]] || return 0
         virsh dominfo "${vm}" >/dev/null 2>&1 || return 0
 
+        # Get only non-seed CD-ROM devices (seed ISO is required for Cloud-Init)
         local devs
-        devs="$(_list_cdrom_targets_inactive "${vm}" || true)"
+        devs="$(_list_non_seed_cdrom_targets "${vm}" || true)"
         [[ -n "${devs}" ]] || return 0
 
         local dev
@@ -6766,7 +9913,7 @@ step_12_sriov_cpu_affinity() {
                 log "[DRY-RUN] virsh detach-disk ${vm} ${dev} --config"
             else
                 virsh detach-disk "${vm}" "${dev}" --config >/dev/null 2>&1 || true
-                log "[STEP 12] ${vm}: CD-ROM(${dev}) detach attempt completed"
+                log "[STEP 12] ${vm}: CD-ROM(${dev}) detach attempt completed (seed ISO preserved)"
             fi
         done <<< "${devs}"
     }
@@ -6989,11 +10136,15 @@ EOF
         else
             local out
             if ! out="$(virsh attach-device "${vm}" "${tmp_xml}" --config 2>&1)"; then
-                log "[ERROR] ${vm}: virsh attach-device failed (PCI=${pci})"
-                log "[ERROR] virsh message:"
-                while IFS= read -r line; do
-                    log "  ${line}"
-                done <<< "${out}"
+                if echo "${out}" | grep -q "already in the domain configuration"; then
+                    log "[STEP 12] ${vm}: VF PCI(${pci}) already attached → skipping"
+                else
+                    log "[ERROR] ${vm}: virsh attach-device failed (PCI=${pci})"
+                    log "[ERROR] virsh message:"
+                    while IFS= read -r line; do
+                        log "  ${line}"
+                    done <<< "${out}"
+                fi
             else
                 log "[STEP 12] ${vm}: VF PCI(${pci}) hostdev attach (--config) completed"
             fi
@@ -7007,53 +10158,70 @@ EOF
     ###########################################################################
     # 5. CPU Affinity (virsh vcpupin --config)
     ###########################################################################
-    _apply_cpu_affinity_vm() {
-        local vm="$1"
-        local cpus_list="$2"
-
-        if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
-            return 0
+    # Check NUMA node count - skip CPU Affinity if only 1 NUMA node exists
+    local numa_node_count
+    numa_node_count=$(lscpu 2>/dev/null | grep -i "NUMA node(s)" | awk '{print $3}' || echo "0")
+    
+    if [[ -z "${numa_node_count}" ]] || [[ "${numa_node_count}" == "0" ]]; then
+        # Fallback: try numactl if available
+        if command -v numactl >/dev/null 2>&1; then
+            numa_node_count=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || echo "1")
+        else
+            numa_node_count="1"
         fi
-        [[ -n "${cpus_list}" ]] || return 0
+    fi
+    
+    if [[ "${numa_node_count}" == "1" ]]; then
+        log "[STEP 12] System has only 1 NUMA node → skipping CPU Affinity configuration"
+    else
+        _apply_cpu_affinity_vm() {
+            local vm="$1"
+            local cpus_list="$2"
 
-        # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
-        local max_vcpus
-        max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
-
-        if [[ "${max_vcpus}" -eq 0 ]]; then
-            log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
-            return 0
-        fi
-
-        # Convert cpus_list to array
-        local arr=()
-        local c
-        for c in ${cpus_list}; do
-            arr+=("${c}")
-        done
-
-        if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
-            log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
-            max_vcpus="${#arr[@]}"
-        fi
-
-        local i
-        for (( i=0; i<max_vcpus; i++ )); do
-            local pcpu="${arr[$i]}"
-            if [[ "${_DRY}" -eq 1 ]]; then
-                log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
-            else
-                if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
-                    log "[STEP 12] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
-                else
-                    log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
-                fi
+            if ! virsh dominfo "${vm}" >/dev/null 2>&1; then
+                return 0
             fi
-        done
-    }
+            [[ -n "${cpus_list}" ]] || return 0
 
-    _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
-    _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+            # Maximum vCPU count (designed as DL=42, DA=46, but check based on actual XML)
+            local max_vcpus
+            max_vcpus="$(virsh vcpucount "${vm}" --maximum --config 2>/dev/null || echo 0)"
+
+            if [[ "${max_vcpus}" -eq 0 ]]; then
+                log "[WARN] ${vm}: Unable to determine vCPU count → skipping CPU Affinity"
+                return 0
+            fi
+
+            # Convert cpus_list to array
+            local arr=()
+            local c
+            for c in ${cpus_list}; do
+                arr+=("${c}")
+            done
+
+            if [[ "${#arr[@]}" -lt "${max_vcpus}" ]]; then
+                log "[WARN] ${vm}: Specified CPU list count(${#arr[@]}) is less than maximum vCPU(${max_vcpus})."
+                max_vcpus="${#arr[@]}"
+            fi
+
+            local i
+            for (( i=0; i<max_vcpus; i++ )); do
+                local pcpu="${arr[$i]}"
+                if [[ "${_DRY}" -eq 1 ]]; then
+                    log "[DRY-RUN] virsh vcpupin ${vm} ${i} ${pcpu} --config"
+                else
+                    if virsh vcpupin "${vm}" "${i}" "${pcpu}" --config >/dev/null 2>&1; then
+                        log "[STEP 12] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin (--config) completed"
+                    else
+                        log "[WARN] ${vm}: vCPU ${i} -> pCPU ${pcpu} pin failed"
+                    fi
+                fi
+            done
+        }
+
+        _apply_cpu_affinity_vm "${DL_VM}" "${DL_CPUS_LIST}"
+        _apply_cpu_affinity_vm "${DA_VM}" "${DA_CPUS_LIST}"
+    fi
 
     ###########################################################################
     # 6. NUMA memory interleave (virsh numatune --config)
@@ -7083,38 +10251,81 @@ EOF
     ###########################################################################
     local DATA_LV="/dev/mapper/vg_dl-lv_dl"
     
+    # Helper: extract the full <disk>...</disk> XML block that contains target dev='vdb'
+    # NOTE: In libvirt XML, <source ...> often appears BEFORE <target ...>,
+    # so parsing with `grep -A ... "target dev='vdb'"` is unreliable.
+    # Args:
+    #   $1: vm name
+    #   $2: 0=live XML, 1=inactive XML
+    get_vdb_disk_block() {
+        local vm_name="$1"
+        local inactive="${2:-0}"
+        if [[ -z "${vm_name}" ]]; then
+            return 1
+        fi
+
+        local dump_cmd=(virsh dumpxml "${vm_name}")
+        if [[ "${inactive}" -eq 1 ]]; then
+            dump_cmd+=(--inactive)
+        fi
+
+        "${dump_cmd[@]}" 2>/dev/null | awk '
+            BEGIN { in_disk=0; buf="" }
+            /<disk[ >]/ { in_disk=1; buf=$0 ORS; next }
+            in_disk {
+                buf = buf $0 ORS
+                if ($0 ~ /<\/disk>/) {
+                    if (buf ~ /<target[[:space:]]+dev=.vdb./) { print buf; exit }
+                    in_disk=0; buf=""
+                }
+            }
+        '
+    }
+
+    # Helper: pretty-print live_ok for logs.
+    # For shutoff VMs, live verification is not applicable.
+    fmt_live_ok() {
+        local is_running="${1:-0}"
+        local val="${2:-0}"
+        if [[ "${is_running}" -eq 1 ]]; then
+            echo "${val}"
+        else
+            echo "N/A"
+        fi
+    }
+
     # Helper function to extract and normalize vdb source from VM XML
     get_vdb_source() {
         local vm_name="$1"
         local vdb_xml
-        vdb_xml=$(virsh dumpxml "${vm_name}" 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
-        
+        vdb_xml="$(get_vdb_disk_block "${vm_name}" 0 || true)"
+
         if [[ -z "${vdb_xml}" ]]; then
             echo ""
             return
         fi
-        
+
         # Try multiple methods to extract source device
         local source_dev=""
-        
+
         # Method 1: Extract from source dev='...' pattern
         source_dev=$(echo "${vdb_xml}" | grep -E "source dev=" | sed -E "s/.*source dev=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
-        
+
         # Method 2: Extract from source file='...' pattern
         if [[ -z "${source_dev}" ]]; then
             source_dev=$(echo "${vdb_xml}" | grep -E "source file=" | sed -E "s/.*source file=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
         fi
-        
+
         # Method 3: Extract from any source= pattern (more flexible)
         if [[ -z "${source_dev}" ]]; then
             source_dev=$(echo "${vdb_xml}" | grep -E "source.*=" | sed -E "s/.*source[^=]*=['\"]([^'\"]+)['\"].*/\1/" | head -1 || echo "")
         fi
-        
+
         # Method 4: Try with different quote styles
         if [[ -z "${source_dev}" ]]; then
             source_dev=$(echo "${vdb_xml}" | grep -E "source" | sed -E "s/.*source[^>]*>([^<]+)<.*/\1/" | head -1 || echo "")
         fi
-        
+
         echo "${source_dev}"
     }
     
@@ -7200,7 +10411,7 @@ EOF
         
         # Use --inactive to check persistent config
         local vdb_xml
-        vdb_xml=$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        vdb_xml="$(get_vdb_disk_block "${vm_name}" 1 || true)"
         
         if [[ -z "${vdb_xml}" ]]; then
             return 1  # vdb not found in config
@@ -7292,7 +10503,7 @@ EOF
                     live_ok=1
                 fi
                 
-                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=${live_ok}"
+                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${live_ok})"
                 
                 # Determine if attachment is needed
                 local needs_attach=1
@@ -7455,7 +10666,7 @@ EOF
                             final_live_ok=1  # Not applicable for shutoff
                         fi
                         
-                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                         
                         # Determine success based on VM state
                         if [[ ${dl_running} -eq 1 ]]; then
@@ -7563,20 +10774,20 @@ EOF
                         if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
                             log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
                             log "[STEP 12] Status: Attached (live), persistence pending"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                             log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
-                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'"
                         else
                             log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (${attach_mode}) completed and verified"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                         fi
                     else
                         # Only report as failed if live is also not OK (for running VM)
                         if [[ ${dl_running} -eq 1 ]] && [[ ${final_live_ok} -eq 0 ]]; then
                             log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
-                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                             log "[DEBUG] VM XML vdb section (config):"
-                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                            get_vdb_disk_block "${DL_VM}" 1 2>/dev/null | while read -r line; do
                                 log "[DEBUG]   ${line}"
                             done
                             log "[DEBUG] Live block list:"
@@ -7587,14 +10798,14 @@ EOF
                             # This should not happen due to verification_passed logic, but handle it anyway
                             log "[STEP 12] ${DL_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
                             log "[STEP 12] Status: Attached (live), persistence pending"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                             log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
-                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | grep vdb"
+                            log "[WARN] Please manually verify with: virsh dumpxml ${DL_VM} --inactive | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'"
                         else
                             log "[ERROR] ${DL_VM} data disk(${DATA_LV}) attach failed after all attempts"
-                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${dl_running} ${final_live_ok})"
                             log "[DEBUG] VM XML vdb section (config):"
-                            virsh dumpxml "${DL_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                            get_vdb_disk_block "${DL_VM}" 1 2>/dev/null | while read -r line; do
                                 log "[DEBUG]   ${line}"
                             done
                         fi
@@ -7611,6 +10822,29 @@ EOF
     ###########################################################################
     # 8. DL/DA VM restart (fail-fast)
     ###########################################################################
+    ensure_vm_bridge_if_needed() {
+        local vm_name="$1"
+        local bridge_name="$2"
+        if [[ -z "${vm_name}" || -z "${bridge_name}" ]]; then
+            return 0
+        fi
+        if ! virsh dominfo "${vm_name}" >/dev/null 2>&1; then
+            return 0
+        fi
+        if virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -q "<source bridge='${bridge_name}'"; then
+            if ! ip link show dev "${bridge_name}" >/dev/null 2>&1; then
+                log "[STEP 12] Bridge ${bridge_name} required by ${vm_name} but missing; creating it"
+                ensure_bridge_up_no_carrier_ok "${bridge_name}" "" || return 1
+            fi
+        fi
+        return 0
+    }
+
+    local dl_bridge="${DL_BRIDGE:-virbr0}"
+    local da_bridge="${DA_BRIDGE:-virbr0}"
+    ensure_vm_bridge_if_needed "${DL_VM}" "${dl_bridge}" || return 1
+    ensure_vm_bridge_if_needed "${DA_VM}" "${da_bridge}" || return 1
+
     for vm in "${DL_VM}" "${DA_VM}"; do
         if virsh dominfo "${vm}" >/dev/null 2>&1; then
             log "[STEP 12] Requesting ${vm} start"
@@ -7638,10 +10872,36 @@ EOF
     ###########################################################################
     # 9. Display basic validation results using show_paged
     ###########################################################################
-    if [[ "${_DRY}" -eq 0 ]]; then
-        local result_file="/tmp/step12_result.txt"
-        rm -f "${result_file}"
+    local result_file="/tmp/step12_result.txt"
+    rm -f "${result_file}"
 
+    if [[ "${_DRY}" -eq 1 ]]; then
+        {
+            echo "===== DRY-RUN MODE: Simulation Results ====="
+            echo
+            echo "📊 SIMULATED OPERATIONS:"
+            echo "  • SR-IOV VF PCI passthrough to ${DL_VM} and ${DA_VM}"
+            echo "  • CPU Affinity configuration"
+            echo "  • NUMA memory interleave configuration"
+            echo "  • DL data disk attach (if applicable)"
+            echo
+            echo "ℹ️  In real execution mode, the following would occur:"
+            echo "  1. SR-IOV VF PCI devices would be attached to ${DL_VM} and ${DA_VM}"
+            echo "  2. CPU pinning would be applied"
+            echo "  3. NUMA configuration would be applied"
+            echo "  4. Data disk would be attached to ${DL_VM} (if available)"
+            echo
+            echo "📋 EXPECTED CONFIGURATION:"
+            echo "  • DL VM: ${DL_VM}"
+            echo "  • DA VM: ${DA_VM}"
+            if [[ -n "${DL_VF:-}" ]]; then
+                echo "  • DL VF PCI: ${DL_VF}"
+            fi
+            if [[ -n "${DA_VF:-}" ]]; then
+                echo "  • DA VF PCI: ${DA_VF}"
+            fi
+        } > "${result_file}"
+    else
         {
             echo "===== DL vcpuinfo (${DL_VM}) ====="
             if virsh dominfo "${DL_VM}" >/dev/null 2>&1; then
@@ -7677,9 +10937,79 @@ EOF
             fi
             echo
         } > "${result_file}"
+    fi
 
-                show_paged "STEP 12 – SR-IOV / CPU Affinity / DL data LV validation results" "${result_file}"
-        
+    # Execution completion message box
+    local completion_msg
+    if [[ "${_DRY}" -eq 1 ]]; then
+        completion_msg="STEP 12: SR-IOV + CPU Affinity Configuration (DRY RUN) Completed
+
+✅ Simulation Summary:
+  • SR-IOV VF PCI passthrough simulation for ${DL_VM} and ${DA_VM}
+  • CPU Affinity configuration simulation
+  • NUMA memory interleave configuration simulation
+  • DL data disk attach simulation (if applicable)
+  • CD-ROM removal simulation
+
+⚠️  DRY RUN MODE: No actual changes were made.
+
+📋 What Would Have Been Applied:
+  • SR-IOV VF PCI devices would be attached to VMs
+  • CPU pinning would be configured
+  • NUMA memory interleave would be applied
+  • Data disk would be attached to ${DL_VM} (if available)
+  • CD-ROM devices would be removed
+
+💡 Next Steps:
+  Set DRY_RUN=0 and rerun STEP 12 to apply actual configurations.
+  Detailed simulation results are available in the log."
+    else
+        completion_msg="STEP 12: SR-IOV + CPU Affinity Configuration Completed
+
+✅ Configuration Summary:
+  • SR-IOV VF PCI passthrough applied to ${DL_VM} and ${DA_VM}
+  • CPU Affinity (CPU pinning) configured
+  • NUMA memory interleave applied
+  • DL data disk attached (if applicable)
+  • CD-ROM devices removed
+
+✅ VMs Status:
+  • ${DL_VM} and ${DA_VM} have been restarted with new configurations
+  • All SR-IOV and CPU affinity settings are now active
+
+📋 Verification:
+  • Check VM CPU pinning: virsh vcpuinfo ${DL_VM}
+  • Check SR-IOV devices: virsh dumpxml ${DL_VM} | grep hostdev
+  • Check NUMA configuration: virsh numatune ${DL_VM}
+  • Verify data disk: virsh dumpxml ${DL_VM} | awk '/<disk[ >]/{d=1;b=$0 ORS;next} d{b=b $0 ORS; if($0~/<\\\/disk>/){ if(b~/<target[[:space:]]+dev=.vdb./){print b; exit} d=0;b=\"\"}}'
+
+💡 Note:
+  Detailed verification results are shown below.
+  VMs are ready for use with SR-IOV and CPU affinity enabled."
+    fi
+
+    # Calculate dialog size dynamically
+    local dialog_dims
+    dialog_dims=$(calc_dialog_size 22 90)
+    local dialog_height dialog_width
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+
+    whiptail_msgbox "STEP 12 - Configuration Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
+    if [[ "${_DRY}" -eq 1 ]]; then
+        # Read result file content and display in message box
+        local dry_run_content
+        if [[ -f "${result_file}" ]]; then
+            dry_run_content=$(cat "${result_file}")
+            # Calculate dialog size dynamically
+            local dry_dialog_dims
+            dry_dialog_dims=$(calc_dialog_size 20 90)
+            local dry_dialog_height dry_dialog_width
+            read -r dry_dialog_height dry_dialog_width <<< "${dry_dialog_dims}"
+            whiptail_msgbox "STEP 12 – SR-IOV / CPU Affinity / DL data LV (DRY-RUN)" "${dry_run_content}" "${dry_dialog_height}" "${dry_dialog_width}"
+        fi
+    else
+        show_paged "STEP 12 – SR-IOV / CPU Affinity / DL data LV validation results" "${result_file}" "no-clear"
     fi
 
     ###########################################################################
@@ -8026,20 +11356,29 @@ menu_config() {
     # Load latest configuration
     load_config
 
+    # Determine ACPS Password display text
+    local acps_password_display
+    if [[ -n "${ACPS_PASSWORD:-}" ]]; then
+      acps_password_display="(Configured)"
+    else
+      acps_password_display="(Not Set)"
+    fi
+
     local msg
     msg="Current Configuration\n\n"
     msg+="DRY_RUN      : ${DRY_RUN}\n"
     msg+="DP_VERSION   : ${DP_VERSION}\n"
     msg+="ACPS_USER    : ${ACPS_USERNAME:-<Not Set>}\n"
-        msg+="ACPS_PASSWORD: ${ACPS_PASSWORD:-<Not Set>}\n"
+    msg+="ACPS_PASSWORD: ${acps_password_display}\n"
     msg+="ACPS_URL     : ${ACPS_BASE_URL:-<Not Set>}\n"
     msg+="MGT_NIC      : ${MGT_NIC:-<Not Set>}\n"
     msg+="CLTR0_NIC    : ${CLTR0_NIC:-<Not Set>}\n"
     msg+="DATA_SSD_LIST: ${DATA_SSD_LIST:-<Not Set>}\n"
+    msg+="CLUSTER_NIC_TYPE: ${CLUSTER_NIC_TYPE:-BRIDGE}\n"
 
-    # Calculate menu size dynamically (5 menu items)
+    # Calculate menu size dynamically (6 menu items)
     local menu_dims
-    menu_dims=$(calc_menu_size 5 80 8)
+    menu_dims=$(calc_menu_size 6 80 8)
     local menu_height menu_width menu_list_height
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
 
@@ -8057,7 +11396,8 @@ menu_config() {
       "2" "Set DP_VERSION" \
       "3" "Set ACPS Account/Password" \
       "4" "Set ACPS URL" \
-      "5" "Go Back" \
+      "5" "Set Cluster Interface Type (${CLUSTER_NIC_TYPE:-BRIDGE})" \
+      "6" "Go Back" \
       3>&1 1>&2 2>&3)
     local menu_rc=$?
     set -e
@@ -8193,6 +11533,73 @@ menu_config() {
         ;;
 
       "5")
+        # Cluster Interface Type
+        local current_type="${CLUSTER_NIC_TYPE:-BRIDGE}"
+        local type_choice
+        local new_type=""
+        
+        # Temporarily disable set -e to handle cancel gracefully
+        set +e
+        type_choice=$(whiptail --title "Cluster Interface Type Configuration" \
+          --menu "Select Cluster Interface Type:\n\nCurrent: ${current_type}\n\n⚠️  Changing mode requires STEP 03 re-execution" \
+          12 70 2 \
+          "1" "SR-IOV (Virtual Function Passthrough)" \
+          "2" "Bridge (Linux Bridge)" \
+          3>&1 1>&2 2>&3)
+        local type_rc=$?
+        set -e
+        
+        if [[ ${type_rc} -ne 0 ]] || [[ -z "${type_choice}" ]]; then
+          continue
+        fi
+        
+        case "${type_choice}" in
+          "1")
+            new_type="SRIOV"
+            ;;
+          "2")
+            new_type="BRIDGE"
+            ;;
+          *)
+            continue
+            ;;
+        esac
+        
+        # 모드 변경 확인
+        if [[ "${new_type}" != "${current_type}" ]]; then
+          local switch_msg=""
+          if [[ "${current_type}" == "SRIOV" ]] && [[ "${new_type}" == "BRIDGE" ]]; then
+            switch_msg="Switching from SR-IOV to Bridge mode:\n\n• SR-IOV VFs will be removed\n• Bridge will be created\n• STEP 03 must be re-executed"
+          elif [[ "${current_type}" == "BRIDGE" ]] && [[ "${new_type}" == "SRIOV" ]]; then
+            switch_msg="Switching from Bridge to SR-IOV mode:\n\n• Existing bridge will be removed\n• SR-IOV VFs will be created\n• STEP 03 must be re-executed"
+          fi
+          
+          if [[ -n "${switch_msg}" ]]; then
+            set +e
+            whiptail --title "Cluster Interface Type Change" \
+              --yesno "${switch_msg}\n\nProceed with mode change?" \
+              15 70
+            local confirm_rc=$?
+            set -e
+            
+            if [[ ${confirm_rc} -ne 0 ]]; then
+              continue
+            fi
+          fi
+        fi
+        
+        CLUSTER_NIC_TYPE="${new_type}"
+        save_config
+        
+        local info_msg="CLUSTER_NIC_TYPE has been set to '${CLUSTER_NIC_TYPE}'."
+        if [[ "${new_type}" != "${current_type}" ]]; then
+          info_msg="${info_msg}\n\n⚠️  IMPORTANT: Re-run STEP 03 to apply the mode change."
+        fi
+        
+        whiptail_msgbox "Cluster Interface Type Configuration" "${info_msg}" 10 70
+        ;;
+
+      "6")
         break
         ;;
 
@@ -8221,9 +11628,19 @@ show_log() {
 build_validation_summary() {
   local validation_log="$1"   # Can check based on log if needed, but here we re-check actual status
 
+  # Load config to get CLUSTER_NIC_TYPE
+  load_config
+
   local ok_msgs=()
   local warn_msgs=()
   local err_msgs=()
+
+  # Determine network mode (SR-IOV or Bridge)
+  local cluster_nic_type="${CLUSTER_NIC_TYPE:-BRIDGE}"
+  local is_bridge_mode=0
+  if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
+    is_bridge_mode=1
+  fi
 
   ###############################
   # 1. HWE kernel + IOMMU(grub)
@@ -8387,6 +11804,29 @@ build_validation_summary() {
   fi
 
   ###############################
+  # 5.5. SR-IOV driver (iavf/i40evf)
+  ###############################
+  if [[ "${CLUSTER_NIC_TYPE}" != "BRIDGE" ]]; then
+    local sriov_modules
+    sriov_modules=$(lsmod | grep -E '^(iavf|i40evf)\b' 2>/dev/null || echo "")
+    if [[ -n "${sriov_modules}" ]]; then
+      ok_msgs+=("SR-IOV driver modules (iavf/i40evf) loaded")
+    else
+      # Check if module files exist (driver may be installed but not loaded)
+      if modinfo iavf >/dev/null 2>&1 || modinfo i40evf >/dev/null 2>&1; then
+        warn_msgs+=("SR-IOV driver modules (iavf/i40evf) are installed but not loaded.")
+        warn_msgs+=("  → ACTION: Re-run STEP 06 (SR-IOV + NTPsec)")
+        warn_msgs+=("  → MANUAL: Run 'sudo modprobe iavf' or 'sudo modprobe i40evf'")
+        warn_msgs+=("  → NOTE: Modules may need to be loaded after reboot or when VFs are created")
+      else
+        warn_msgs+=("SR-IOV driver modules (iavf/i40evf) are not installed or not available.")
+        warn_msgs+=("  → ACTION: Re-run STEP 06 (SR-IOV + NTPsec)")
+        warn_msgs+=("  → CHECK: Verify driver installation from GitHub (iavf-4.13.16)")
+      fi
+    fi
+  fi
+
+  ###############################
   # 6. LVM / /stellar mount
   ###############################
   if grep -q 'lv_dl_root' /etc/fstab && grep -q 'lv_da_root' /etc/fstab; then
@@ -8417,87 +11857,205 @@ build_validation_summary() {
   ###############################
   local dl_defined=0
   local da_defined=0
+  local dl_domains=()
+  local da_domains=()
 
-  if virsh dominfo dl-master >/dev/null 2>&1; then
-    dl_defined=1
-  fi
-  if virsh dominfo da-master >/dev/null 2>&1; then
-    da_defined=1
-  fi
+  # Check for any dl-* domains (dl-master, dl-worker1, dl-worker2, etc.)
+  while IFS= read -r domain; do
+    if [[ -n "$domain" ]] && virsh dominfo "$domain" >/dev/null 2>&1; then
+      dl_domains+=("$domain")
+      dl_defined=1
+    fi
+  done < <(virsh list --all --name 2>/dev/null | grep -E '^dl-' || true)
+
+  # Check for any da-* domains (da-master, da-worker1, da-worker2, etc.)
+  while IFS= read -r domain; do
+    if [[ -n "$domain" ]] && virsh dominfo "$domain" >/dev/null 2>&1; then
+      da_domains+=("$domain")
+      da_defined=1
+    fi
+  done < <(virsh list --all --name 2>/dev/null | grep -E '^da-' || true)
 
   # 7-1. VM definition existence
   if (( dl_defined == 1 && da_defined == 1 )); then
-    ok_msgs+=("dl-master / da-master libvirt domain definition complete")
+    local dl_list="${dl_domains[*]}"
+    local da_list="${da_domains[*]}"
+    ok_msgs+=("dl/da domain(s) definition complete (dl: ${dl_list}, da: ${da_list})")
   elif (( dl_defined == 1 || da_defined == 1 )); then
-    warn_msgs+=("Only one of dl-master or da-master is defined.")
     if (( dl_defined == 1 )); then
-      warn_msgs+=("  → ACTION: Re-run STEP 11 (DA-master VM Deployment)")
+      local dl_list="${dl_domains[*]}"
+      warn_msgs+=("Only dl domain(s) are defined: ${dl_list}")
+      warn_msgs+=("  → ACTION: Re-run STEP 11 (DA VM Deployment)")
     else
-      warn_msgs+=("  → ACTION: Re-run STEP 10 (DL-master VM Deployment)")
+      local da_list="${da_domains[*]}"
+      warn_msgs+=("Only da domain(s) are defined: ${da_list}")
+      warn_msgs+=("  → ACTION: Re-run STEP 10 (DL VM Deployment)")
     fi
   else
-    warn_msgs+=("dl-master / da-master domain not yet defined.")
+    warn_msgs+=("dl/da domain(s) (e.g., dl-master, dl-worker1-3, da-master, da-worker1-3) not yet defined.")
     warn_msgs+=("  → NOTE: This is normal if before STEP 10/11 execution")
     warn_msgs+=("  → ACTION: Complete STEP 09 (DP Download) then run STEP 10 and STEP 11")
   fi
 
-  # 7-2. dl-master detailed validation (only if defined)
-  if (( dl_defined == 1 )); then
-    # SR-IOV hostdev
-    if virsh dumpxml dl-master 2>/dev/null | grep -q '<hostdev '; then
-      ok_msgs+=("dl-master SR-IOV VF(hostdev) passthrough configuration detected")
+  # 7-2. dl-* domain(s) detailed validation (only if defined)
+  if (( dl_defined == 1 )) && (( ${#dl_domains[@]} > 0 )); then
+    # Use first dl-* domain for validation (prefer dl-master if exists, otherwise first one)
+    local dl_vm=""
+    local found_master=0
+    for domain in "${dl_domains[@]}"; do
+      if [[ "$domain" == "dl-master" ]]; then
+        dl_vm="dl-master"
+        found_master=1
+        break
+      fi
+    done
+    if [[ $found_master -eq 0 ]]; then
+      dl_vm="${dl_domains[0]}"
+    fi
+
+    # SR-IOV hostdev (only check in SR-IOV mode, not in Bridge mode)
+    if [[ ${is_bridge_mode} -eq 0 ]]; then
+      # SR-IOV mode: check for hostdev
+      if virsh dumpxml "${dl_vm}" 2>/dev/null | grep -q '<hostdev '; then
+        ok_msgs+=("${dl_vm} SR-IOV VF(hostdev) passthrough configuration detected")
+      else
+        warn_msgs+=("${dl_vm} XML does not have hostdev(SR-IOV) configuration yet.")
+        warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+        warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
+      fi
     else
-      warn_msgs+=("dl-master XML does not have hostdev(SR-IOV) configuration yet.")
-      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
-      warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
+      # Bridge mode: check for bridge interface instead (SR-IOV not required in Bridge mode)
+      local bridge_name="${CLUSTER_BRIDGE_NAME:-br-cluster}"
+      if virsh dumpxml "${dl_vm}" 2>/dev/null | grep -qE "interface.*type=['\"]bridge['\"]" && \
+         virsh dumpxml "${dl_vm}" 2>/dev/null | grep -qE "source bridge=['\"]${bridge_name}['\"]"; then
+        ok_msgs+=("${dl_vm} Bridge interface (${bridge_name}) configuration detected (Bridge mode)")
+      elif virsh dumpxml "${dl_vm}" 2>/dev/null | grep -qE "interface.*type=['\"]bridge['\"]"; then
+        # Bridge interface exists but may be different bridge
+        ok_msgs+=("${dl_vm} Bridge interface configuration detected (Bridge mode)")
+      else
+        warn_msgs+=("${dl_vm} XML does not have bridge interface configuration.")
+        warn_msgs+=("  → ACTION: Re-run STEP 12 (Bridge / CPU Affinity Configuration)")
+        warn_msgs+=("  → NOTE: In Bridge mode, VMs use bridge interfaces instead of SR-IOV")
+      fi
     fi
 
     # CPU pinning(cputune)
-    if virsh dumpxml dl-master 2>/dev/null | grep -q '<cputune>'; then
-      ok_msgs+=("dl-master CPU pinning(cputune) configuration detected")
+    if virsh dumpxml "${dl_vm}" 2>/dev/null | grep -q '<cputune>'; then
+      ok_msgs+=("${dl_vm} CPU pinning(cputune) configuration detected")
     else
-      warn_msgs+=("dl-master XML does not have CPU pinning(cputune) configuration.")
+      warn_msgs+=("${dl_vm} XML does not have CPU pinning(cputune) configuration.")
       warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
       warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
     fi
 
     # CD-ROM / ISO connection status
-    if virsh dumpxml dl-master 2>/dev/null | grep -q '\.iso'; then
-      warn_msgs+=("dl-master XML still has ISO(.iso) file connected.")
-      warn_msgs+=("  → MANUAL: Remove ISO with 'virsh change-media dl-master --eject hda'")
-      warn_msgs+=("  → MANUAL: Or edit XML with 'virsh edit dl-master' and remove ISO source")
+    # Check if there is a CD-ROM disk device with ISO file source (excluding seed ISO which is required for Cloud-Init)
+    local has_non_seed_cdrom_iso=0
+    local cdrom_xml
+    cdrom_xml="$(virsh dumpxml "${dl_vm}" 2>/dev/null | grep -A 10 -E "device=['\"]cdrom['\"]" || true)"
+    
+    if [[ -n "${cdrom_xml}" ]]; then
+      # Check each CD-ROM device for non-seed ISO files
+      while IFS= read -r line; do
+        if echo "$line" | grep -q "<source.*\.iso"; then
+          # Check if it's NOT a seed ISO (seed ISO is required for Cloud-Init)
+          if ! echo "$line" | grep -qE "-seed\.iso['\"]"; then
+            has_non_seed_cdrom_iso=1
+            break
+          fi
+        fi
+      done <<< "${cdrom_xml}"
+    fi
+    
+    if [[ ${has_non_seed_cdrom_iso} -eq 1 ]]; then
+      warn_msgs+=("${dl_vm} XML still has CD-ROM device with non-seed ISO(.iso) file connected.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 to automatically remove CD-ROM devices")
+      warn_msgs+=("  → MANUAL (if needed): Remove ISO with 'virsh change-media ${dl_vm} --eject <device>'")
+      warn_msgs+=("  → MANUAL (if needed): Or detach CD-ROM with 'virsh detach-disk ${dl_vm} <device> --config'")
+      warn_msgs+=("  → NOTE: seed.iso files are required for Cloud-Init and should remain connected")
     else
-      ok_msgs+=("dl-master ISO not connected (even if CD-ROM device remains, .iso file is not connected)")
+      ok_msgs+=("${dl_vm} CD-ROM/ISO status OK (only seed ISO for Cloud-Init, or no CD-ROM with ISO)")
     fi
   fi
 
-  # 7-3. da-master detailed validation (only if defined)
-  if (( da_defined == 1 )); then
-    # SR-IOV hostdev
-    if virsh dumpxml da-master 2>/dev/null | grep -q '<hostdev '; then
-      ok_msgs+=("da-master SR-IOV VF(hostdev) passthrough configuration detected")
+  # 7-3. da-* domain(s) detailed validation (only if defined)
+  if (( da_defined == 1 )) && (( ${#da_domains[@]} > 0 )); then
+    # Use first da-* domain for validation (prefer da-master if exists, otherwise first one)
+    local da_vm=""
+    local found_master=0
+    for domain in "${da_domains[@]}"; do
+      if [[ "$domain" == "da-master" ]]; then
+        da_vm="da-master"
+        found_master=1
+        break
+      fi
+    done
+    if [[ $found_master -eq 0 ]]; then
+      da_vm="${da_domains[0]}"
+    fi
+
+    # SR-IOV hostdev (only check in SR-IOV mode, not in Bridge mode)
+    if [[ ${is_bridge_mode} -eq 0 ]]; then
+      # SR-IOV mode: check for hostdev
+      if virsh dumpxml "${da_vm}" 2>/dev/null | grep -q '<hostdev '; then
+        ok_msgs+=("${da_vm} SR-IOV VF(hostdev) passthrough configuration detected")
+      else
+        warn_msgs+=("${da_vm} XML does not have hostdev(SR-IOV) configuration yet.")
+        warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
+        warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
+      fi
     else
-      warn_msgs+=("da-master XML does not have hostdev(SR-IOV) configuration yet.")
-      warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
-      warn_msgs+=("  → CHECK: Verify SR-IOV VFs are available with 'lspci | grep Virtual Function'")
+      # Bridge mode: check for bridge interface instead (SR-IOV not required in Bridge mode)
+      local bridge_name="${CLUSTER_BRIDGE_NAME:-br-cluster}"
+      if virsh dumpxml "${da_vm}" 2>/dev/null | grep -qE "interface.*type=['\"]bridge['\"]" && \
+         virsh dumpxml "${da_vm}" 2>/dev/null | grep -qE "source bridge=['\"]${bridge_name}['\"]"; then
+        ok_msgs+=("${da_vm} Bridge interface (${bridge_name}) configuration detected (Bridge mode)")
+      elif virsh dumpxml "${da_vm}" 2>/dev/null | grep -qE "interface.*type=['\"]bridge['\"]"; then
+        # Bridge interface exists but may be different bridge
+        ok_msgs+=("${da_vm} Bridge interface configuration detected (Bridge mode)")
+      else
+        warn_msgs+=("${da_vm} XML does not have bridge interface configuration.")
+        warn_msgs+=("  → ACTION: Re-run STEP 12 (Bridge / CPU Affinity Configuration)")
+        warn_msgs+=("  → NOTE: In Bridge mode, VMs use bridge interfaces instead of SR-IOV")
+      fi
     fi
 
     # CPU pinning(cputune)
-    if virsh dumpxml da-master 2>/dev/null | grep -q '<cputune>'; then
-      ok_msgs+=("da-master CPU pinning(cputune) configuration detected")
+    if virsh dumpxml "${da_vm}" 2>/dev/null | grep -q '<cputune>'; then
+      ok_msgs+=("${da_vm} CPU pinning(cputune) configuration detected")
     else
-      warn_msgs+=("da-master XML does not have CPU pinning(cputune) configuration.")
+      warn_msgs+=("${da_vm} XML does not have CPU pinning(cputune) configuration.")
       warn_msgs+=("  → ACTION: Re-run STEP 12 (SR-IOV / CPU Affinity Configuration)")
       warn_msgs+=("  → NOTE: NUMA-based vCPU placement may not be applied without this")
     fi
 
     # CD-ROM / ISO connection status
-    if virsh dumpxml da-master 2>/dev/null | grep -q '\.iso'; then
-      warn_msgs+=("da-master XML still has ISO(.iso) file connected.")
-      warn_msgs+=("  → MANUAL: Remove ISO with 'virsh change-media da-master --eject hda'")
-      warn_msgs+=("  → MANUAL: Or edit XML with 'virsh edit da-master' and remove ISO source")
+    # Check if there is a CD-ROM disk device with ISO file source (excluding seed ISO which is required for Cloud-Init)
+    local has_non_seed_cdrom_iso=0
+    local cdrom_xml
+    cdrom_xml="$(virsh dumpxml "${da_vm}" 2>/dev/null | grep -A 10 -E "device=['\"]cdrom['\"]" || true)"
+    
+    if [[ -n "${cdrom_xml}" ]]; then
+      # Check each CD-ROM device for non-seed ISO files
+      while IFS= read -r line; do
+        if echo "$line" | grep -q "<source.*\.iso"; then
+          # Check if it's NOT a seed ISO (seed ISO is required for Cloud-Init)
+          if ! echo "$line" | grep -qE "-seed\.iso['\"]"; then
+            has_non_seed_cdrom_iso=1
+            break
+          fi
+        fi
+      done <<< "${cdrom_xml}"
+    fi
+    
+    if [[ ${has_non_seed_cdrom_iso} -eq 1 ]]; then
+      warn_msgs+=("${da_vm} XML still has CD-ROM device with non-seed ISO(.iso) file connected.")
+      warn_msgs+=("  → ACTION: Re-run STEP 12 to automatically remove CD-ROM devices")
+      warn_msgs+=("  → MANUAL (if needed): Remove ISO with 'virsh change-media ${da_vm} --eject <device>'")
+      warn_msgs+=("  → MANUAL (if needed): Or detach CD-ROM with 'virsh detach-disk ${da_vm} <device> --config'")
+      warn_msgs+=("  → NOTE: seed.iso files are required for Cloud-Init and should remain connected")
     else
-      ok_msgs+=("da-master ISO not connected (even if CD-ROM device remains, .iso file is not connected)")
+      ok_msgs+=("${da_vm} CD-ROM/ISO status OK (only seed ISO for Cloud-Init, or no CD-ROM with ISO)")
     fi
   fi
 
@@ -8762,6 +12320,28 @@ menu_full_validation() {
 
     echo "\$ ntpq -p"
     ntpq -p 2>&1 || echo "[WARN] ntpq -p execution failed (NTP synchronization may not have occurred)."
+    echo
+
+    ##################################################
+    # 5.5. SR-IOV driver (iavf/i40evf) validation
+    ##################################################
+    echo "## 5.5. SR-IOV driver (iavf/i40evf) validation"
+    echo
+
+    echo "\$ lsmod | grep -E '^(iavf|i40evf)\\b'"
+    lsmod | grep -E '^(iavf|i40evf)\b' 2>&1 || echo "[WARN] SR-IOV driver modules (iavf/i40evf) are not loaded."
+    echo
+
+    echo "\$ modinfo iavf 2>/dev/null | head -20"
+    modinfo iavf 2>/dev/null | head -20 2>&1 || echo "[INFO] iavf module info not available (module may not be installed)."
+    echo
+
+    echo "\$ modinfo i40evf 2>/dev/null | head -20"
+    modinfo i40evf 2>/dev/null | head -20 2>&1 || echo "[INFO] i40evf module info not available (module may not be installed)."
+    echo
+
+    echo "\$ lspci | grep -E 'Virtual Function|Adaptive Virtual'"
+    lspci | grep -E 'Virtual Function|Adaptive Virtual' 2>&1 || echo "[INFO] No SR-IOV Virtual Function devices detected (this is normal if SR-IOV is not configured or VFs are not created)."
     echo
 
     ##################################################
@@ -9190,70 +12770,71 @@ Log Files:
 
 
 menu_select_step_and_run() {
-  local menu_items=()
-  local i
-  for ((i=0; i<NUM_STEPS; i++)); do
-    # Extract number part from STEP_ID (e.g., "01" from "01_hw_detect")
-    # Use number as tag to avoid showing function name in menu
-    local step_num="${STEP_IDS[$i]%%_*}"
-    # Display format: description only (number is shown as tag on the left)
-    menu_items+=("${step_num}" "${STEP_NAMES[$i]}")
-  done
-  
-  # Add Back menu item at the end (empty item to avoid duplication)
-  menu_items+=("back" "")
+  while true; do
+    load_state
+    load_config
 
-  # Calculate menu size dynamically based on number of steps (including Back)
-  local menu_dims
-  menu_dims=$(calc_menu_size "$((NUM_STEPS + 1))" 80 10)
-  local menu_height menu_width menu_list_height
-  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+    local menu_items=()
+    local i
+    for ((i=0; i<NUM_STEPS; i++)); do
+      local step_id="${STEP_IDS[$i]}"
+      local step_name="${STEP_NAMES[$i]}"
+      local status="[wait]"
+      local step_num=$(printf "%02d" $((i+1)))
 
-  # Center-align the menu message based on terminal height
-  local centered_msg
-  centered_msg=$(center_menu_message "Select step to execute:\n" "${menu_height}")
+      # STEP 06 always includes SR-IOV driver installation + NTPsec
+      if [[ "${step_id}" == "06_ntpsec" ]]; then
+        step_name="Configure SR-IOV drivers (iavf/i40evf) + NTPsec"
+      fi
 
-  local choice
-  # Temporarily disable set -e to handle cancel gracefully
-  set +e
-  choice=$(whiptail --title "XDR Installer - Select Step to Run" \
-                    --menu "${centered_msg}" \
-                    "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                    "${menu_items[@]}" \
-                    3>&1 1>&2 2>&3)
-  local menu_rc=$?
-  set -e
-  
-  if [[ ${menu_rc} -ne 0 ]]; then
-    # ESC or Cancel pressed - return to main menu
-    return 0
-  fi
-  
-  # Additional check: if choice is empty, also return
-  if [[ -z "${choice}" ]]; then
-    return 0
-  fi
-  
-  # Handle Back menu selection
-  if [[ "${choice}" == "back" ]]; then
-    return 0
-  fi
-  
-  # Find the index of the selected step by matching the number
-  local idx
-  for ((idx=0; idx<NUM_STEPS; idx++)); do
-    local step_num="${STEP_IDS[$idx]%%_*}"
-    if [[ "${step_num}" == "${choice}" ]]; then
-      run_step "${idx}"
-      return
+      if [[ "${LAST_COMPLETED_STEP}" == "${step_id}" ]]; then
+        status="[✓]"
+      elif [[ -n "${LAST_COMPLETED_STEP}" ]]; then
+        local last_idx
+        last_idx=$(get_step_index_by_id "${LAST_COMPLETED_STEP}")
+        if [[ ${last_idx} -ge 0 && ${i} -le ${last_idx} ]]; then
+          status="[✓]"
+        fi
+      fi
+
+      # Use step number as tag (instead of step_id) for cleaner display
+      menu_items+=("${step_num}" "${step_name} ${status}")
+    done
+
+    # Calculate menu size dynamically
+    local menu_item_count=${NUM_STEPS}
+    local menu_dims
+    menu_dims=$(calc_menu_size "${menu_item_count}" 100 10)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Center-align the menu message
+    local centered_msg
+    centered_msg=$(center_menu_message "Select step to execute:" "${menu_height}")
+
+    local choice
+    choice=$(whiptail --title "XDR Installer - Step Selection" \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "${menu_items[@]}" \
+                      3>&1 1>&2 2>&3) || {
+      # ESC or Cancel pressed - return to main menu
+      break
+    }
+
+    # Convert step number (e.g., "01") to step index (0-based)
+    local step_index=$((10#${choice} - 1))
+    if [[ ${step_index} -ge 0 && ${step_index} -lt ${NUM_STEPS} ]]; then
+      run_step "${step_index}"
+    else
+      log "ERROR: Invalid step number '${choice}'"
+      continue
     fi
   done
-  
-  log "ERROR: Selected step number '${choice}' not found in STEP_IDS"
-  return 1
 }
 
 menu_auto_continue_from_state() {
+  load_config
   local next_idx
   next_idx=$(get_next_step_index)
 
@@ -9271,6 +12852,11 @@ menu_auto_continue_from_state() {
   fi
 
   local next_step_name="${STEP_NAMES[$next_idx]}"
+  # STEP 06 always includes SR-IOV driver installation + NTPsec
+  local next_step_id="${STEP_IDS[$next_idx]}"
+  if [[ "${next_step_id}" == "06_ntpsec" ]]; then
+    next_step_name="Configure SR-IOV drivers (iavf/i40evf) + NTPsec"
+  fi
 
   # Calculate dialog size dynamically for yesno
   local dialog_dims

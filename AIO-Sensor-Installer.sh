@@ -371,7 +371,7 @@ show_textbox() {
 #   2) When passing title + file   : show_paged "Title" "/path/to/file"
 #######################################
 show_paged() {
-  local title file tmpfile
+  local title file tmpfile no_clear
 
   # ANSI Color Definition
   local RED="\033[1;31m"
@@ -382,6 +382,7 @@ show_paged() {
   local RESET="\033[0m"
 
   # --- Argument processing (safe for set -u environment) ---
+  no_clear="0"
   if [[ $# -eq 1 ]]; then
     # ① Case when only one argument is provided: content string only
     title="XDR AIO & Sensor Installer Guide"
@@ -392,12 +393,17 @@ show_paged() {
     # ② Two or more arguments: 1 = title, 2 = file path
     title="$1"
     file="$2"
+    if [[ "${3:-}" == "no-clear" ]]; then
+      no_clear="1"
+    fi
   else
     echo "show_paged: no content provided" >&2
     return 1
   fi
 
-  clear
+  if [[ "${no_clear}" -eq 0 ]]; then
+    clear
+  fi
   echo -e "${CYAN}============================================================${RESET}"
   echo -e "  ${YELLOW}${title}${RESET}"
   echo -e "${CYAN}============================================================${RESET}"
@@ -605,6 +611,18 @@ load_config() {
   : "${HOST_NIC:=}"
   : "${DATA_NIC:=}"
   : "${HOST_ACCESS_NIC:=}"
+  : "${HOST_NIC_PCI:=}"
+  : "${HOST_NIC_MAC:=}"
+  : "${HOST_NIC_EFFECTIVE:=}"
+  : "${HOST_ACCESS_NIC_PCI:=}"
+  : "${HOST_ACCESS_NIC_MAC:=}"
+  : "${HOST_ACCESS_NIC_EFFECTIVE:=}"
+  : "${DATA_NIC_PCI:=}"
+  : "${DATA_NIC_MAC:=}"
+  : "${DATA_NIC_EFFECTIVE:=}"
+  
+  # Load renamed interface names if available
+  : "${HOST_NIC_RENAMED:=}"
 
   : "${SPAN_NICS:=}"
 
@@ -735,6 +753,15 @@ AUTO_REBOOT_AFTER_STEP_ID="${AUTO_REBOOT_AFTER_STEP_ID}"
 HOST_NIC="${esc_host_nic}"
 DATA_NIC="${esc_data_nic}"
 HOST_ACCESS_NIC="${esc_host_access_nic}"
+HOST_NIC_PCI="${HOST_NIC_PCI//\"/\\\"}"
+HOST_NIC_MAC="${HOST_NIC_MAC//\"/\\\"}"
+HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE//\"/\\\"}"
+HOST_ACCESS_NIC_PCI="${HOST_ACCESS_NIC_PCI//\"/\\\"}"
+HOST_ACCESS_NIC_MAC="${HOST_ACCESS_NIC_MAC//\"/\\\"}"
+HOST_ACCESS_NIC_EFFECTIVE="${HOST_ACCESS_NIC_EFFECTIVE//\"/\\\"}"
+DATA_NIC_PCI="${DATA_NIC_PCI//\"/\\\"}"
+DATA_NIC_MAC="${DATA_NIC_MAC//\"/\\\"}"
+DATA_NIC_EFFECTIVE="${DATA_NIC_EFFECTIVE//\"/\\\"}"
 SPAN_NICS="${esc_span_nics}"
 
 # ---- AIO Configuration ----
@@ -801,7 +828,17 @@ save_config_var() {
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_NIC)       DATA_NIC="${value}" ;;
     HOST_ACCESS_NIC) HOST_ACCESS_NIC="${value}" ;;
+    HOST_NIC_PCI)   HOST_NIC_PCI="${value}" ;;
+    HOST_NIC_MAC)   HOST_NIC_MAC="${value}" ;;
+    HOST_NIC_EFFECTIVE) HOST_NIC_EFFECTIVE="${value}" ;;
+    HOST_ACCESS_NIC_PCI) HOST_ACCESS_NIC_PCI="${value}" ;;
+    HOST_ACCESS_NIC_MAC) HOST_ACCESS_NIC_MAC="${value}" ;;
+    HOST_ACCESS_NIC_EFFECTIVE) HOST_ACCESS_NIC_EFFECTIVE="${value}" ;;
+    DATA_NIC_PCI)   DATA_NIC_PCI="${value}" ;;
+    DATA_NIC_MAC)   DATA_NIC_MAC="${value}" ;;
+    DATA_NIC_EFFECTIVE) DATA_NIC_EFFECTIVE="${value}" ;;
     SPAN_NICS)      SPAN_NICS="${value}" ;;
+    HOST_NIC_RENAMED) HOST_NIC_RENAMED="${value}" ;;
 
     # ---- AIO Configuration ----
     AIO_VM_COUNT) AIO_VM_COUNT="${value}" ;;
@@ -876,6 +913,20 @@ save_state() {
   cat > "${STATE_FILE}" <<EOF
 LAST_COMPLETED_STEP="${step_id}"
 LAST_RUN_TIME="$(date '+%F %T')"
+
+# NIC identity and effective names (updated after STEP 01/03)
+HOST_NIC="${HOST_NIC}"
+DATA_NIC="${DATA_NIC}"
+HOST_ACCESS_NIC="${HOST_ACCESS_NIC}"
+HOST_NIC_PCI="${HOST_NIC_PCI}"
+HOST_NIC_MAC="${HOST_NIC_MAC}"
+HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE}"
+HOST_ACCESS_NIC_PCI="${HOST_ACCESS_NIC_PCI}"
+HOST_ACCESS_NIC_MAC="${HOST_ACCESS_NIC_MAC}"
+HOST_ACCESS_NIC_EFFECTIVE="${HOST_ACCESS_NIC_EFFECTIVE}"
+DATA_NIC_PCI="${DATA_NIC_PCI}"
+DATA_NIC_MAC="${DATA_NIC_MAC}"
+DATA_NIC_EFFECTIVE="${DATA_NIC_EFFECTIVE}"
 EOF
 }
 
@@ -1375,6 +1426,141 @@ list_nic_candidates() {
     || true
 }
 
+# NIC identity helpers (PCI/MAC/resolve)
+normalize_pci() {
+  local p="$1"
+  if [[ -z "$p" ]]; then echo ""; return 0; fi
+  if [[ "$p" =~ ^0000: ]]; then echo "$p"; return 0; fi
+  echo "0000:${p}"
+}
+
+normalize_mac() {
+  local mac="$1"
+  [[ -z "$mac" ]] && { echo ""; return 0; }
+  echo "$mac" | tr '[:upper:]' '[:lower:]' | tr -d ' ' | sed 's/-/:/g'
+}
+
+get_if_pci() {
+  local ifname="$1"
+  if [[ -z "$ifname" || ! -e "/sys/class/net/${ifname}/device" ]]; then
+    echo ""
+    return 0
+  fi
+  readlink -f "/sys/class/net/${ifname}/device" 2>/dev/null | awk -F/ '{print $NF}'
+}
+
+get_if_mac() {
+  local ifname="$1"
+  if [[ -z "$ifname" || ! -e "/sys/class/net/${ifname}/address" ]]; then
+    echo ""
+    return 0
+  fi
+  cat "/sys/class/net/${ifname}/address" 2>/dev/null || echo ""
+}
+
+find_if_by_pci() {
+  local pci="$1"
+  [[ -z "$pci" ]] && { echo ""; return 0; }
+  pci="$(normalize_pci "$pci")"
+  local iface name iface_pci
+  for iface in /sys/class/net/*; do
+    name="$(basename "$iface")"
+    [[ "$name" =~ ^(lo|virbr|vnet|tap|docker|br-|ovs) ]] && continue
+    iface_pci="$(get_if_pci "$name")"
+    if [[ "$iface_pci" == "$pci" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+find_if_by_mac() {
+  local mac="$1"
+  [[ -z "$mac" ]] && { echo ""; return 0; }
+  mac="$(normalize_mac "$mac")"
+  local iface name iface_mac
+  for iface in /sys/class/net/*; do
+    name="$(basename "$iface")"
+    [[ "$name" =~ ^(lo|virbr|vnet|tap|docker|br-|ovs) ]] && continue
+    iface_mac="$(get_if_mac "$name")"
+    if [[ "$iface_mac" == "$mac" ]]; then
+      echo "$name"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+resolve_ifname_by_identity() {
+  local pci="$1"
+  local mac="$2"
+  if [[ -n "$pci" ]]; then pci="$(normalize_pci "$pci")"; fi
+  if [[ -n "$mac" ]]; then mac="$(normalize_mac "$mac")"; fi
+  if [[ -n "$pci" ]]; then
+    local found_by_pci
+    found_by_pci="$(find_if_by_pci "$pci")"
+    if [[ -n "$found_by_pci" ]]; then
+      echo "$found_by_pci"
+      return 0
+    fi
+  fi
+  if [[ -n "$mac" ]]; then
+    local found_by_mac
+    found_by_mac="$(find_if_by_mac "$mac")"
+    if [[ -n "$found_by_mac" ]]; then
+      echo "$found_by_mac"
+      return 0
+    fi
+  fi
+  echo ""
+}
+
+get_effective_nic() {
+  local nic_type="$1"
+  local effective_var="" pci_var="" mac_var="" fallback_var=""
+  case "$nic_type" in
+    HOST)
+      effective_var="HOST_NIC_EFFECTIVE"
+      pci_var="HOST_NIC_PCI"
+      mac_var="HOST_NIC_MAC"
+      fallback_var="HOST_NIC"
+      ;;
+    HOST_ACCESS)
+      effective_var="HOST_ACCESS_NIC_EFFECTIVE"
+      pci_var="HOST_ACCESS_NIC_PCI"
+      mac_var="HOST_ACCESS_NIC_MAC"
+      fallback_var="HOST_ACCESS_NIC"
+      ;;
+    *)
+      echo ""
+      return 1
+      ;;
+  esac
+  local effective_name="${!effective_var:-}"
+  if [[ -n "$effective_name" ]] && ip link show "$effective_name" >/dev/null 2>&1; then
+    echo "$effective_name"
+    return 0
+  fi
+  local pci_val="${!pci_var:-}"
+  local mac_val="${!mac_var:-}"
+  if [[ -n "$pci_val" || -n "$mac_val" ]]; then
+    local resolved
+    resolved="$(resolve_ifname_by_identity "$pci_val" "$mac_val")"
+    if [[ -n "$resolved" ]]; then
+      echo "$resolved"
+      return 0
+    fi
+  fi
+  local fallback_name="${!fallback_var:-}"
+  if [[ -n "$fallback_name" ]] && ip link show "$fallback_name" >/dev/null 2>&1; then
+    echo "$fallback_name"
+    return 0
+  fi
+  echo ""
+  return 1
+}
+
 #######################################
 # Implementation for Each STEP
 #######################################
@@ -1629,6 +1815,8 @@ step_01_hw_detect() {
     DATA_NIC=""  # DATA NIC is not used in NAT mode
     save_config_var "HOST_NIC" "${HOST_NIC}"
     save_config_var "DATA_NIC" "${DATA_NIC}"
+    save_config_var "HOST_NIC_PCI" "$(get_if_pci "${nat_nic}")"
+    save_config_var "HOST_NIC_MAC" "$(get_if_mac "${nat_nic}")"
     save_config_var "SENSOR_NET_MODE" "${net_mode}"
   else
     log "ERROR: Network mode must be NAT. Current: ${net_mode}"
@@ -1755,6 +1943,8 @@ step_01_hw_detect() {
       log "Selected HOST_ACCESS_NIC: ${host_access_nic}"
       HOST_ACCESS_NIC="${host_access_nic}"
       save_config_var "HOST_ACCESS_NIC" "${HOST_ACCESS_NIC}"
+      save_config_var "HOST_ACCESS_NIC_PCI" "$(get_if_pci "${host_access_nic}")"
+      save_config_var "HOST_ACCESS_NIC_MAC" "$(get_if_mac "${host_access_nic}")"
     else
       HOST_ACCESS_NIC=""
       save_config_var "HOST_ACCESS_NIC" "${HOST_ACCESS_NIC}"
@@ -2116,251 +2306,116 @@ step_03_nic_ifupdown() {
 # STEP 03 - NAT Mode (OpenXDR NAT configuration)
 #######################################
 step_03_nat_mode() {
-  log "[STEP 03 NAT Mode] OpenXDR NAT-based network configuration"
+  log "[STEP 03 NAT Mode] OpenXDR NAT-based network configuration (Declarative)"
+  load_config
 
-  # NAT mode requires only HOST_NIC (NAT uplink NIC)
   if [[ -z "${HOST_NIC:-}" ]]; then
     whiptail_msgbox "STEP 03 - NAT NIC Not configured" "NAT uplink NIC (HOST_NIC) is not set.\n\nPlease select NAT uplink NIC in STEP 01 first." 12 70
     log "HOST_NIC (NAT uplink NIC) is empty, so STEP 03 NAT Mode cannot proceed."
     return 1
   fi
 
-  #######################################
-  # 0) Check NAT NIC PCI information
-  #######################################
+  cidr_to_netmask() {
+    local pfx="$1"
+    local mask=$(( 0xffffffff << (32-pfx) & 0xffffffff ))
+    printf "%d.%d.%d.%d\n" \
+      $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
+  }
+
+  parse_mgt_from_interfaces() {
+    local f="/etc/network/interfaces"
+    local fd="/etc/network/interfaces.d"
+    local ip="" netmask="" gw="" dns=""
+
+    if [[ -f "${fd}/01-mgt.cfg" ]]; then
+      ip="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${ip}" && -f "${f}" ]]; then
+      ip="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="address" {print $2; exit}' "${f}" 2>/dev/null || true)"
+      netmask="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="netmask" {print $2; exit}' "${f}" 2>/dev/null || true)"
+      gw="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="gateway" {print $2; exit}' "${f}" 2>/dev/null || true)"
+      dns="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}' "${f}" 2>/dev/null || true)"
+    fi
+
+    echo "${ip}|${netmask}|${gw}|${dns}"
+  }
+
+  local desired_host_if
+  desired_host_if="$(resolve_ifname_by_identity "${HOST_NIC_PCI:-}" "${HOST_NIC_MAC:-}")"
+  [[ -z "${desired_host_if}" ]] && desired_host_if="${HOST_NIC}"
+
+  if [[ ! -d "/sys/class/net/${desired_host_if}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC Not Found" "NAT uplink NIC '${desired_host_if}' does not exist on this system.\n\nRe-run STEP 01 and select the correct NIC." 12 70
+    log "ERROR: NAT uplink NIC '${desired_host_if}' not found in /sys/class/net"
+    return 1
+  fi
+
   local nat_pci
-  nat_pci=$(readlink -f "/sys/class/net/${HOST_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-
+  nat_pci="${HOST_NIC_PCI:-}"
   if [[ -z "${nat_pci}" ]]; then
-    whiptail --title "STEP 03 - PCI information Error" \
-    whiptail_msgbox "STEP 03 - PCI information Error" "Could not retrieve PCI bus information for selected NAT NIC.\n\nPlease check /sys/class/net/${HOST_NIC}/device" 12 70
-    log "NAT_NIC=${HOST_NIC}(${nat_pci}) → insufficient PCI information."
-    return 1
+    nat_pci="$(readlink -f "/sys/class/net/${desired_host_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+  fi
+    if [[ -z "${nat_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - PCI Information Error" "Could not retrieve PCI bus information for NAT uplink NIC.\n\nNIC: ${desired_host_if}\n\nPlease re-run STEP 01 to verify and select the correct NIC." 14 80
+    log "ERROR: NAT uplink NIC PCI information not found for ${desired_host_if}"
+      return 1
   fi
 
-  local tmp_pci="${STATE_DIR}/xdr_step03_pci.txt"
-  {
-    echo "Selected NAT network NIC and PCI information"
-    echo "------------------------------------"
-    echo "NAT uplink NIC  : ${HOST_NIC}"
-    echo "  -> PCI     : ${nat_pci}"
-    echo
-    echo "AIO & Sensor VM will be virbr0 connected to NAT bridge."
-  } > "${tmp_pci}"
-
-  show_textbox "STEP 03 - NAT NIC/PCI Verification" "${tmp_pci}"
-  
-  #######################################
-  # Check if desired NAT configuration already exists
-  #######################################
-  local maybe_done=0
-  local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
-  local iface_file="/etc/network/interfaces"
-  local host_cfg="/etc/network/interfaces.d/02-hostmgmt.cfg"
-
-  if [[ -f "${udev_file}" ]] && \
-     grep -q "KERNELS==\"${nat_pci}\".*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null; then
-    if [[ -f "${iface_file}" ]] && \
-       grep -q "^auto mgt" "${iface_file}" 2>/dev/null && \
-       grep -q "iface mgt inet static" "${iface_file}" 2>/dev/null; then
-      # Check hostmgmt if HOST_ACCESS_NIC is set
+  local host_access_pci=""
       if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
-        local host_access_pci
-        host_access_pci=$(readlink -f "/sys/class/net/${HOST_ACCESS_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-        if [[ -n "${host_access_pci}" ]] && \
-           grep -q "KERNELS==\"${host_access_pci}\".*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null && \
-           [[ -f "${host_cfg}" ]] && \
-           grep -q "^auto hostmgmt" "${host_cfg}" 2>/dev/null && \
-           grep -q "address 192\.168\.0\.100" "${host_cfg}" 2>/dev/null; then
-          maybe_done=1
-        fi
-      else
-        maybe_done=1
-      fi
+    local desired_host_access_if
+    desired_host_access_if="$(resolve_ifname_by_identity "${HOST_ACCESS_NIC_PCI:-}" "${HOST_ACCESS_NIC_MAC:-}")"
+    [[ -z "${desired_host_access_if}" ]] && desired_host_access_if="${HOST_ACCESS_NIC}"
+    if [[ ! -d "/sys/class/net/${desired_host_access_if}" ]]; then
+      whiptail_msgbox "STEP 03 - NIC Not Found" "HOST_ACCESS_NIC '${desired_host_access_if}' does not exist on this system.\n\nRe-run STEP 01 and select the correct NIC." 12 70
+      log "ERROR: HOST_ACCESS_NIC '${desired_host_access_if}' not found in /sys/class/net"
+      return 1
+    fi
+    host_access_pci="${HOST_ACCESS_NIC_PCI:-}"
+    if [[ -z "${host_access_pci}" ]]; then
+      host_access_pci="$(readlink -f "/sys/class/net/${desired_host_access_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+    fi
+    if [[ -z "${host_access_pci}" ]]; then
+      whiptail_msgbox "STEP 03 - PCI Information Error" "Could not retrieve PCI bus information for HOST_ACCESS_NIC.\n\nNIC: ${desired_host_access_if}\n\nPlease re-run STEP 01 to verify and select the correct NIC." 14 80
+      log "ERROR: HOST_ACCESS_NIC PCI information not found for ${desired_host_access_if}"
+      return 1
     fi
   fi
 
-  if [[ "${maybe_done}" -eq 1 ]]; then
-    if whiptail --title "STEP 03 - Already configured thing same" \
-    if whiptail_yesno "STEP 03 - Already configured thing same" "Looking at udev rules and /etc/network/interfaces, NAT configuration seems to be already done.\n\nDo you want to skip this STEP?" 12 80
-    then
-      log "User chose to skip STEP 03 NAT Mode (already configured)."
-      return 0
-    fi
-    log "User chose to force re-execute STEP 03 NAT Mode."
-  fi
+  local parsed ip0 nm0 gw0 dns0
+  parsed="$(parse_mgt_from_interfaces)"
+  ip0="${parsed%%|*}"; parsed="${parsed#*|}"
+  nm0="${parsed%%|*}"; parsed="${parsed#*|}"
+  gw0="${parsed%%|*}"; parsed="${parsed#*|}"
+  dns0="${parsed}"
 
-  #######################################
-  # 1) mgt IP collect configuration values (OpenXDR method)
-  #######################################
-  local cur_cidr cur_ip cur_prefix cur_gw cur_dns
-  cur_cidr=$(ip -4 -o addr show dev "${HOST_NIC}" 2>/dev/null | awk '{print $4}' | head -n1)
-  if [[ -n "${cur_cidr}" ]]; then
-    cur_ip="${cur_cidr%/*}"
-    cur_prefix="${cur_cidr#*/}"
-  else
-    cur_ip=""
-    cur_prefix="24"
-  fi
+  local def_ip="${MGT_IP_ADDR:-$ip0}"
+  local def_prefix="${MGT_IP_PREFIX:-24}"
+  local def_gw="${MGT_GW:-$gw0}"
+  local def_dns="${MGT_DNS:-$dns0}"
+  [[ -z "${def_dns}" ]] && def_dns="8.8.8.8 8.8.4.4"
 
-  # Find gateway
-  cur_gw=$(ip route | awk '/default.*'"${HOST_NIC}"'/ {print $3}' | head -n1)
-  [[ -z "${cur_gw}" ]] && cur_gw=$(ip route | awk '/default/ {print $3}' | head -n1)
+  local new_ip new_prefix new_gw new_dns
+  new_ip="$(whiptail_inputbox "STEP 03 - mgt NIC IP Configuration" "Enter NAT uplink NIC (mgt) IP address:" "${def_ip}" 8 60)" || return 1
+  [[ -z "${new_ip}" ]] && return 1
+  new_prefix="$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${def_prefix}" 8 60)" || return 1
+  [[ -z "${new_prefix}" ]] && return 1
+  new_gw="$(whiptail_inputbox "STEP 03 - Gateway Configuration" "Enter gateway IP:" "${def_gw}" 8 60)" || return 1
+  [[ -z "${new_gw}" ]] && return 1
+  new_dns="$(whiptail_inputbox "STEP 03 - DNS configuration" "Please enter DNS server IPs (space-separated):" "${def_dns}" 8 70)" || return 1
+  [[ -z "${new_dns}" ]] && return 1
 
-  # Find DNS (Ubuntu 24.04 uses systemd-resolved, so get actual DNS servers from the interface)
-  cur_dns=""
-  
-  # Method 1: Try resolvectl status for the specific interface (most accurate for Ubuntu 24.04)
-  if command -v resolvectl >/dev/null 2>&1; then
-    # Get DNS servers for the current interface
-    local iface_dns
-    iface_dns=$(resolvectl status "${HOST_NIC}" 2>/dev/null | awk '/DNS Servers:/ {getline; while (NF > 0 && $1 !~ /^Link/ && $1 !~ /^DNS/) {print $1; getline}}' 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-    if [[ -n "${iface_dns}" ]]; then
-      cur_dns="${iface_dns}"
-    else
-      # If interface-specific DNS not found, try global DNS
-      iface_dns=$(resolvectl status 2>/dev/null | awk '/DNS Servers:/ {getline; while (NF > 0 && $1 !~ /^Link/ && $1 !~ /^DNS/) {print $1; getline}}' 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-      [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
-    fi
-  fi
-  
-  # Method 2: Try /run/systemd/resolve/resolv.conf (systemd-resolved actual config)
-  if [[ -z "${cur_dns}" ]] && [[ -f /run/systemd/resolve/resolv.conf ]]; then
-    local all_dns
-    all_dns=$(awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf 2>/dev/null | grep -v "^127.0.0" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-    [[ -n "${all_dns}" ]] && cur_dns="${all_dns}"
-  fi
-  
-  # Method 3: Try to get DNS from netplan configuration (Ubuntu 18.04+)
-  if [[ -z "${cur_dns}" ]] && [[ -d /etc/netplan ]]; then
-    local netplan_file
-    # Find the first netplan YAML file
-    netplan_file=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
-    if [[ -n "${netplan_file}" && -f "${netplan_file}" ]]; then
-      local iface_dns=""
-      
-      # Try using yq if available (most accurate)
-      if command -v yq >/dev/null 2>&1; then
-        # Try to get DNS from the specific interface
-        iface_dns=$(yq eval ".network.ethernets.\"${HOST_NIC}\".nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        if [[ -z "${iface_dns}" ]]; then
-          # Try dhcp4-overrides
-          iface_dns=$(yq eval ".network.ethernets.\"${HOST_NIC}\".dhcp4-overrides.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
-        if [[ -z "${iface_dns}" ]]; then
-          # Try bridges
-          iface_dns=$(yq eval ".network.bridges.*.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
-        if [[ -z "${iface_dns}" ]]; then
-          # Try any ethernet interface
-          iface_dns=$(yq eval ".network.ethernets.*.nameservers.addresses[]?" "${netplan_file}" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
-      else
-        # Fallback: simple grep/awk parsing (works without yq)
-        # Extract DNS IPs from nameservers.addresses sections
-        # Pattern: nameservers: ... addresses: [IP1, IP2] or addresses: - IP1 - IP2
-        local dns_list=""
-        
-        # Method 1: Look for addresses: [IP1, IP2, ...] format
-        dns_list=$(grep -A 5 "nameservers:" "${netplan_file}" 2>/dev/null | \
-          grep -E "addresses:\s*\[" -A 10 | \
-          grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | \
-          tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        
-        # Method 2: Look for addresses: - IP format (if Method 1 didn't find anything)
-        if [[ -z "${dns_list}" ]]; then
-          dns_list=$(grep -A 10 "nameservers:" "${netplan_file}" 2>/dev/null | \
-            grep -E "^\s+-\s+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | \
-            sed 's/.*-\s*\([0-9.]*\).*/\1/' | \
-            tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
-        
-        # Method 3: Look for any IP addresses after nameservers: (more flexible)
-        if [[ -z "${dns_list}" ]]; then
-          dns_list=$(awk '/nameservers:/ {flag=1; next} 
-                         flag && /addresses:/ {flag=2; next}
-                         flag==2 && /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ {gsub(/[^0-9.]/,"",$0); if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $0; if (/^[[:space:]]*[a-zA-Z]/) flag=0}
-                         /^[[:space:]]*[a-zA-Z]+:/ && !/nameservers/ && !/addresses/ {flag=0}' "${netplan_file}" 2>/dev/null | \
-            tr '\n' ' ' | sed 's/[[:space:]]*$//')
-        fi
-        
-        iface_dns="${dns_list}"
-      fi
-      
-      [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
-    fi
-  fi
-  
-  # Method 4: Try to get DNS from network interface configuration (ifupdown style)
-  if [[ -z "${cur_dns}" ]] && [[ -f /etc/network/interfaces ]]; then
-    # Try to find DNS from the interface that matches HOST_NIC or mgt
-    local iface_dns
-    iface_dns=$(awk '/^[[:space:]]*iface.*'"${HOST_NIC}"'/,/^[[:space:]]*iface/ {if (/^[[:space:]]*dns-nameservers/) {for (i=2; i<=NF; i++) printf "%s ", $i; exit}}' /etc/network/interfaces 2>/dev/null | sed 's/[[:space:]]*$//')
-    if [[ -z "${iface_dns}" ]]; then
-      # Try mgt interface
-      iface_dns=$(awk '/^[[:space:]]*iface.*mgt/,/^[[:space:]]*iface/ {if (/^[[:space:]]*dns-nameservers/) {for (i=2; i<=NF; i++) printf "%s ", $i; exit}}' /etc/network/interfaces 2>/dev/null | sed 's/[[:space:]]*$//')
-    fi
-    [[ -n "${iface_dns}" ]] && cur_dns="${iface_dns}"
-  fi
-  
-  # Method 5: Try /etc/resolv.conf (but skip if it's 127.0.0.53)
-  if [[ -z "${cur_dns}" ]]; then
-    local resolv_dns
-    resolv_dns=$(awk '/nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -v "^127.0.0" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
-    [[ -n "${resolv_dns}" ]] && cur_dns="${resolv_dns}"
-  fi
-  
-  # Fallback to default if still empty
-  [[ -z "${cur_dns}" ]] && cur_dns="8.8.8.8"
-  
-  log "[STEP 03 NAT Mode] Detected DNS servers for ${HOST_NIC}: ${cur_dns}"
+  local netmask
+  netmask="$(cidr_to_netmask "${new_prefix}")"
 
-  # IP configuration Receive input
-  local new_ip new_netmask new_gw new_dns
-  new_ip=$(whiptail_inputbox "STEP 03 - mgt NIC IP Configuration" \
-                    "Enter NAT uplink NIC (mgt) IP address:" \
-                    "${cur_ip}" \
-                    8 60)
-  if [[ -z "${new_ip}" ]]; then
-    log "User canceled IP input."
-    return 1
-  fi
-
-  # Convert prefix to netmask
-  local netmask=""
-  case "${cur_prefix}" in
-    24) netmask="255.255.255.0" ;;
-    16) netmask="255.255.0.0" ;;
-    8)  netmask="255.0.0.0" ;;
-    *)  netmask="255.255.255.0" ;;
-  esac
-
-  new_netmask=$(whiptail_inputbox "STEP 03 - Netmask Configuration" \
-                         "Enter netmask:" \
-                         "${netmask}" \
-                         8 60)
-  if [[ -z "${new_netmask}" ]]; then
-    log "User canceled netmask input."
-    return 1
-  fi
-
-  new_gw=$(whiptail_inputbox "STEP 03 - Gateway Configuration" \
-                    "Enter gateway IP:" \
-                    "${cur_gw}" \
-                    8 60)
-  if [[ -z "${new_gw}" ]]; then
-    log "User canceled gateway input."
-    return 1
-  fi
-
-  new_dns=$(whiptail_inputbox "STEP 03 - DNS configuration" \
-                     "Please enter DNS server IP:" \
-                     "${cur_dns}" \
-                     8 60)
-  if [[ -z "${new_dns}" ]]; then
-    log "User canceled DNS input."
-    return 1
-  fi
+  save_config_var "MGT_IP_ADDR" "${new_ip}"
+  save_config_var "MGT_IP_PREFIX" "${new_prefix}"
+  save_config_var "MGT_GW" "${new_gw}"
+  save_config_var "MGT_DNS" "${new_dns}"
 
   #######################################
   # 2) Create udev rule (NAT uplink NIC → mgt rename + SPAN NIC name fixed)
@@ -2388,7 +2443,10 @@ SUBSYSTEM==\"net\", ACTION==\"add\", KERNELS==\"${span_pci}\", NAME:=\"${span_ni
   local hostmgmt_udev_rule=""
   if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
     local host_access_pci
-    host_access_pci=$(readlink -f "/sys/class/net/${HOST_ACCESS_NIC}/device" 2>/dev/null | awk -F'/' '{print $NF}')
+    local actual_host_access_nic=""
+    actual_host_access_nic="$(get_effective_nic "HOST_ACCESS")" || true
+    [[ -z "${actual_host_access_nic}" ]] && actual_host_access_nic="${HOST_ACCESS_NIC}"
+    host_access_pci=$(readlink -f "/sys/class/net/${actual_host_access_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
     if [[ -n "${host_access_pci}" ]]; then
       hostmgmt_udev_rule="
 
@@ -2400,85 +2458,197 @@ SUBSYSTEM==\"net\", ACTION==\"add\", KERNELS==\"${host_access_pci}\", NAME:=\"ho
     fi
   fi
 
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] /etc/udev/rules.d/99-custom-ifnames.rules create"
-    log "[DRY-RUN] Add NAT mgt NIC + SPAN NIC name fixed rule + hostmgmt rule"
-  else
-    cat > /etc/udev/rules.d/99-custom-ifnames.rules <<EOF
+  local udev_file="/etc/udev/rules.d/99-custom-ifnames.rules"
+  local udev_lib_file="/usr/lib/udev/rules.d/99-custom-ifnames.rules"
+  local udev_content
+  udev_content=$(cat <<EOF
 # XDR NAT Mode - Custom interface names
 SUBSYSTEM=="net", ACTION=="add", KERNELS=="${nat_pci}", NAME:="mgt"${hostmgmt_udev_rule}${span_udev_rules}
 EOF
+)
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] ${udev_file} will be created with the following content:\n${udev_content}"
+    log "[DRY-RUN] ${udev_lib_file} will be created with the following content:\n${udev_content}"
+    log "[DRY-RUN] Would run: sudo update-initramfs -u -k all"
+  else
+    printf "%s\n" "${udev_content}" > "${udev_file}"
+    printf "%s\n" "${udev_content}" > "${udev_lib_file}"
+    chmod 644 "${udev_file}" || true
+    chmod 644 "${udev_lib_file}" || true
     log "udev rule file creation completed (mgt + hostmgmt + SPAN NIC name fixed)"
+    log "[STEP 03 NAT Mode] Updating initramfs to apply udev rename on reboot"
+    run_cmd "sudo update-initramfs -u -k all"
   fi
 
   #######################################
-  # 3) /etc/network/interfaces configuration (OpenXDR method)
+  # 2.5) Update state file with renamed interface name (NAT Mode)
   #######################################
-  log "[STEP 03 NAT Mode] Configuring /etc/network/interfaces"
-  if [[ "${DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] Configuring /etc/network/interfaces for mgt NIC"
-  else
-    cp /etc/network/interfaces /etc/network/interfaces.backup.$(date +%Y%m%d-%H%M%S)
-    
-    cat > /etc/network/interfaces <<EOF
-# This file describes the network interfaces available on your system
-# and how to activate them. For more information, see interfaces(5).
+  log "[STEP 03 NAT Mode] Updating state file with renamed interface name"
 
+  if [[ "${DRY_RUN}" -ne 1 ]]; then
+    save_config_var "HOST_NIC_EFFECTIVE" "mgt"
+    save_config_var "HOST_NIC" "mgt"
+    save_config_var "HOST_NIC_RENAMED" "mgt"
+    if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+      save_config_var "HOST_ACCESS_NIC_EFFECTIVE" "hostmgmt"
+      save_config_var "HOST_ACCESS_NIC" "hostmgmt"
+      log "[STEP 03 NAT Mode] HOST_ACCESS_NIC will be renamed to hostmgmt after reboot"
+    else
+      log "[INFO] HOST_ACCESS_NIC not set; hostmgmt will not be configured"
+    fi
+  else
+    log "[DRY-RUN] Would save HOST_NIC_EFFECTIVE/HOST_ACCESS_NIC_EFFECTIVE"
+  fi
+
+  #######################################
+  # 3) /etc/network/interfaces configuration (Declarative)
+  #######################################
+  log "[STEP 03 NAT Mode] Configuring /etc/network/interfaces (declarative)"
+
+  local iface_file="/etc/network/interfaces"
+  local iface_dir="/etc/network/interfaces.d"
+  local mgt_cfg="${iface_dir}/01-mgt.cfg"
+  local host_cfg="${iface_dir}/02-hostmgmt.cfg"
+
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mkdir -p "${iface_dir}"
+  fi
+
+  local iface_content
+  iface_content=$(cat <<EOF
 source /etc/network/interfaces.d/*
 
-# The loopback network interface
 auto lo
 iface lo inet loopback
+EOF
+)
 
-# Management interface (NAT uplink)
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] ${iface_file} will be created with the following content:\n${iface_content}"
+  else
+    printf "%s\n" "${iface_content}" > "${iface_file}"
+  fi
+
+  local mgt_content
+  mgt_content=$(cat <<EOF
 auto mgt
 iface mgt inet static
     address ${new_ip}
-    netmask ${new_netmask}
+    netmask ${netmask}
     gateway ${new_gw}
     dns-nameservers ${new_dns}
 EOF
-    log "/etc/network/interfaces configuration completed"
+)
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Will write to ${mgt_cfg}:\n${mgt_content}"
+  else
+    printf "%s\n" "${mgt_content}" > "${mgt_cfg}"
   fi
 
-  #######################################
-  # 3-1) Create /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt, no gateway, fixed IP)
-  #######################################
   if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
-    log "[STEP 03 NAT Mode] Creating /etc/network/interfaces.d/02-hostmgmt.cfg (hostmgmt: 192.168.0.100/24, no gateway)"
-
-    local iface_dir="/etc/network/interfaces.d"
-    local host_cfg="${iface_dir}/02-hostmgmt.cfg"
-    local host_bak="${host_cfg}.$(date +%Y%m%d-%H%M%S).bak"
-
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-      mkdir -p "${iface_dir}"
-    fi
-
-    if [[ -f "${host_cfg}" && "${DRY_RUN}" -eq 0 ]]; then
-      cp -a "${host_cfg}" "${host_bak}"
-      log "Backed up existing ${host_cfg}: ${host_bak}"
-    fi
-
     local host_content
     host_content=$(cat <<EOF
-# Host direct management interface (no gateway)
 auto hostmgmt
 iface hostmgmt inet static
     address 192.168.0.100
     netmask 255.255.255.0
 EOF
 )
-
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       log "[DRY-RUN] Will write the following content to ${host_cfg}:\n${host_content}"
     else
       printf "%s\n" "${host_content}" > "${host_cfg}"
-      log "Created ${host_cfg} (hostmgmt: 192.168.0.100/24, no gateway)"
     fi
   else
     log "[STEP 03 NAT Mode] HOST_ACCESS_NIC not set, skipping hostmgmt interface configuration"
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      rm -f "${host_cfg}" 2>/dev/null || true
+    fi
   fi
+
+  #######################################
+  # 3-1) File-based verification (no runtime checks)
+  #######################################
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[STEP 03] DRY-RUN: Skipping file-based verification"
+  else
+    local verify_failed=0
+    local verify_errors=""
+
+    if [[ ! -f "${udev_file}" ]] || [[ ! -f "${udev_lib_file}" ]] || \
+       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_file}"
+      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_lib_file}"
+    fi
+
+    if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+      if [[ -z "${host_access_pci}" ]] || \
+         ! grep -qE "KERNELS==\"${host_access_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${host_access_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- hostmgmt udev rule missing or invalid"
+      fi
+    fi
+
+    if [[ ! -f "${iface_file}" ]] || \
+       ! grep -qE '^[[:space:]]*source[[:space:]]+/etc/network/interfaces\.d/\*' "${iface_file}" 2>/dev/null || \
+       ! grep -qE '^[[:space:]]*auto[[:space:]]+lo([[:space:]]|$)' "${iface_file}" 2>/dev/null || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+lo[[:space:]]+inet[[:space:]]+loopback([[:space:]]|$)' "${iface_file}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- /etc/network/interfaces is missing required base content"
+    fi
+
+    if [[ ! -f "${mgt_cfg}" ]] || \
+       ! grep -qE '^[[:space:]]*iface[[:space:]]+mgt[[:space:]]+inet[[:space:]]+static' "${mgt_cfg}" 2>/dev/null || \
+       ! grep -qE "^[[:space:]]*address[[:space:]]+${new_ip}$" "${mgt_cfg}" 2>/dev/null || \
+       ! grep -qE "^[[:space:]]*netmask[[:space:]]+${netmask}$" "${mgt_cfg}" 2>/dev/null || \
+       ! grep -qE "^[[:space:]]*gateway[[:space:]]+${new_gw}$" "${mgt_cfg}" 2>/dev/null || \
+       ! grep -qE "^[[:space:]]*dns-nameservers[[:space:]]+${new_dns}$" "${mgt_cfg}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- mgt config invalid: ${mgt_cfg}"
+    fi
+
+    if [[ -n "${HOST_ACCESS_NIC:-}" ]]; then
+      if [[ ! -f "${host_cfg}" ]] || \
+         ! grep -qE '^[[:space:]]*iface[[:space:]]+hostmgmt[[:space:]]+inet[[:space:]]+static' "${host_cfg}" 2>/dev/null || \
+         ! grep -qE '^[[:space:]]*address[[:space:]]+192\.168\.0\.100$' "${host_cfg}" 2>/dev/null || \
+         ! grep -qE '^[[:space:]]*netmask[[:space:]]+255\.255\.255\.0$' "${host_cfg}" 2>/dev/null; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- hostmgmt config invalid: ${host_cfg}"
+      fi
+    fi
+
+    if [[ "${verify_failed}" -eq 1 ]]; then
+      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      log "[ERROR] STEP 03 file verification failed:${verify_errors}"
+      return 1
+    fi
+  fi
+
+  log "[STEP 03 NAT Mode] Install ifupdown and disable netplan (no restart)"
+  local missing_pkgs=()
+  dpkg -s ifupdown >/dev/null 2>&1 || missing_pkgs+=("ifupdown")
+  dpkg -s net-tools >/dev/null 2>&1 || missing_pkgs+=("net-tools")
+  if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+    run_cmd "sudo apt update"
+    run_cmd "sudo apt install -y ${missing_pkgs[*]}"
+  fi
+
+  if compgen -G "/etc/netplan/*.yaml" > /dev/null; then
+    run_cmd "sudo mkdir -p /etc/netplan/disabled"
+    run_cmd "sudo mv /etc/netplan/*.yaml /etc/netplan/disabled/"
+  fi
+
+  run_cmd "sudo systemctl stop systemd-networkd || true"
+  run_cmd "sudo systemctl disable systemd-networkd || true"
+  run_cmd "sudo systemctl mask systemd-networkd || true"
+  run_cmd "sudo systemctl mask systemd-networkd-wait-online || true"
+  run_cmd "sudo systemctl mask netplan-* || true"
+  run_cmd "sudo systemctl unmask networking || true"
+  run_cmd "sudo systemctl enable networking || true"
 
   #######################################
   # 4) Process SPAN NICs
@@ -2516,14 +2686,14 @@ EOF
 NAT network configuration completed.
 
 Network configuration:
-- NAT uplink NIC  : ${HOST_NIC} → mgt (${new_ip}/${new_netmask})
+- NAT uplink NIC  : ${HOST_NIC} → mgt (${new_ip}/${netmask})
 - Gateway      : ${new_gw}
 - DNS          : ${new_dns}
 - Sensor VM      : Connected to virbr0 NAT bridge (192.168.122.0/24)${HOST_ACCESS_NIC:+
 - Host access NIC : ${HOST_ACCESS_NIC} → hostmgmt (192.168.0.100/24, no gateway)}
 - SPAN NICs   : ${SPAN_NIC_LIST:-None} (PCI passthrough specific)${span_summary_nat}
 
-udev rule     : /etc/udev/rules.d/99-custom-ifnames.rules
+udev rule     : /etc/udev/rules.d/99-custom-ifnames.rules + /usr/lib/udev/rules.d/99-custom-ifnames.rules
 network configuration  : /etc/network/interfaces${HOST_ACCESS_NIC:+
 hostmgmt configuration : /etc/network/interfaces.d/02-hostmgmt.cfg}
 
@@ -2554,6 +2724,92 @@ step_04_kvm_libvirt() {
   log "[STEP 04] KVM / Libvirt Installation and Basic Configuration"
   log "[STEP 04] This step will install and configure KVM/libvirt for VM management."
   load_config
+
+  #######################################
+  # Helper functions for STEP 04
+  #######################################
+  
+  # Check if systemd unit is active (service or socket)
+  is_systemd_unit_active_or_socket() {
+    local svc="$1"
+    # svc: libvirtd or virtlogd
+    if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+      return 0
+    fi
+    if systemctl is-active --quiet "${svc}.socket" 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  }
+
+  # Check if default network is in desired state (virsh-based)
+  is_default_net_desired_state() {
+    # Active check (with space tolerance and net-list fallback)
+    local active_check=0
+    if virsh net-info default 2>/dev/null | grep -qiE '^[[:space:]]*Active:[[:space:]]*yes'; then
+      active_check=1
+    else
+      # Fallback: check net-list --all for active status
+      if virsh net-list --all 2>/dev/null | awk 'NR>2 {print $1,$2}' | grep -qiE '^default[[:space:]]+active'; then
+        active_check=1
+      fi
+    fi
+    
+    if [[ ${active_check} -eq 0 ]]; then
+      return 1
+    fi
+
+    local xml
+    xml="$(virsh net-dumpxml default 2>/dev/null)" || return 1
+
+    # Required: IP address and netmask
+    if ! echo "$xml" | grep -q "ip address='192.168.122.1'"; then
+      return 1
+    fi
+    if ! echo "$xml" | grep -q "netmask='255.255.255.0'"; then
+      return 1
+    fi
+
+    # Required: DHCP must NOT exist
+    if echo "$xml" | grep -qi "<dhcp"; then
+      return 1
+    fi
+
+    # Optional checks (warn only, not failure conditions)
+    if ! echo "$xml" | grep -qi "<forward mode='nat'"; then
+      log "[STEP 04] Warning: default network XML may not have forward mode='nat' (continuing anyway)"
+    fi
+    if ! echo "$xml" | grep -qi "<bridge name='virbr0'"; then
+      log "[STEP 04] Warning: default network XML may not have bridge name='virbr0' (continuing anyway)"
+    fi
+
+    return 0
+  }
+
+  # Wait for default network to reach desired state (polling)
+  wait_for_default_net_desired_state() {
+    local timeout_sec="${1:-30}"
+    local interval_sec="${2:-1}"
+    local waited=0
+
+    while (( waited < timeout_sec )); do
+      if is_default_net_desired_state; then
+        return 0
+      fi
+      sleep "$interval_sec"
+      waited=$((waited + interval_sec))
+    done
+
+    # Debug outputs (do not exit here; caller decides)
+    log "[STEP 04] default network not in desired state after ${timeout_sec}s. Debug:"
+    log "[STEP 04] virsh net-list --all:"
+    virsh net-list --all 2>&1 | sed 's/^/[STEP 04]   /' || true
+    log "[STEP 04] virsh net-info default:"
+    virsh net-info default 2>&1 | sed 's/^/[STEP 04]   /' || true
+    log "[STEP 04] virsh net-dumpxml default (first 200 lines):"
+    virsh net-dumpxml default 2>&1 | sed -n '1,200p' | sed 's/^/[STEP 04]   /' || true
+    return 1
+  }
 
   # Force NAT mode only
   local net_mode="nat"
@@ -2660,6 +2916,34 @@ step_04_kvm_libvirt() {
   run_cmd "sudo systemctl enable --now libvirtd"
   run_cmd "sudo systemctl enable --now virtlogd"
 
+  # Wait for services to become active (with retry logic, considering socket-activation)
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    log "[STEP 04] Waiting for libvirtd/virtlogd to become active (service or socket)..."
+    local tries=10
+    local i
+    for i in $(seq 1 "$tries"); do
+      if is_systemd_unit_active_or_socket libvirtd && is_systemd_unit_active_or_socket virtlogd; then
+        log "[STEP 04] libvirtd/virtlogd are active (service or socket)"
+        break
+      fi
+      sleep 1
+    done
+
+    if ! is_systemd_unit_active_or_socket libvirtd; then
+      log "[WARN] libvirtd not active (service/socket) after wait"
+      log "[STEP 04] Debug: systemctl status libvirtd --no-pager:"
+      systemctl status libvirtd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
+    fi
+
+    if ! is_systemd_unit_active_or_socket virtlogd; then
+      log "[WARN] virtlogd not active (service/socket) after wait"
+      log "[STEP 04] Debug: systemctl status virtlogd --no-pager:"
+      systemctl status virtlogd --no-pager 2>&1 | sed 's/^/[STEP 04]   /' || true
+    fi
+  else
+    log "[DRY-RUN] Would wait for libvirtd/virtlogd services to become active"
+  fi
+
   #######################################
   # 4) default libvirt network configuration (NAT mode only)
   #######################################
@@ -2697,6 +2981,18 @@ EOF
     run_cmd "sudo virsh net-define \"${default_net_xml}\""
     run_cmd "sudo virsh net-autostart default"
     run_cmd "sudo virsh net-start default"
+    
+    # Wait for default network settings to apply (polling)
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      log "[STEP 04] Waiting for default network settings to apply (polling)..."
+      if ! wait_for_default_net_desired_state 30 1; then
+        log "[STEP 04] Prerequisite validation failed (default network not stabilized) -> rc=1"
+        return 1
+      fi
+      log "[STEP 04] Default network settings applied successfully."
+    else
+      log "[DRY-RUN] Would wait for default network settings to apply (polling)"
+    fi
     
     log "Sensor VM will use virbr0 NAT bridge (192.168.122.0/24)."
     
@@ -7298,88 +7594,182 @@ menu_config() {
   while true; do
     load_config
 
+    # Determine ACPS Password display text
+    local acps_password_display
+    if [[ -n "${ACPS_PASSWORD:-}" ]]; then
+      acps_password_display="(Configured)"
+    else
+      acps_password_display="(Not Set)"
+    fi
+
+    local msg
+    msg="Current Configuration\n\n"
+    msg+="DRY_RUN        : ${DRY_RUN}\n"
+    msg+="DP_VERSION     : ${DP_VERSION:-<Not Set>}\n"
+    msg+="SENSOR_VERSION : ${SENSOR_VERSION:-<Not Set>}\n"
+    msg+="ACPS_USER      : ${ACPS_USERNAME:-<Not Set>}\n"
+    msg+="ACPS_PASSWORD  : ${acps_password_display}\n"
+    msg+="ACPS_URL       : ${ACPS_BASE_URL:-<Not Set>}\n"
+    msg+="AUTO_REBOOT    : ${ENABLE_AUTO_REBOOT}\n"
+    msg+="SPAN_MODE      : ${SPAN_ATTACH_MODE}\n"
+
+    # Calculate menu size dynamically (8 menu items)
+    local menu_dims
+    menu_dims=$(calc_menu_size 8 80 8)
+    local menu_height menu_width menu_list_height
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    # Center-align the menu message based on terminal height
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg}\n" "${menu_height}")
+
     local choice
-    choice=$(whiptail --title "XDR AIO & Sensor Installer - Configuration" \
-                      --menu "Change configuration:" \
-                      22 90 11 \
-                      "1" "DRY_RUN mode: ${DRY_RUN} (1=simulation, 0=actual execution)" \
-                      "2" "DP version: ${DP_VERSION:-<not set>}" \
-                      "3" "Sensor version: ${SENSOR_VERSION}" \
-                      "4" "ACPS Username: ${ACPS_USERNAME}" \
-                      "5" "ACPS Password: $([ -n "${ACPS_PASSWORD:-}" ] && echo "(configured)" || echo "(not set)")" \
-                      "6" "ACPS URL: ${ACPS_BASE_URL}" \
-                      "7" "Auto Reboot: ${ENABLE_AUTO_REBOOT} (1=active, 0=inactive)" \
-                      "8" "SPAN attachment mode: ${SPAN_ATTACH_MODE} (pci only)" \
-                      "9" "go back" \
-                      3>&1 1>&2 2>&3) || break
+    # Temporarily disable set -e to handle cancel gracefully
+    set +e
+    choice=$(whiptail --title "XDR Installer - Configuration" \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "1" "Toggle DRY_RUN (0/1)" \
+                      "2" "Set DP_VERSION" \
+                      "3" "Set Sensor Version" \
+                      "4" "Set ACPS Account/Password" \
+                      "5" "Set ACPS URL" \
+                      "6" "Set Auto Reboot (${ENABLE_AUTO_REBOOT})" \
+                      "7" "Set SPAN Attachment Mode (${SPAN_ATTACH_MODE})" \
+                      "8" "Go Back" \
+                      3>&1 1>&2 2>&3)
+    local menu_rc=$?
+    set -e
+
+    if [[ ${menu_rc} -ne 0 ]]; then
+      # ESC or Cancel pressed - go back to main menu
+      break
+    fi
+
+    # Additional check: if choice is empty, also break
+    if [[ -z "${choice}" ]]; then
+      break
+    fi
 
     case "${choice}" in
-      1)
-        local new_dry_run
+      "1")
+        # Toggle DRY_RUN
         if [[ "${DRY_RUN}" -eq 1 ]]; then
-          new_dry_run=0
+          local dialog_dims
+          dialog_dims=$(calc_dialog_size 12 70)
+          local dialog_height dialog_width
+          read -r dialog_height dialog_width <<< "${dialog_dims}"
+          local centered_msg
+          centered_msg=$(center_message "Current DRY_RUN=1 (simulation mode).\n\nChange to DRY_RUN=0 to execute actual commands?")
+
+          set +e
+          whiptail --title "DRY_RUN Configuration" \
+                   --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+          local dry_toggle_rc=$?
+          set -e
+
+          if [[ ${dry_toggle_rc} -eq 0 ]]; then
+            DRY_RUN=0
+          fi
         else
-          new_dry_run=1
+          local dialog_dims
+          dialog_dims=$(calc_dialog_size 12 70)
+          local dialog_height dialog_width
+          read -r dialog_height dialog_width <<< "${dialog_dims}"
+          local centered_msg
+          centered_msg=$(center_message "Current DRY_RUN=0 (actual execution mode).\n\nSafely change to DRY_RUN=1 (simulation mode)?")
+
+          set +e
+          whiptail --title "DRY_RUN Configuration" \
+                   --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+          local dry_toggle_rc=$?
+          set -e
+
+          if [[ ${dry_toggle_rc} -eq 0 ]]; then
+            DRY_RUN=1
+          fi
         fi
-        save_config_var "DRY_RUN" "${new_dry_run}"
-        whiptail_msgbox "Configuration Changed" "DRY_RUN changed to ${new_dry_run}."
+        save_config_var "DRY_RUN" "${DRY_RUN}"
         ;;
-      2)
+      "2")
         local new_dp_version
+        # Temporarily disable set -e to handle cancel gracefully
         set +e
         new_dp_version=$(whiptail_inputbox "DP Version Configuration" "Enter DP version (e.g., 6.2.0):" "${DP_VERSION:-}")
-        local input_rc=$?
+        local ver_rc=$?
         set -e
-        if [[ ${input_rc} -eq 0 && -n "${new_dp_version}" ]]; then
+        if [[ ${ver_rc} -ne 0 ]] || [[ -z "${new_dp_version}" ]]; then
+          continue
+        fi
+        if [[ -n "${new_dp_version}" ]]; then
           save_config_var "DP_VERSION" "${new_dp_version}"
-          whiptail_msgbox "Configuration Changed" "DP version has been set to ${new_dp_version}."
+          whiptail_msgbox "DP_VERSION Configuration" "DP_VERSION has been set to ${new_dp_version}." 8 60
         fi
         ;;
-      3)
+      "3")
         local new_version
+        # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_version=$(whiptail_inputbox "Sensor Version Configuration" "Enter sensor version:" "${SENSOR_VERSION}")
-        local input_rc=$?
+        new_version=$(whiptail_inputbox "Sensor Version Configuration" "Enter sensor version." "${SENSOR_VERSION}" 10 60)
+        local ver_rc=$?
         set -e
-        if [[ ${input_rc} -eq 0 && -n "${new_version}" ]]; then
+        if [[ ${ver_rc} -ne 0 ]] || [[ -z "${new_version}" ]]; then
+          continue
+        fi
+        if [[ -n "${new_version}" ]]; then
           save_config_var "SENSOR_VERSION" "${new_version}"
-          whiptail_msgbox "Configuration Changed" "Sensor version has been set to ${new_version}."
+          whiptail_msgbox "Sensor Version Configuration" "Sensor version has been set to ${new_version}." 8 60
         fi
         ;;
-      4)
-        local new_username
+      "4")
+        # ACPS account / password
+        local user pass
+        # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_username=$(whiptail_inputbox "ACPS Username Configuration" "Enter ACPS username:" "${ACPS_USERNAME:-}")
-        local input_rc=$?
+        user=$(whiptail_inputbox "ACPS Account Configuration" "Enter ACPS account (ID)." "${ACPS_USERNAME}" 10 60)
+        local user_rc=$?
         set -e
-        if [[ ${input_rc} -eq 0 && -n "${new_username}" ]]; then
-          save_config_var "ACPS_USERNAME" "${new_username}"
-          whiptail_msgbox "Configuration Changed" "ACPS username has been changed."
+        if [[ ${user_rc} -ne 0 ]] || [[ -z "${user}" ]]; then
+          continue
         fi
-        ;;
-      5)
-        local new_password
+
+        local dialog_dims
+        dialog_dims=$(calc_dialog_size 10 60)
+        local dialog_height dialog_width
+        read -r dialog_height dialog_width <<< "${dialog_dims}"
+        local centered_pass_msg
+        centered_pass_msg=$(center_message "Enter ACPS password.\n(This value will be saved to the config file and automatically used in STEP 09)")
+
         set +e
-        new_password=$(whiptail_passwordbox "ACPS Password Configuration" "Enter ACPS password:" "")
-        local input_rc=$?
+        pass=$(whiptail --title "ACPS Password Configuration" \
+                        --passwordbox "${centered_pass_msg}" "${dialog_height}" "${dialog_width}" "${ACPS_PASSWORD}" \
+                        3>&1 1>&2 2>&3)
+        local pass_rc=$?
         set -e
-        if [[ ${input_rc} -eq 0 && -n "${new_password}" ]]; then
-          save_config_var "ACPS_PASSWORD" "${new_password}"
-          whiptail_msgbox "Configuration Changed" "ACPS password has been changed."
+        if [[ ${pass_rc} -ne 0 ]] || [[ -z "${pass}" ]]; then
+          continue
         fi
+
+        save_config_var "ACPS_USERNAME" "${user}"
+        save_config_var "ACPS_PASSWORD" "${pass}"
+        whiptail_msgbox "ACPS Account Configuration" "ACPS_USERNAME has been set to '${user}'." 8 70
         ;;
-      6)
+      "5")
         local new_url
+        # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_url=$(whiptail_inputbox "ACPS URL Configuration" "Enter ACPS URL:" "${ACPS_BASE_URL}")
+        new_url=$(whiptail_inputbox "ACPS URL Configuration" "Enter ACPS BASE URL." "${ACPS_BASE_URL}" 10 70)
         local input_rc=$?
         set -e
-        if [[ ${input_rc} -eq 0 && -n "${new_url}" ]]; then
+        if [[ ${input_rc} -ne 0 ]] || [[ -z "${new_url}" ]]; then
+          continue
+        fi
+        if [[ -n "${new_url}" ]]; then
           save_config_var "ACPS_BASE_URL" "${new_url}"
-          whiptail_msgbox "Configuration Changed" "ACPS URL has been set to ${new_url}."
+          whiptail_msgbox "ACPS URL Configuration" "ACPS_BASE_URL has been set to '${new_url}'." 8 70
         fi
         ;;
-      7)
+      "6")
         local new_auto_reboot
         if [[ "${ENABLE_AUTO_REBOOT}" -eq 1 ]]; then
           new_auto_reboot=0
@@ -7387,12 +7777,12 @@ menu_config() {
           new_auto_reboot=1
         fi
         save_config_var "ENABLE_AUTO_REBOOT" "${new_auto_reboot}"
-        whiptail_msgbox "Configuration Changed" "Auto Reboot has been set to ${new_auto_reboot}."
+        whiptail_msgbox "Auto Reboot Configuration" "Auto Reboot has been set to ${new_auto_reboot}."
         ;;
-      8)
-        whiptail_msgbox "Configuration Info" "SPAN attachment mode is fixed to 'pci' (PCI passthrough only).\nBridge mode is not supported in this installer." 10 70
+      "7")
+        whiptail_msgbox "SPAN Attachment Mode Configuration" "SPAN attachment mode is fixed to 'pci' (PCI passthrough only).\nBridge mode is not supported in this installer." 10 70
         ;;
-      9)
+      "8")
         break
         ;;
     esac
@@ -8154,7 +8544,7 @@ menu_full_validation() {
   
   if whiptail_yesno "View Detailed Log" "${view_detail_msg}"; then
     # 5) Show full validation log in detail using less
-    show_paged "Full Configuration Validation Results (Detailed Log)" "${tmp_file}"
+    show_paged "Full Configuration Validation Results (Detailed Log)" "${tmp_file}" "no-clear"
   fi
 
   # Clean up temporary files

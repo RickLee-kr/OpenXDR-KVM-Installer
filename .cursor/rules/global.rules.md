@@ -102,3 +102,40 @@ When modifying code, Cursor must explicitly provide:
   - Cancel / ESC behavior
 - Any UX change must be applied uniformly across all scripts.
 
+## 8. Language Policy (English-only Output Contract)
+
+### 8.1 Mandatory Language
+- All user-facing text and engineering text must be written in **English**.
+- This includes, but is not limited to:
+  - whiptail UI titles and messages
+  - menu labels
+  - log messages (LOG_FILE output)
+  - validation output (OK/WARN/FAIL lines and summaries)
+  - inline error messages shown to the user
+  - comments added to the code
+  - documentation text added/updated under this repository
+  - proposed commit messages, PR titles, and patch summaries
+
+### 8.2 Non-Regression Constraint
+- Existing English UI and log messages are part of the stability contract and must not be changed unless explicitly requested.
+- Existing non-English strings must not be translated as a “cleanup” action.
+  - Translation is allowed **only** when the user explicitly requests it.
+  - Otherwise, the rule is: **do not change existing text; only ensure all newly introduced text is English.**
+
+### 8.3 New Text Rule (Strict)
+- Any newly introduced strings (UI/log/validation/error text) must be English only.
+- Any newly introduced comments must be English only.
+- Any newly introduced identifiers (function/variable names) must be English only.
+- Do not mix languages in a single message or log line.
+
+### 8.4 Commit Message Standard (English)
+Whenever a commit message is proposed, it must be in English and follow this format:
+- Subject line: `<type>(<scope>): <short summary>` (max 72 chars)
+- Body (optional): bullet points describing behavior-preserving changes
+
+Allowed `type` values:
+- fix, feat, refactor, docs, chore, test
+
+Example:
+- `fix(sensor): return to main menu on auto-execute cancel`
+

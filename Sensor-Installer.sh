@@ -542,13 +542,18 @@ load_config() {
   # Set default values for NIC / disk selection to ensure they are always defined
   : "${HOST_NIC:=}"
   : "${DATA_NIC:=}"
+  : "${HOSTMGMT_NIC:=}"
   : "${SPAN_NICS:=}"
   : "${HOST_NIC_PCI:=}"
   : "${HOST_NIC_MAC:=}"
   : "${DATA_NIC_PCI:=}"
   : "${DATA_NIC_MAC:=}"
+  : "${HOSTMGMT_NIC_PCI:=}"
+  : "${HOSTMGMT_NIC_MAC:=}"
   : "${HOST_NIC_EFFECTIVE:=}"
   : "${DATA_NIC_EFFECTIVE:=}"
+  : "${HOSTMGMT_NIC_EFFECTIVE:=}"
+  : "${HOSTMGMT_NIC_RENAMED:=}"
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_MEMORY_MB:=}"
   : "${SENSOR_SPAN_VF_PCIS:=}"
@@ -573,10 +578,11 @@ save_config() {
   esc_acps_url=${ACPS_BASE_URL//\"/\\\"}
 
   # ★ Also escape NIC / sensor related values
-  local esc_host_nic esc_data_nic esc_span_nics esc_sensor_vcpus esc_sensor_memory_mb esc_sensor_passthrough_pcis
+  local esc_host_nic esc_data_nic esc_hostmgmt_nic esc_span_nics esc_sensor_vcpus esc_sensor_memory_mb esc_sensor_passthrough_pcis
   local esc_span_attach_mode esc_span_nic_list esc_span_bridge_list esc_sensor_net_mode esc_lv_location esc_lv_size_gb
   esc_host_nic=${HOST_NIC//\"/\\\"}
   esc_data_nic=${DATA_NIC//\"/\\\"}
+  esc_hostmgmt_nic=${HOSTMGMT_NIC//\"/\\\"}
   esc_span_nics=${SPAN_NICS//\"/\\\"}
   esc_sensor_vcpus=${SENSOR_VCPUS//\"/\\\"}
   esc_sensor_memory_mb=${SENSOR_MEMORY_MB//\"/\\\"}
@@ -601,12 +607,17 @@ AUTO_REBOOT_AFTER_STEP_ID="${AUTO_REBOOT_AFTER_STEP_ID}"
 # NIC / Sensor settings selected in STEP 01
 HOST_NIC="${esc_host_nic}"
 DATA_NIC="${esc_data_nic}"
+HOSTMGMT_NIC="${esc_hostmgmt_nic}"
 HOST_NIC_PCI="${HOST_NIC_PCI//\"/\\\"}"
 HOST_NIC_MAC="${HOST_NIC_MAC//\"/\\\"}"
 DATA_NIC_PCI="${DATA_NIC_PCI//\"/\\\"}"
 DATA_NIC_MAC="${DATA_NIC_MAC//\"/\\\"}"
+HOSTMGMT_NIC_PCI="${HOSTMGMT_NIC_PCI//\"/\\\"}"
+HOSTMGMT_NIC_MAC="${HOSTMGMT_NIC_MAC//\"/\\\"}"
 HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE//\"/\\\"}"
 DATA_NIC_EFFECTIVE="${DATA_NIC_EFFECTIVE//\"/\\\"}"
+HOSTMGMT_NIC_EFFECTIVE="${HOSTMGMT_NIC_EFFECTIVE//\"/\\\"}"
+HOSTMGMT_NIC_RENAMED="${HOSTMGMT_NIC_RENAMED//\"/\\\"}"
 SPAN_NICS="${esc_span_nics}"
 SENSOR_VCPUS="${esc_sensor_vcpus}"
 SENSOR_MEMORY_MB="${esc_sensor_memory_mb}"
@@ -639,14 +650,19 @@ save_config_var() {
     # ★ Added here
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_NIC)        DATA_NIC="${value}" ;;
+    HOSTMGMT_NIC)    HOSTMGMT_NIC="${value}" ;;
     HOST_NIC_PCI)    HOST_NIC_PCI="${value}" ;;
     HOST_NIC_MAC)    HOST_NIC_MAC="${value}" ;;
     DATA_NIC_PCI)    DATA_NIC_PCI="${value}" ;;
     DATA_NIC_MAC)    DATA_NIC_MAC="${value}" ;;
+    HOSTMGMT_NIC_PCI) HOSTMGMT_NIC_PCI="${value}" ;;
+    HOSTMGMT_NIC_MAC) HOSTMGMT_NIC_MAC="${value}" ;;
     HOST_NIC_EFFECTIVE) HOST_NIC_EFFECTIVE="${value}" ;;
     DATA_NIC_EFFECTIVE) DATA_NIC_EFFECTIVE="${value}" ;;
+    HOSTMGMT_NIC_EFFECTIVE) HOSTMGMT_NIC_EFFECTIVE="${value}" ;;
     HOST_NIC_RENAMED) HOST_NIC_RENAMED="${value}" ;;
     DATA_NIC_RENAMED) DATA_NIC_RENAMED="${value}" ;;
+    HOSTMGMT_NIC_RENAMED) HOSTMGMT_NIC_RENAMED="${value}" ;;
     SPAN_NICS)      SPAN_NICS="${value}" ;;
     SENSOR_VCPUS)   SENSOR_VCPUS="${value}" ;;
     SENSOR_MEMORY_MB) SENSOR_MEMORY_MB="${value}" ;;
@@ -693,12 +709,17 @@ LAST_RUN_TIME="$(date '+%F %T')"
 # NIC identity and effective names (updated after STEP 01/03)
 HOST_NIC="${HOST_NIC}"
 DATA_NIC="${DATA_NIC}"
+HOSTMGMT_NIC="${HOSTMGMT_NIC}"
 HOST_NIC_PCI="${HOST_NIC_PCI}"
 HOST_NIC_MAC="${HOST_NIC_MAC}"
 DATA_NIC_PCI="${DATA_NIC_PCI}"
 DATA_NIC_MAC="${DATA_NIC_MAC}"
+HOSTMGMT_NIC_PCI="${HOSTMGMT_NIC_PCI}"
+HOSTMGMT_NIC_MAC="${HOSTMGMT_NIC_MAC}"
 HOST_NIC_EFFECTIVE="${HOST_NIC_EFFECTIVE}"
 DATA_NIC_EFFECTIVE="${DATA_NIC_EFFECTIVE}"
+HOSTMGMT_NIC_EFFECTIVE="${HOSTMGMT_NIC_EFFECTIVE}"
+HOSTMGMT_NIC_RENAMED="${HOSTMGMT_NIC_RENAMED}"
 EOF
 }
 
@@ -746,12 +767,14 @@ run_step() {
   local idx="$1"
   local step_id="${STEP_IDS[$idx]}"
   local step_name="${STEP_NAMES[$idx]}"
+  RUN_STEP_STATUS="UNKNOWN"
 
   # Confirm STEP execution
   if ! whiptail_yesno "XDR Installer - ${step_id}" "${step_name}\n\nDo you want to execute this step?"
   then
     # User cancellation is considered "normal flow" (not an error)
     log "User canceled execution of STEP ${step_id}."
+    RUN_STEP_STATUS="CANCELED"
     return 0   # Must return 0 here so set -e doesn't trigger in main case
   fi
 
@@ -799,6 +822,7 @@ run_step() {
   esac
 
   if [[ "${rc}" -eq 0 ]]; then
+    RUN_STEP_STATUS="DONE"
     log "===== STEP DONE: ${step_id} - ${step_name} ====="
     
     # State verification summary after STEP completion
@@ -899,6 +923,7 @@ run_step() {
 	      done
 	    fi
 	  else
+    RUN_STEP_STATUS="FAILED"
 	    log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
     
     # Provide log file location on failure
@@ -919,47 +944,259 @@ run_step() {
 # Hardware Detection Utilities
 #######################################
 
+is_step01_excluded_iface() {
+  local name="$1"
+  [[ -z "${name}" ]] && return 0
+  [[ "${name}" == "lo" ]] && return 0
+  [[ "${name}" =~ ^(virbr|vnet|br|docker|tap|tun|vxlan|flannel|cni|cali|kube|veth|ovs) ]] && return 0
+  [[ -d "/sys/class/net/${name}/bridge" ]] && return 0
+  [[ ! -e "/sys/class/net/${name}/device" ]] && return 0
+  [[ -e "/sys/class/net/${name}/device/physfn" ]] && return 0
+  return 1
+}
+
+list_step01_phys_nics() {
+  local nic_path name
+  for nic_path in /sys/class/net/*; do
+    name="${nic_path##*/}"
+    if is_step01_excluded_iface "${name}"; then
+      continue
+    fi
+    echo "${name}"
+  done
+}
+
+list_auto_ifaces() {
+  local f
+  for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+    [[ -f "${f}" ]] || continue
+    awk '
+      tolower($1)=="auto" {
+        for (i=2; i<=NF; i++) print $i
+      }
+    ' "${f}" 2>/dev/null || true
+  done | sort -u
+}
+
+get_admin_state() {
+  local nic="$1"
+  local line
+  line="$(ip -o link show dev "${nic}" 2>/dev/null || true)"
+  if [[ -z "${line}" ]]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+  if echo "${line}" | grep -q "UP"; then
+    echo "UP"
+  else
+    echo "DOWN"
+  fi
+}
+
+step01_write_admin_state_snapshot() {
+  local state_file="$1"
+  local nic
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would write STEP 01 admin snapshot: ${state_file}"
+    return 0
+  fi
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  {
+    echo "# nic|admin_state|mac"
+    for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+      echo "${nic}|${STEP01_ADMIN_STATE[${nic}]}|${STEP01_MAC[${nic}]}"
+    done
+  } > "${state_file}"
+}
+
+step01_get_link_state() {
+  local nic="$1"
+  local et_out link_state
+
+  link_state="unknown"
+
+  if command -v ethtool >/dev/null 2>&1; then
+    et_out="$(ethtool "${nic}" 2>/dev/null || true)"
+    if echo "${et_out}" | grep -q "Link detected: yes"; then
+      echo "yes"
+      return 0
+    fi
+    if echo "${et_out}" | grep -q "Link detected: no"; then
+      link_state="no"
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/carrier" ]]; then
+    local carrier
+    carrier="$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null || echo "")"
+    if [[ "${carrier}" == "1" ]]; then
+      echo "yes"
+      return 0
+    elif [[ "${carrier}" == "0" && "${link_state}" != "yes" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/operstate" ]]; then
+    local operstate
+    operstate="$(cat "/sys/class/net/${nic}/operstate" 2>/dev/null || echo "")"
+    if [[ "${operstate}" == "up" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if [[ "${operstate}" == "down" || "${operstate}" == "dormant" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  echo "${link_state}"
+}
+
+step01_get_link_state_with_retry() {
+  local nic="$1"
+  local retries interval attempt state
+
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  attempt=1
+
+  while true; do
+    state="$(step01_get_link_state "${nic}")"
+    if [[ "${state}" == "yes" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if (( attempt >= retries )); then
+      echo "${state}"
+      return 0
+    fi
+    sleep "${interval}"
+    attempt=$((attempt + 1))
+  done
+}
+
+step01_prepare_link_scan() {
+  local cleanup_mode="${STEP01_LINK_CLEANUP_MODE:-B}"
+  local state_file="${STATE_DIR}/step01_admin_state.txt"
+  local nics auto_list nic mac admin_state
+
+  nics="$(list_step01_phys_nics || true)"
+  if [[ -z "${nics}" ]]; then
+    log "[STEP 01] No physical NIC candidates found for link scan (skip)"
+    return 0
+  fi
+
+  declare -gA STEP01_ADMIN_STATE STEP01_LINK_STATE STEP01_MAC
+  declare -ga STEP01_CANDIDATE_NICS STEP01_TEMP_UP_NICS
+  STEP01_CANDIDATE_NICS=()
+  STEP01_TEMP_UP_NICS=()
+
+  while IFS= read -r nic; do
+    [[ -z "${nic}" ]] && continue
+    STEP01_CANDIDATE_NICS+=("${nic}")
+    mac="$(get_if_mac "${nic}")"
+    admin_state="$(get_admin_state "${nic}")"
+    STEP01_MAC["${nic}"]="${mac}"
+    STEP01_ADMIN_STATE["${nic}"]="${admin_state}"
+  done <<< "${nics}"
+
+  step01_write_admin_state_snapshot "${state_file}"
+  log "[STEP 01] Temp admin-up target NICs: ${STEP01_CANDIDATE_NICS[*]}"
+
+  auto_list="$(list_auto_ifaces || true)"
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    if echo "${auto_list}" | grep -qx "${nic}"; then
+      log "[STEP 01] Skip temp up (auto iface): ${nic}"
+      continue
+    fi
+    if [[ "${STEP01_ADMIN_STATE[${nic}]}" == "UP" ]]; then
+      log "[STEP 01] Skip temp up (already UP): ${nic}"
+      continue
+    fi
+    STEP01_TEMP_UP_NICS+=("${nic}")
+  done
+
+  if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
+    log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
+    for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
+      run_cmd "sudo ip link set ${nic} up" || true
+    done
+  fi
+
+  local initial_wait retries interval total_wait
+  initial_wait="${STEP01_LINK_INITIAL_WAIT:-3}"
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  total_wait=$(( initial_wait + interval * (retries - 1) ))
+  log "[STEP 01] Link scan in progress. This can take longer depending on NIC count (often 10~20s). Please wait..."
+
+  sleep "${initial_wait}"
+
+  local remaining_nics round
+  remaining_nics=("${STEP01_CANDIDATE_NICS[@]}")
+  round=1
+  while true; do
+    local new_remaining=()
+    for nic in "${remaining_nics[@]}"; do
+      local link_state
+      link_state="$(step01_get_link_state "${nic}")"
+      STEP01_LINK_STATE["${nic}"]="${link_state}"
+      if [[ "${link_state}" != "yes" ]]; then
+        new_remaining+=("${nic}")
+      fi
+    done
+    remaining_nics=("${new_remaining[@]}")
+    if [[ ${#remaining_nics[@]} -eq 0 || ${round} -ge ${retries} ]]; then
+      break
+    fi
+    sleep "${interval}"
+    round=$((round + 1))
+  done
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    log "[STEP 01] Link detected: ${nic}=${STEP01_LINK_STATE[${nic}]:-unknown}"
+  done
+
+  log "[STEP 01] Link scan cleanup policy: ${cleanup_mode}"
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    local link_state orig_state
+    link_state="${STEP01_LINK_STATE[${nic}]}"
+    orig_state="${STEP01_ADMIN_STATE[${nic}]}"
+
+    if [[ "${cleanup_mode}" == "A" ]]; then
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
+      else
+        log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
+      fi
+      continue
+    fi
+
+    if [[ "${link_state}" == "yes" ]]; then
+      run_cmd "sudo ip link set ${nic} up" || true
+      log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
+    else
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
+      else
+        log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
+      fi
+    fi
+  done
+}
+
 list_nic_candidates() {
-  # Exclude lo, virbr*, vnet*, tap*, docker*, br*, ovs, etc.
-  ip -o link show | awk -F': ' '{print $2}' \
-    | grep -Ev '^(lo|virbr|vnet|tap|docker|br-|ovs)' \
-    || true
+  list_step01_phys_nics || true
 }
 
 # NIC link state helper (carrier/operstate)
 get_nic_link_state() {
-  local ifname="$1"
-  local carrier_file="/sys/class/net/${ifname}/carrier"
-  local oper_file="/sys/class/net/${ifname}/operstate"
-  local carrier=""
-  local oper=""
-
-  if [[ -f "${carrier_file}" ]]; then
-    carrier="$(cat "${carrier_file}" 2>/dev/null || echo "")"
-    if [[ "${carrier}" == "1" ]]; then
-      echo "up"
-      return 0
-    elif [[ "${carrier}" == "0" ]]; then
-      echo "down"
-      return 0
-    fi
-  fi
-
-  if [[ -f "${oper_file}" ]]; then
-    oper="$(cat "${oper_file}" 2>/dev/null || echo "")"
-    if [[ "${oper}" == "up" ]]; then
-      echo "up"
-      return 0
-    elif [[ "${oper}" == "down" ]]; then
-      echo "down"
-      return 0
-    elif [[ -n "${oper}" ]]; then
-      echo "${oper}"
-      return 0
-    fi
-  fi
-
-  echo "unknown"
+  step01_get_link_state "$1"
 }
 # NIC identity helpers (PCI/MAC/resolve)
 normalize_pci() {
@@ -1111,12 +1348,14 @@ step_01_hw_detect() {
   # Set default values to prevent set -u (empty string if not defined)
   : "${HOST_NIC:=}"
   : "${DATA_NIC:=}"
+  : "${HOSTMGMT_NIC:=}"
   : "${SPAN_NICS:=}"
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_MEMORY_MB:=}"
   : "${SENSOR_SPAN_VF_PCIS:=}"
   : "${SPAN_ATTACH_MODE:=pci}"
   : "${SENSOR_NET_MODE:=nat}"
+  : "${HOSTMGMT_NIC_RENAMED:=}"
   
   # Determine network mode
   local net_mode="${SENSOR_NET_MODE}"
@@ -1127,24 +1366,41 @@ step_01_hw_detect() {
   ########################
   local can_reuse_config=0
   local reuse_message=""
+  local host_display data_display hostmgmt_display
   
   # Load storage configuration values
   : "${LV_LOCATION:=}"
   : "${LV_SIZE_GB:=}"
   
+  : "${HOST_NIC_RENAMED:=}"
+  : "${DATA_NIC_RENAMED:=}"
+  : "${HOSTMGMT_NIC_RENAMED:=}"
+  host_display="${HOST_NIC}"
+  data_display="${DATA_NIC}"
+  hostmgmt_display="${HOSTMGMT_NIC}"
+  if [[ -n "${HOST_NIC_RENAMED}" && "${HOST_NIC_RENAMED}" != "${HOST_NIC}" ]]; then
+    host_display="${HOST_NIC} (renamed: ${HOST_NIC_RENAMED})"
+  fi
+  if [[ -n "${DATA_NIC_RENAMED}" && "${DATA_NIC_RENAMED}" != "${DATA_NIC}" ]]; then
+    data_display="${DATA_NIC} (renamed: ${DATA_NIC_RENAMED})"
+  fi
+  if [[ -n "${HOSTMGMT_NIC_RENAMED}" && "${HOSTMGMT_NIC_RENAMED}" != "${HOSTMGMT_NIC}" ]]; then
+    hostmgmt_display="${HOSTMGMT_NIC} (renamed: ${HOSTMGMT_NIC_RENAMED})"
+  fi
+
   if [[ "${net_mode}" == "bridge" ]]; then
     if [[ -n "${HOST_NIC}" && -n "${DATA_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
       [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- HOST NIC: ${HOST_NIC}\n- DATA NIC: ${DATA_NIC}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
+      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- HOST NIC: ${host_display}\n- DATA NIC: ${data_display}\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
     fi
   elif [[ "${net_mode}" == "nat" ]]; then
-    if [[ -n "${HOST_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
+    if [[ -n "${HOST_NIC}" && -n "${HOSTMGMT_NIC}" && -n "${SPAN_NICS}" && -n "${SENSOR_SPAN_VF_PCIS}" ]]; then
       can_reuse_config=1
       local span_mode_label="PF PCI (Passthrough)"
       [[ "${SPAN_ATTACH_MODE}" == "bridge" ]] && span_mode_label="Bridge (virtio)"
-      reuse_message="The following values are already configured:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${HOST_NIC}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
+      reuse_message="The following values are already set:\n\n- Network mode: ${net_mode}\n- NAT uplink NIC: ${host_display}\n- Direct access NIC: ${hostmgmt_display}\n- DATA NIC: N/A (NAT mode)\n- SPAN NICs: ${SPAN_NICS}\n- SPAN attachment mode: ${SPAN_ATTACH_MODE}\n- SPAN ${span_mode_label}: ${SENSOR_SPAN_VF_PCIS}"
     fi
   fi
   
@@ -1153,10 +1409,6 @@ step_01_hw_detect() {
     # Check both original names and renamed names (after STEP 03 udev rule)
     local nic_validation_failed=0
     local missing_nics=""
-    
-    # Load renamed interface names if available
-    : "${HOST_NIC_RENAMED:=}"
-    : "${DATA_NIC_RENAMED:=}"
     
     if [[ "${net_mode}" == "bridge" ]]; then
       # Check HOST_NIC (original or renamed)
@@ -1215,6 +1467,25 @@ step_01_hw_detect() {
         fi
         nic_validation_failed=1
       fi
+
+      # Check HOSTMGMT_NIC (direct access)
+      local hostmgmt_nic_found=0
+      if [[ -d "/sys/class/net/${HOSTMGMT_NIC}" ]]; then
+        hostmgmt_nic_found=1
+      elif [[ -n "${HOSTMGMT_NIC_RENAMED}" ]] && [[ -d "/sys/class/net/${HOSTMGMT_NIC_RENAMED}" ]]; then
+        hostmgmt_nic_found=1
+        log "[STEP 01] HOSTMGMT_NIC found with renamed name: ${HOSTMGMT_NIC_RENAMED} (original: ${HOSTMGMT_NIC})"
+      fi
+
+      if [[ ${hostmgmt_nic_found} -eq 0 ]]; then
+        missing_nics="${missing_nics}Direct access NIC (HOSTMGMT_NIC): ${HOSTMGMT_NIC}"
+        if [[ -n "${HOSTMGMT_NIC_RENAMED}" ]]; then
+          missing_nics="${missing_nics} (renamed: ${HOSTMGMT_NIC_RENAMED})\n"
+        else
+          missing_nics="${missing_nics}\n"
+        fi
+        nic_validation_failed=1
+      fi
     fi
     
     # Validate SPAN NICs (SPAN NICs are not renamed, so check original names)
@@ -1240,7 +1511,19 @@ step_01_hw_detect() {
   fi
   
   if [[ "${can_reuse_config}" -eq 1 ]]; then
-    if whiptail_yesno "STEP 01 - Reuse Existing Selection" "${reuse_message}\n\nDo you want to reuse these values and skip STEP 01?\n\n(Select No to choose again.)" 20 80
+    log "[STEP 01] Previous selections detected:"
+    log "[STEP 01] - Network mode: ${net_mode}"
+    if [[ "${net_mode}" == "bridge" ]]; then
+      log "[STEP 01] - HOST NIC: ${host_display}"
+      log "[STEP 01] - DATA NIC: ${data_display}"
+    else
+      log "[STEP 01] - NAT uplink NIC: ${host_display}"
+      log "[STEP 01] - Direct access NIC: ${hostmgmt_display}"
+    fi
+    log "[STEP 01] - SPAN NICs: ${SPAN_NICS}"
+    log "[STEP 01] - SPAN attachment mode: ${SPAN_ATTACH_MODE}"
+    log "[STEP 01] - SPAN PCI/Bridge: ${SENSOR_SPAN_VF_PCIS}"
+    if whiptail_yesno "STEP 01 - Reuse previous selections" "${reuse_message}\n\nDo you want to reuse these values and skip STEP 01?\n\n(Select No to choose again.)" 20 80
     then
       log "User chose to reuse existing STEP 01 selection values. (Skipping STEP 01)"
 
@@ -1260,6 +1543,9 @@ step_01_hw_detect() {
   # 1) NIC candidate  and Selection
   ########################
   local nics nic_list nic name idx
+
+  # STEP 01 link scan: temp admin UP + ethtool detection + cleanup
+  step01_prepare_link_scan || log "[STEP 01] Link scan completed with warnings (continuing)"
 
   # list_nic_candidates  Failed set -e  script All prevent death defense
   nics="$(list_nic_candidates || true)"
@@ -1286,8 +1572,8 @@ step_01_hw_detect() {
     duplex="Unknown"
     link_state="unknown"
 
-    # Link state
-    link_state=$(get_nic_link_state "${name}")
+    # Link state (from pre-scan)
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
 
     # ethtool Speed / Duplex get
     if command -v ethtool >/dev/null 2>&1; then
@@ -1395,6 +1681,34 @@ step_01_hw_detect() {
     save_config_var "DATA_NIC" "${DATA_NIC}"
     save_config_var "HOST_NIC_PCI" "$(get_if_pci "${nat_nic}")"
     save_config_var "HOST_NIC_MAC" "$(get_if_mac "${nat_nic}")"
+
+    # Direct access NIC (hostmgmt) selection
+    local hostmgmt_nic
+    menu_dims=$(calc_menu_size ${#nic_list[@]} 90 10)
+    read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+    menu_msg=$(center_menu_message "Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\nCurrent Configuration: ${HOSTMGMT_NIC:-<None>}" "${menu_height}")
+
+    hostmgmt_nic=$(whiptail --title "STEP 01 - Select Host Access NIC (NAT Mode)" \
+                      --menu "${menu_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "${nic_list[@]}" \
+                      3>&1 1>&2 2>&3) || {
+      log "User canceled Host Access NIC selection."
+      return 1
+    }
+
+    if [[ "${hostmgmt_nic}" == "${nat_nic}" ]]; then
+      whiptail_msgbox "Error" "Direct access NIC cannot be the same as NAT uplink NIC.\n\n- NAT uplink NIC: ${nat_nic}\n- Direct access NIC: ${hostmgmt_nic}" 12 80
+      log "HOSTMGMT_NIC duplicate selection: ${hostmgmt_nic}"
+      return 1
+    fi
+
+    log "Selected Host Access NIC: ${hostmgmt_nic}"
+    HOSTMGMT_NIC="${hostmgmt_nic}"
+    save_config_var "HOSTMGMT_NIC" "${HOSTMGMT_NIC}"
+    save_config_var "HOSTMGMT_NIC_PCI" "$(get_if_pci "${hostmgmt_nic}")"
+    save_config_var "HOSTMGMT_NIC_MAC" "$(get_if_mac "${hostmgmt_nic}")"
     
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
@@ -1450,8 +1764,8 @@ step_01_hw_detect() {
     duplex="Unknown"
     link_state="unknown"
 
-    # Link state
-    link_state=$(get_nic_link_state "${name}")
+    # Link state (from pre-scan)
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
 
     # ethtool Speed / Duplex get
     if command -v ethtool >/dev/null 2>&1; then
@@ -1511,6 +1825,30 @@ step_01_hw_detect() {
     whiptail_msgbox "SPAN NIC Selection Required" "No SPAN NICs selected.\nAt least 1 SPAN NIC is required." 10 70
     log "SPAN NIC selection is required but none selected."
     return 1
+  fi
+  # Prevent using direct access NIC as SPAN NIC (NAT mode only)
+  if [[ "${net_mode}" == "nat" && -n "${HOSTMGMT_NIC:-}" ]]; then
+    for s in ${selected_span_nics}; do
+      if [[ "${s}" == "${HOSTMGMT_NIC}" ]]; then
+        whiptail_msgbox "SPAN NIC Selection Error" "Direct access NIC cannot be selected as SPAN NIC.\n\nDirect access NIC: ${HOSTMGMT_NIC}\nSelected SPAN NIC: ${s}" 12 80
+        log "SPAN NIC selection includes HOSTMGMT_NIC: ${s}"
+        return 1
+      fi
+    done
+    # Also prevent physical NIC overlap by PCI (direct access NIC vs SPAN NIC)
+    local hostmgmt_pci
+    hostmgmt_pci="$(get_if_pci "${HOSTMGMT_NIC}")"
+    if [[ -n "${hostmgmt_pci}" ]]; then
+      for s in ${selected_span_nics}; do
+        local span_pci
+        span_pci="$(get_if_pci "${s}")"
+        if [[ -n "${span_pci}" && "${span_pci}" == "${hostmgmt_pci}" ]]; then
+          whiptail_msgbox "SPAN NIC Selection Error" "Direct access NIC and SPAN NIC cannot be the same physical device.\n\nDirect access PCI: ${hostmgmt_pci}\nSPAN NIC: ${s} (PCI: ${span_pci})" 12 85
+          log "SPAN NIC selection overlaps HOSTMGMT_NIC by PCI: ${span_pci}"
+          return 1
+        fi
+      done
+    fi
   fi
 
   log "Selected SPAN NICs: ${selected_span_nics}"
@@ -1645,6 +1983,7 @@ EOF
 
 - Sensor Network Mode : ${net_mode}
 - NAT uplink NIC     : ${HOST_NIC}
+- Direct access NIC  : ${HOSTMGMT_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
 - Data NIC         : N/A (NAT Mode - using virbr0)
 - SPAN NICs       : ${SPAN_NICS}
 - SPAN connection Mode    : ${SPAN_ATTACH_MODE}
@@ -2167,6 +2506,14 @@ EOF
       verify_failed=1
       verify_errors="${verify_errors}\n- udev rules missing"
     fi
+    if [[ ! -f "${udev_file}" ]] || \
+       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${hostmgmt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null || \
+       ! grep -qE "KERNELS==\"${hostmgmt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- udev rules do not include mgt/hostmgmt mappings"
+    fi
     if [[ ! -f "${iface_file}" ]] || \
        ! grep -qE '^[[:space:]]*source[[:space:]]+/etc/network/interfaces\.d/\*' "${iface_file}" 2>/dev/null; then
       verify_failed=1
@@ -2181,7 +2528,7 @@ EOF
       verify_errors="${verify_errors}\n- data bridge config invalid: ${data_cfg}"
     fi
     if [[ "${verify_failed}" -eq 1 ]]; then
-      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      whiptail_msgbox "STEP 03 - File Verification Failed" "Configuration file verification failed.\n\n${verify_errors}\n\nPlease check the files and re-run the step." 16 85
       log "[ERROR] STEP 03 file verification failed:${verify_errors}"
       return 1
     fi
@@ -2257,6 +2604,11 @@ step_03_nat_mode_declarative() {
     log "HOST_NIC (NAT uplink NIC) is empty, so STEP 03 NAT Mode cannot proceed."
     return 1
   fi
+  if [[ -z "${HOSTMGMT_NIC:-}" ]]; then
+    whiptail_msgbox "STEP 03 - Direct Access NIC Not configured" "Direct access NIC (HOSTMGMT_NIC) is not set.\n\nPlease select direct access NIC in STEP 01 first." 12 70
+    log "HOSTMGMT_NIC (direct access NIC) is empty, so STEP 03 NAT Mode cannot proceed."
+    return 1
+  fi
 
   cidr_to_netmask() {
     local pfx="$1"
@@ -2297,6 +2649,16 @@ step_03_nat_mode_declarative() {
     return 1
   fi
 
+  local desired_hostmgmt_if
+  desired_hostmgmt_if="$(resolve_ifname_by_identity "${HOSTMGMT_NIC_PCI:-}" "${HOSTMGMT_NIC_MAC:-}")"
+  [[ -z "${desired_hostmgmt_if}" ]] && desired_hostmgmt_if="${HOSTMGMT_NIC}"
+
+  if [[ ! -d "/sys/class/net/${desired_hostmgmt_if}" ]]; then
+    whiptail_msgbox "STEP 03 - NIC Not Found" "Direct access NIC '${desired_hostmgmt_if}' does not exist on this system.\n\nRe-run STEP 01 and select the correct NIC." 12 70
+    log "ERROR: Direct access NIC '${desired_hostmgmt_if}' not found in /sys/class/net"
+    return 1
+  fi
+
   local nat_pci
   nat_pci="${HOST_NIC_PCI:-}"
   if [[ -z "${nat_pci}" ]]; then
@@ -2306,6 +2668,46 @@ step_03_nat_mode_declarative() {
     whiptail_msgbox "STEP 03 - PCI Information Error" "Could not retrieve PCI bus information for NAT uplink NIC.\n\nNIC: ${desired_host_if}\n\nPlease re-run STEP 01 to verify and select the correct NIC." 14 80
     log "ERROR: NAT uplink NIC PCI information not found for ${desired_host_if}"
     return 1
+  fi
+
+  local hostmgmt_pci
+  hostmgmt_pci="${HOSTMGMT_NIC_PCI:-}"
+  if [[ -z "${hostmgmt_pci}" ]]; then
+    hostmgmt_pci="$(readlink -f "/sys/class/net/${desired_hostmgmt_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+  fi
+  if [[ -z "${hostmgmt_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - PCI Information Error" "Could not retrieve PCI bus information for direct access NIC.\n\nNIC: ${desired_hostmgmt_if}\n\nPlease re-run STEP 01 to verify and select the correct NIC." 14 80
+    log "ERROR: Direct access NIC PCI information not found for ${desired_hostmgmt_if}"
+    return 1
+  fi
+
+  if [[ "${desired_host_if}" == "${desired_hostmgmt_if}" || "${nat_pci}" == "${hostmgmt_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "NAT uplink NIC and Direct access NIC cannot be the same physical NIC.\n\nNAT uplink: ${desired_host_if} (PCI: ${nat_pci})\nDirect access: ${desired_hostmgmt_if} (PCI: ${hostmgmt_pci})\n\nPlease select different NICs in STEP 01." 14 85
+    log "ERROR: NAT uplink NIC and Direct access NIC are duplicated"
+    return 1
+  fi
+  # Prevent direct access NIC from overlapping with SPAN NICs (NAT mode)
+  if [[ -n "${SPAN_NIC_LIST:-${SPAN_NICS}}" ]]; then
+    for span_nic in ${SPAN_NIC_LIST:-${SPAN_NICS}}; do
+      if [[ "${span_nic}" == "${desired_hostmgmt_if}" || "${span_nic}" == "${HOSTMGMT_NIC}" ]]; then
+        whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "Direct access NIC cannot be the same as any SPAN NIC.\n\nDirect access: ${desired_hostmgmt_if}\nSPAN NIC: ${span_nic}\n\nPlease select different NICs in STEP 01." 14 85
+        log "ERROR: Direct access NIC overlaps with SPAN NIC: ${span_nic}"
+        return 1
+      fi
+    done
+  fi
+  if [[ -n "${SPAN_NIC_LIST:-${SPAN_NICS}}" ]]; then
+    for span_nic in ${SPAN_NIC_LIST:-${SPAN_NICS}}; do
+      if [[ -d "/sys/class/net/${span_nic}" ]]; then
+        local span_pci
+        span_pci="$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+        if [[ -n "${span_pci}" && "${span_pci}" == "${hostmgmt_pci}" ]]; then
+          whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "Direct access NIC and SPAN NIC cannot be the same physical device.\n\nDirect access PCI: ${hostmgmt_pci}\nSPAN NIC: ${span_nic} (PCI: ${span_pci})\n\nPlease select different NICs in STEP 01." 14 90
+          log "ERROR: Direct access NIC overlaps with SPAN NIC by PCI: ${span_pci}"
+          return 1
+        fi
+      fi
+    done
   fi
 
   local span_udev_rules=""
@@ -2361,7 +2763,8 @@ ACTION==\"add\", SUBSYSTEM==\"net\", KERNELS==\"${span_pci}\", NAME:=\"${span_ni
   local udev_content
   udev_content=$(cat <<EOF
 # XDR NAT Mode - Custom interface names
-ACTION=="add", SUBSYSTEM=="net", KERNELS=="${nat_pci}", NAME:="mgt"${span_udev_rules}
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${nat_pci}", NAME:="mgt"
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${hostmgmt_pci}", NAME:="hostmgmt"${span_udev_rules}
 EOF
 )
 
@@ -2382,11 +2785,14 @@ EOF
     save_config_var "HOST_NIC_EFFECTIVE" "mgt"
     save_config_var "HOST_NIC" "mgt"
     save_config_var "HOST_NIC_RENAMED" "mgt"
+    save_config_var "HOSTMGMT_NIC_EFFECTIVE" "hostmgmt"
+    save_config_var "HOSTMGMT_NIC_RENAMED" "hostmgmt"
   fi
 
   local iface_file="/etc/network/interfaces"
   local iface_dir="/etc/network/interfaces.d"
   local mgt_cfg="${iface_dir}/01-mgt.cfg"
+  local hostmgmt_cfg="${iface_dir}/02-hostmgmt.cfg"
 
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     mkdir -p "${iface_dir}"
@@ -2422,6 +2828,20 @@ EOF
     printf "%s\n" "${mgt_content}" > "${mgt_cfg}"
   fi
 
+  local hostmgmt_content
+  hostmgmt_content=$(cat <<EOF
+auto hostmgmt
+iface hostmgmt inet static
+    address 192.168.0.100
+    netmask 255.255.255.0
+EOF
+)
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] ${hostmgmt_cfg} will be created with the following content:\n${hostmgmt_content}"
+  else
+    printf "%s\n" "${hostmgmt_content}" > "${hostmgmt_cfg}"
+  fi
+
   if [[ "${DRY_RUN}" -eq 0 ]]; then
     local verify_failed=0
     local verify_errors=""
@@ -2438,8 +2858,12 @@ EOF
       verify_failed=1
       verify_errors="${verify_errors}\n- mgt config invalid: ${mgt_cfg}"
     fi
+    if [[ ! -f "${hostmgmt_cfg}" ]] || ! grep -qE '^[[:space:]]*iface[[:space:]]+hostmgmt[[:space:]]+inet[[:space:]]+static' "${hostmgmt_cfg}" 2>/dev/null; then
+      verify_failed=1
+      verify_errors="${verify_errors}\n- hostmgmt config invalid: ${hostmgmt_cfg}"
+    fi
     if [[ "${verify_failed}" -eq 1 ]]; then
-      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      whiptail_msgbox "STEP 03 - File Verification Failed" "Configuration file verification failed.\n\n${verify_errors}\n\nPlease check the files and re-run the step." 16 85
       log "[ERROR] STEP 03 file verification failed:${verify_errors}"
       return 1
     fi
@@ -2478,12 +2902,14 @@ EOF
 * mgt IP: ${new_ip}/${new_prefix} (netmask ${netmask})
 * Gateway: ${new_gw}
 * DNS: ${new_dns}
+* Direct access NIC: ${HOSTMGMT_NIC} → hostmgmt (192.168.0.100/24, no gateway)
 
 📂 Files:
 1. udev: /etc/udev/rules.d/99-custom-ifnames.rules
 2. udev: /usr/lib/udev/rules.d/99-custom-ifnames.rules
 3. /etc/network/interfaces
 4. /etc/network/interfaces.d/01-mgt.cfg
+5. /etc/network/interfaces.d/02-hostmgmt.cfg
 
 ⚠️ REBOOT REQUIRED
 Network configuration changes will be applied after reboot.
@@ -3113,7 +3539,7 @@ step_05_kernel_tuning() {
       echo "     - /etc/default/qemu-kvm would be created/updated"
       echo "     - KSM_ENABLED=0 would be set"
       echo
-      # Swap disable 상태 확인
+      # Check swap disable state
       local swap_status=""
       if swapon --show 2>/dev/null | grep -q .; then
         swap_status="enabled"
@@ -3152,7 +3578,7 @@ step_05_kernel_tuning() {
       echo "  • KSM Disable: Completed"
       echo "    - /etc/default/qemu-kvm: KSM_ENABLED=0 configured"
       echo
-      # Swap disable 상태 확인
+      # Check swap disable state
       local swap_status=""
       if swapon --show 2>/dev/null | grep -q .; then
         swap_status="enabled"
@@ -4664,7 +5090,7 @@ step_08_sensor_deploy() {
     disksize_final="${disksize}GB"
   fi
   
-  # nodownload 자동 보정: 이미지 존재 여부 체크
+  # Auto-fix nodownload: check if image exists
   local expected_image="${installdir}/images/aella-modular-ds-${release}.qcow2"
   local nodownload="true"
   if [[ ! -f "${expected_image}" ]]; then
@@ -5209,7 +5635,7 @@ step_09_sensor_passthrough() {
     ###########################################################################
     log "[STEP 09] Configuring sensor VM network interfaces"
     
-    # Network mode 확인
+    # Check network mode
     local net_mode="${SENSOR_NET_MODE:-bridge}"
     
     # br-data bridge Exists Check and Creation (Bridge mode only)
@@ -5237,7 +5663,7 @@ step_09_sensor_passthrough() {
       fi
     elif [[ "${net_mode}" == "nat" ]]; then
       log "[STEP 09] NAT Mode - br-data bridge is not required (using virbr0)"
-      # virbr0 확인
+      # Check virbr0
       if [[ "${_DRY}" -eq 0 ]]; then
         if ! ip link show virbr0 >/dev/null 2>&1; then
           log "WARNING: virbr0 bridge does not exist. Starting default libvirt network..."
@@ -5552,9 +5978,48 @@ step_09_sensor_passthrough() {
       fi
       
       if [[ -f "${vm_xml_new}" && -s "${vm_xml_new}" ]]; then
+        # Pre-detect SPAN PCI list BEFORE cleanup (PCI mode only)
+        local span_attach_mode="${SPAN_ATTACH_MODE:-pci}"
+        local span_pci_list=""
+        if [[ "${span_attach_mode}" == "pci" ]]; then
+          log "[STEP 09] SPAN_ATTACH_MODE=pci, preparing SPAN PCI list before cleanup..."
+          log "[STEP 09] SENSOR_SPAN_VF_PCIS value: '${SENSOR_SPAN_VF_PCIS:-}'"
+          log "[STEP 09] SPAN_NICS value: '${SPAN_NICS:-}'"
+
+          # If SENSOR_SPAN_VF_PCIS is empty but SPAN_NICS are configured, re-detect PCI addresses
+          if [[ -z "${SENSOR_SPAN_VF_PCIS:-}" && -n "${SPAN_NICS:-}" ]]; then
+            log "[STEP 09] WARNING: SENSOR_SPAN_VF_PCIS is empty. Re-detecting PCI addresses for SPAN NICs..."
+            for span_nic in ${SPAN_NICS}; do
+              local pci_addr
+              pci_addr=$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
+              if [[ -n "${pci_addr}" ]]; then
+                span_pci_list="${span_pci_list} ${pci_addr}"
+                log "[STEP 09] Detected PCI address for ${span_nic}: ${pci_addr}"
+              else
+                log "[STEP 09] WARNING: Could not detect PCI address for ${span_nic}"
+              fi
+            done
+            if [[ -n "${span_pci_list}" ]]; then
+              SENSOR_SPAN_VF_PCIS="${span_pci_list# }"
+              save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
+              log "[STEP 09] SENSOR_SPAN_VF_PCIS updated: ${SENSOR_SPAN_VF_PCIS}"
+            else
+              log "[STEP 09] ERROR: Could not detect any PCI addresses for SPAN NICs."
+              log "[STEP 09] Please verify SPAN NICs are correctly configured in STEP 01."
+              return 1
+            fi
+          fi
+
+          span_pci_list="${SENSOR_SPAN_VF_PCIS:-}"
+          if [[ -z "${span_pci_list}" ]]; then
+            log "[STEP 09] ERROR: SPAN PCI list is empty. Cannot proceed with PCI mode."
+            log "[STEP 09] Please run STEP 01 to detect SPAN NIC PCI addresses."
+            return 1
+          fi
+        fi
+
         # Clean up conflicting devices based on SPAN_ATTACH_MODE
         # This handles mode switching: PCI passthrough <-> Bridge
-        local span_attach_mode="${SPAN_ATTACH_MODE:-pci}"
         log "[STEP 09] Cleaning up XML for SPAN_ATTACH_MODE=${span_attach_mode}..."
         
         # Use python for reliable XML parsing and cleanup
@@ -5575,7 +6040,7 @@ try:
         span_attach_mode = "${span_attach_mode}"
         net_mode = "${net_mode}"
         span_bridge_list = "${SPAN_BRIDGE_LIST:-}".split()
-        span_pci_list = "${SENSOR_SPAN_VF_PCIS:-}".split()
+        span_pci_list = "${span_pci_list}".split()
         
         # Determine expected devices based on mode
         expected_bridges = set()
@@ -5618,17 +6083,13 @@ try:
                 removed_count += len(interfaces_to_remove)
                 print(f"Removed {len(interfaces_to_remove)} SPAN bridge interface(s) (PCI passthrough mode)")
             
-            # PCI mode: Remove PCI hostdev devices that are not in current SPAN_NICS
-            # This handles cases where user removed SPAN NICs in STEP 01
-            if span_pci_list:
-                # Create a set of expected PCI addresses (normalize format)
-                expected_pcis = set()
-                for pci in span_pci_list:
-                    if pci:
-                        # Normalize PCI format (e.g., "0000:6f:00.0" -> "0000:6f:00.0")
-                        expected_pcis.add(pci.strip())
-                
-                # Find and remove PCI hostdev devices that are not in expected list
+            # PCI mode: Remove PCI hostdev devices not in current SPAN PCI list
+            expected_pcis = set()
+            for pci in span_pci_list:
+                if pci:
+                    expected_pcis.add(pci.strip())
+
+            if expected_pcis:
                 hostdevs_to_remove = []
                 for hostdev in devices.findall('hostdev'):
                     if hostdev.get('type') == 'pci':
@@ -5636,23 +6097,44 @@ try:
                         if source is not None:
                             address = source.find('address')
                             if address is not None:
-                                # Extract PCI address from XML
                                 domain = address.get('domain', '').replace('0x', '').zfill(4)
                                 bus = address.get('bus', '').replace('0x', '').zfill(2)
                                 slot = address.get('slot', '').replace('0x', '').zfill(2)
                                 func = address.get('function', '').replace('0x', '').zfill(1)
                                 pci_addr = f"{domain}:{bus}:{slot}.{func}"
-                                
-                                # Check if this PCI is in expected list
                                 if pci_addr not in expected_pcis:
                                     hostdevs_to_remove.append(hostdev)
-                
-                # Remove unexpected PCI devices
+
                 for hostdev in hostdevs_to_remove:
                     devices.remove(hostdev)
                     removed_count += len(hostdevs_to_remove)
-                if len(hostdevs_to_remove) > 0:
-                    print(f"Removed {len(hostdevs_to_remove)} unexpected PCI passthrough hostdev device(s) (not in current SPAN_NICS)")
+
+            # Always remove duplicate PCI hostdev devices for SPAN PCIs (keep first)
+            seen_pcis = set()
+            hostdevs_to_remove = []
+            for hostdev in devices.findall('hostdev'):
+                if hostdev.get('type') == 'pci':
+                    source = hostdev.find('source')
+                    if source is not None:
+                        address = source.find('address')
+                        if address is not None:
+                            domain = address.get('domain', '').replace('0x', '').zfill(4)
+                            bus = address.get('bus', '').replace('0x', '').zfill(2)
+                            slot = address.get('slot', '').replace('0x', '').zfill(2)
+                            func = address.get('function', '').replace('0x', '').zfill(1)
+                            pci_addr = f"{domain}:{bus}:{slot}.{func}"
+                            if pci_addr not in expected_pcis:
+                                continue
+                            if pci_addr in seen_pcis:
+                                hostdevs_to_remove.append(hostdev)
+                            else:
+                                seen_pcis.add(pci_addr)
+
+            for hostdev in hostdevs_to_remove:
+                devices.remove(hostdev)
+                removed_count += len(hostdevs_to_remove)
+            if len(hostdevs_to_remove) > 0:
+                print(f"Removed {len(hostdevs_to_remove)} duplicate PCI passthrough hostdev device(s)")
         
         # Step 2: Remove duplicate interfaces (keep only one per bridge/network)
         bridge_interfaces = {}
@@ -5886,44 +6368,107 @@ EOF
         # SPAN connection mode
         if [[ "${SPAN_ATTACH_MODE}" == "pci" ]]; then
           # Add SPAN NICs PF PCI passthrough (hostdev)
-          log "[STEP 09] SPAN_ATTACH_MODE=pci, checking SENSOR_SPAN_VF_PCIS..."
-          log "[STEP 09] SENSOR_SPAN_VF_PCIS value: '${SENSOR_SPAN_VF_PCIS:-}'"
-          log "[STEP 09] SPAN_NICS value: '${SPAN_NICS:-}'"
-          
-          # If SENSOR_SPAN_VF_PCIS is empty but SPAN_NICS are configured, re-detect PCI addresses
-          if [[ -z "${SENSOR_SPAN_VF_PCIS:-}" && -n "${SPAN_NICS:-}" ]]; then
-            log "[STEP 09] WARNING: SENSOR_SPAN_VF_PCIS is empty. Re-detecting PCI addresses for SPAN NICs..."
-            local span_pci_list=""
-            for span_nic in ${SPAN_NICS}; do
-              local pci_addr
-              pci_addr=$(readlink -f "/sys/class/net/${span_nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-              if [[ -n "${pci_addr}" ]]; then
-                span_pci_list="${span_pci_list} ${pci_addr}"
-                log "[STEP 09] Detected PCI address for ${span_nic}: ${pci_addr}"
-              else
-                log "[STEP 09] WARNING: Could not detect PCI address for ${span_nic}"
-              fi
-            done
-            if [[ -n "${span_pci_list}" ]]; then
-              SENSOR_SPAN_VF_PCIS="${span_pci_list# }"
-              save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
-              log "[STEP 09] SENSOR_SPAN_VF_PCIS updated: ${SENSOR_SPAN_VF_PCIS}"
-            else
-              log "[STEP 09] ERROR: Could not detect any PCI addresses for SPAN NICs."
-              log "[STEP 09] Please verify SPAN NICs are correctly configured in STEP 01."
-            fi
+          log "[STEP 09] SPAN_ATTACH_MODE=pci, checking SPAN PCI list..."
+          log "[STEP 09] SPAN PCI list: '${span_pci_list:-}'"
+          if [[ -z "${span_pci_list:-}" ]]; then
+            log "[STEP 09] ERROR: SPAN PCI list is empty. Cannot add hostdev devices."
+            return 1
           fi
-          
-          if [[ -n "${SENSOR_SPAN_VF_PCIS:-}" ]]; then
-            log "[STEP 09] Adding SPAN NIC PCIs for PCI passthrough: ${SENSOR_SPAN_VF_PCIS}"
-            for pci_full in ${SENSOR_SPAN_VF_PCIS}; do
+
+          if command -v python3 >/dev/null 2>&1; then
+            python3 <<EOF
+import sys
+import xml.etree.ElementTree as ET
+
+span_pcis = "${span_pci_list}".split()
+
+try:
+    tree = ET.parse("${vm_xml_new}")
+    root = tree.getroot()
+    devices = root.find('.//devices')
+    if devices is None:
+        print("ERROR: devices element not found in XML")
+        sys.exit(1)
+
+    def pci_key_from_hostdev(hostdev):
+        source = hostdev.find('source')
+        if source is None:
+            return None
+        address = source.find('address')
+        if address is None:
+            return None
+        domain = address.get('domain', '').replace('0x', '').zfill(4)
+        bus = address.get('bus', '').replace('0x', '').zfill(2)
+        slot = address.get('slot', '').replace('0x', '').zfill(2)
+        func = address.get('function', '').replace('0x', '').zfill(1)
+        return f"{domain}:{bus}:{slot}.{func}"
+
+    seen = set()
+    duplicates = []
+    for hostdev in devices.findall('hostdev'):
+        if hostdev.get('type') != 'pci':
+            continue
+        key = pci_key_from_hostdev(hostdev)
+        if key is None or key not in span_pcis:
+            continue
+        if key in seen:
+            duplicates.append(hostdev)
+        else:
+            seen.add(key)
+
+    for hostdev in duplicates:
+        devices.remove(hostdev)
+
+    added = 0
+    for pci in span_pcis:
+        if pci in seen:
+            continue
+        try:
+            domain, bus, slot_func = pci.split(':')
+            slot, func = slot_func.split('.')
+        except ValueError:
+            print(f"WARNING: Invalid PCI address format: {pci}")
+            continue
+
+        hostdev = ET.Element('hostdev', mode='subsystem', type='pci', managed='yes')
+        source = ET.SubElement(hostdev, 'source')
+        ET.SubElement(
+            source,
+            'address',
+            domain=f"0x{domain}",
+            bus=f"0x{bus}",
+            slot=f"0x{slot}",
+            function=f"0x{func}"
+        )
+        devices.append(hostdev)
+        added += 1
+
+    if added > 0 or duplicates:
+        ET.indent(tree, space="  ")
+        tree.write("${vm_xml_new}", encoding='unicode', xml_declaration=True)
+    print(f"SPAN PCI hostdev add complete: added={added}, deduped={len(duplicates)}")
+except Exception as e:
+    print(f"ERROR: Failed to add SPAN PCI hostdevs: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
+EOF
+            if [[ $? -eq 0 ]]; then
+              log "[STEP 09] SPAN PCI hostdevs processed successfully (python3)."
+            else
+              log "ERROR: Failed to process SPAN PCI hostdevs using python3."
+              return 1
+            fi
+          else
+            log "[STEP 09] WARNING: python3 not available. Falling back to awk hostdev add."
+            log "[STEP 09] Adding SPAN NIC PCIs for PCI passthrough: ${span_pci_list}"
+            for pci_full in ${span_pci_list}; do
               if [[ "${pci_full}" =~ ^([0-9a-f]{4}):([0-9a-f]{2}):([0-9a-f]{2})\.([0-9a-f])$ ]]; then
                 local domain="${BASH_REMATCH[1]}"
                 local bus="${BASH_REMATCH[2]}"
                 local slot="${BASH_REMATCH[3]}"
                 local func="${BASH_REMATCH[4]}"
                 
-                # Check if this PCI device is already in XML (avoid duplicates)
                 local pci_already_exists=0
                 if grep -q "domain='0x${domain}'.*bus='0x${bus}'.*slot='0x${slot}'.*function='0x${func}'" "${vm_xml_new}" 2>/dev/null; then
                   log "[INFO] SPAN PCI(${pci_full}) hostdev already exists in XML (skipping addition)"
@@ -5931,14 +6476,12 @@ EOF
                 fi
                 
                 if [[ "${pci_already_exists}" -eq 0 ]]; then
-                  # </devices>   hostdev add
                   local hostdev_xml="    <hostdev mode='subsystem' type='pci' managed='yes'>
         <source>
           <address domain='0x${domain}' bus='0x${bus}' slot='0x${slot}' function='0x${func}'/>
         </source>
       </hostdev>"
 
-                  # Update XML file paths
                   local tmp_xml="${vm_xml_new}.tmp"
                   awk -v hostdev="$hostdev_xml" '
                     /<\/devices>/ { print hostdev }
@@ -5951,13 +6494,6 @@ EOF
                 log "WARNING: Invalid PCI address format: ${pci_full}"
               fi
             done
-          else
-            log "[STEP 09] WARNING: SENSOR_SPAN_VF_PCIS is empty."
-            log "[STEP 09] This may indicate that STEP 01 did not properly detect SPAN NIC PCI addresses."
-            log "[STEP 09] Please verify:"
-            log "[STEP 09]   1. SPAN_NICS is configured: ${SPAN_NICS:-<not set>}"
-            log "[STEP 09]   2. SPAN_ATTACH_MODE is set to 'pci': ${SPAN_ATTACH_MODE:-<not set>}"
-            log "[STEP 09]   3. Re-run STEP 01 to detect PCI addresses for SPAN NICs"
           fi
         elif [[ "${SPAN_ATTACH_MODE}" == "bridge" ]]; then
           # Add SPAN bridges as virtio interfaces
@@ -6120,11 +6656,34 @@ EOF
           log "WARNING: Unknown SPAN_ATTACH_MODE: ${SPAN_ATTACH_MODE}"
         fi
         
-        # Redefine VM with modified XML
-        log "Redefining VM with modified XML"
-        if ! virsh undefine mds 2>/dev/null; then
-          log "WARNING: Failed to undefine existing VM (may not exist), continuing..."
+        # Validate modified XML before redefine
+        log "Validating modified XML with virsh define --validate"
+        local validate_output
+        validate_output=$(virsh define --validate "${vm_xml_new}" 2>&1)
+        if [[ $? -ne 0 ]]; then
+          log "ERROR: XML validation failed: ${vm_xml_new}"
+          log "ERROR: virsh define --validate output: ${validate_output}"
+          if [[ -f "${vm_xml_backup}" ]]; then
+            log "Attempting rollback using original XML: ${vm_xml_backup}"
+            virsh define "${vm_xml_backup}" >/dev/null 2>&1 || true
+          fi
+          return 1
         fi
+
+        # Check duplicate PCI hostdev entries in modified XML
+        local dup_pci_list
+        dup_pci_list=$(grep -oE "0000:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f]" "${vm_xml_new}" | sort | uniq -d || true)
+        if [[ -n "${dup_pci_list}" ]]; then
+          log "ERROR: Duplicate PCI hostdev detected in XML: ${dup_pci_list}"
+          if [[ -f "${vm_xml_backup}" ]]; then
+            log "Attempting rollback using original XML: ${vm_xml_backup}"
+            virsh define "${vm_xml_backup}" >/dev/null 2>&1 || true
+          fi
+          return 1
+        fi
+
+        # Redefine VM with modified XML (no undefine)
+        log "Redefining VM with modified XML (no undefine)"
         
         # Try to define VM and capture error output
         local define_output
@@ -6136,6 +6695,10 @@ EOF
           log "ERROR: virsh define error output: ${define_output}"
           log "ERROR: Please check XML file: ${vm_xml_new}"
           log "ERROR: You can validate XML with: virsh define --validate ${vm_xml_new}"
+          if [[ -f "${vm_xml_backup}" ]]; then
+            log "Attempting rollback using original XML: ${vm_xml_backup}"
+            virsh define "${vm_xml_backup}" >/dev/null 2>&1 || true
+          fi
           return 1
         fi
         log "VM XML defined successfully"
@@ -6150,7 +6713,7 @@ EOF
         # Start VM
         log "Starting mds VM"
         if ! virsh start mds 2>/dev/null; then
-          log "WARNING: Failed to start VM immediately (may already be running or need manual start)"
+          log "WARNING: VM start not confirmed yet (may already be running or need manual start)"
         else
           log "VM started successfully"
         fi
@@ -6391,7 +6954,7 @@ EOF
 EOF
                     # Check if PCI device is already attached to VM (check full address including domain)
                     local vm_xml_check
-                    vm_xml_check=$(virsh dumpxml "${SENSOR_VM}" 2>/dev/null)
+                    vm_xml_check=$(virsh dumpxml "${SENSOR_VM}" 2>/dev/null || true)
                     if [[ $? -eq 0 && -n "${vm_xml_check}" ]]; then
                         if echo "${vm_xml_check}" | grep -q "address.*domain='${d}'.*bus='${b}'.*slot='${s}'.*function='${f}'"; then
                             log "[INFO] PCI (${pci_full}) is already connected to VM. Skipping attachment."
@@ -6430,7 +6993,7 @@ EOF
         log "[STEP 09] Checking Sensor VM PCI passthrough status"
 
         local vm_xml_status
-        vm_xml_status=$(virsh dumpxml "${SENSOR_VM}" 2>/dev/null)
+        vm_xml_status=$(virsh dumpxml "${SENSOR_VM}" 2>/dev/null || true)
         if [[ $? -eq 0 && -n "${vm_xml_status}" ]]; then
             if echo "${vm_xml_status}" | grep -q "<hostdev.*type='pci'"; then
                 hostdev_count=$(echo "${vm_xml_status}" | grep -c "<hostdev.*type='pci'" || echo "0")
@@ -7242,9 +7805,12 @@ menu_auto_continue_from_state() {
   fi
 
   for ((i=next_idx; i<NUM_STEPS; i++)); do
-    if ! run_step "${i}"; then
+    run_step "${i}"
+    if [[ "${RUN_STEP_STATUS}" == "CANCELED" ]]; then
+      return
+    elif [[ "${RUN_STEP_STATUS}" == "FAILED" ]]; then
       whiptail_msgbox "Auto Execution Abort" "STEP ${STEP_IDS[$i]} execution failed.\n\nAuto execution aborted."
-      break
+      return
     fi
   done
 }

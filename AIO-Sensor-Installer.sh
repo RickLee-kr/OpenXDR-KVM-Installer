@@ -974,6 +974,7 @@ run_step() {
   local idx="$1"
   local step_id="${STEP_IDS[$idx]}"
   local step_name="${STEP_NAMES[$idx]}"
+  RUN_STEP_STATUS="UNKNOWN"
 
   # Check if STEP should be executed
   # Generate step-specific description
@@ -1027,6 +1028,7 @@ run_step() {
   then
     # User cancellation is considered "normal flow" (not an error)
     log "[$(date '+%Y-%m-%d %H:%M:%S')] User canceled execution of STEP ${step_id} (${step_name})."
+    RUN_STEP_STATUS="CANCELED"
     return 0   # Must end with 0 here so set -e doesn't trigger in main case.
   fi
 
@@ -1084,6 +1086,7 @@ run_step() {
   esac
 
   if [[ "${rc}" -eq 0 ]]; then
+    RUN_STEP_STATUS="DONE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP DONE: ${step_id} - ${step_name} ====="
     log "===== STEP DONE: ${step_id} - ${step_name} ====="
     
@@ -1350,7 +1353,8 @@ run_step() {
 	        fi
 	      done
 	    fi
-	  else
+  else
+    RUN_STEP_STATUS="FAILED"
 	    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
 	    log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
     
@@ -1419,11 +1423,254 @@ run_step() {
 # Hardware Detection Utility
 #######################################
 
+is_step01_excluded_iface() {
+  local name="$1"
+  [[ -z "${name}" ]] && return 0
+  [[ "${name}" == "lo" ]] && return 0
+  [[ "${name}" =~ ^(virbr|vnet|br|docker|tap|tun|vxlan|flannel|cni|cali|kube|veth|ovs) ]] && return 0
+  [[ -d "/sys/class/net/${name}/bridge" ]] && return 0
+  [[ ! -e "/sys/class/net/${name}/device" ]] && return 0
+  [[ -e "/sys/class/net/${name}/device/physfn" ]] && return 0
+  return 1
+}
+
+list_step01_phys_nics() {
+  local nic_path name
+  for nic_path in /sys/class/net/*; do
+    name="${nic_path##*/}"
+    if is_step01_excluded_iface "${name}"; then
+      continue
+    fi
+    echo "${name}"
+  done
+}
+
+list_auto_ifaces() {
+  local f
+  for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+    [[ -f "${f}" ]] || continue
+    awk '
+      tolower($1)=="auto" {
+        for (i=2; i<=NF; i++) print $i
+      }
+    ' "${f}" 2>/dev/null || true
+  done | sort -u
+}
+
+get_admin_state() {
+  local nic="$1"
+  local line
+  line="$(ip -o link show dev "${nic}" 2>/dev/null || true)"
+  if [[ -z "${line}" ]]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+  if echo "${line}" | grep -q "UP"; then
+    echo "UP"
+  else
+    echo "DOWN"
+  fi
+}
+
+step01_write_admin_state_snapshot() {
+  local state_file="$1"
+  local nic
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would write STEP 01 admin snapshot: ${state_file}"
+    return 0
+  fi
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  {
+    echo "# nic|admin_state|mac"
+    for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+      echo "${nic}|${STEP01_ADMIN_STATE[${nic}]}|${STEP01_MAC[${nic}]}"
+    done
+  } > "${state_file}"
+}
+
+step01_get_link_state() {
+  local nic="$1"
+  local et_out link_state
+
+  link_state="unknown"
+
+  if command -v ethtool >/dev/null 2>&1; then
+    et_out="$(ethtool "${nic}" 2>/dev/null || true)"
+    if echo "${et_out}" | grep -q "Link detected: yes"; then
+      echo "yes"
+      return 0
+    fi
+    if echo "${et_out}" | grep -q "Link detected: no"; then
+      link_state="no"
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/carrier" ]]; then
+    local carrier
+    carrier="$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null || echo "")"
+    if [[ "${carrier}" == "1" ]]; then
+      echo "yes"
+      return 0
+    elif [[ "${carrier}" == "0" && "${link_state}" != "yes" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/operstate" ]]; then
+    local operstate
+    operstate="$(cat "/sys/class/net/${nic}/operstate" 2>/dev/null || echo "")"
+    if [[ "${operstate}" == "up" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if [[ "${operstate}" == "down" || "${operstate}" == "dormant" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  echo "${link_state}"
+}
+
+step01_get_link_state_with_retry() {
+  local nic="$1"
+  local retries interval attempt state
+
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  attempt=1
+
+  while true; do
+    state="$(step01_get_link_state "${nic}")"
+    if [[ "${state}" == "yes" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if (( attempt >= retries )); then
+      echo "${state}"
+      return 0
+    fi
+    sleep "${interval}"
+    attempt=$((attempt + 1))
+  done
+}
+
+step01_prepare_link_scan() {
+  local cleanup_mode="${STEP01_LINK_CLEANUP_MODE:-B}"
+  local state_file="${STATE_DIR}/step01_admin_state.txt"
+  local nics auto_list nic mac admin_state
+
+  nics="$(list_step01_phys_nics || true)"
+  if [[ -z "${nics}" ]]; then
+    log "[STEP 01] No physical NIC candidates found for link scan (skip)"
+    return 0
+  fi
+
+  declare -gA STEP01_ADMIN_STATE STEP01_LINK_STATE STEP01_MAC
+  declare -ga STEP01_CANDIDATE_NICS STEP01_TEMP_UP_NICS
+  STEP01_CANDIDATE_NICS=()
+  STEP01_TEMP_UP_NICS=()
+
+  while IFS= read -r nic; do
+    [[ -z "${nic}" ]] && continue
+    STEP01_CANDIDATE_NICS+=("${nic}")
+    mac="$(get_if_mac "${nic}")"
+    admin_state="$(get_admin_state "${nic}")"
+    STEP01_MAC["${nic}"]="${mac}"
+    STEP01_ADMIN_STATE["${nic}"]="${admin_state}"
+  done <<< "${nics}"
+
+  step01_write_admin_state_snapshot "${state_file}"
+  log "[STEP 01] Temp admin-up target NICs: ${STEP01_CANDIDATE_NICS[*]}"
+
+  auto_list="$(list_auto_ifaces || true)"
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    if echo "${auto_list}" | grep -qx "${nic}"; then
+      log "[STEP 01] Skip temp up (auto iface): ${nic}"
+      continue
+    fi
+    if [[ "${STEP01_ADMIN_STATE[${nic}]}" == "UP" ]]; then
+      log "[STEP 01] Skip temp up (already UP): ${nic}"
+      continue
+    fi
+    STEP01_TEMP_UP_NICS+=("${nic}")
+  done
+
+  if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
+    log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
+    for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
+      run_cmd "sudo ip link set ${nic} up" || true
+    done
+  fi
+
+  local initial_wait retries interval total_wait
+  initial_wait="${STEP01_LINK_INITIAL_WAIT:-3}"
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  total_wait=$(( initial_wait + interval * (retries - 1) ))
+  log "[STEP 01] Link scan in progress. This can take longer depending on NIC count (often 10~20s). Please wait..."
+
+  sleep "${initial_wait}"
+
+  local remaining_nics round
+  remaining_nics=("${STEP01_CANDIDATE_NICS[@]}")
+  round=1
+  while true; do
+    local new_remaining=()
+    for nic in "${remaining_nics[@]}"; do
+      local link_state
+      link_state="$(step01_get_link_state "${nic}")"
+      STEP01_LINK_STATE["${nic}"]="${link_state}"
+      if [[ "${link_state}" != "yes" ]]; then
+        new_remaining+=("${nic}")
+      fi
+    done
+    remaining_nics=("${new_remaining[@]}")
+    if [[ ${#remaining_nics[@]} -eq 0 || ${round} -ge ${retries} ]]; then
+      break
+    fi
+    sleep "${interval}"
+    round=$((round + 1))
+  done
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    log "[STEP 01] Link detected: ${nic}=${STEP01_LINK_STATE[${nic}]:-unknown}"
+  done
+
+  log "[STEP 01] Link scan cleanup policy: ${cleanup_mode}"
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    local link_state orig_state
+    link_state="${STEP01_LINK_STATE[${nic}]}"
+    orig_state="${STEP01_ADMIN_STATE[${nic}]}"
+
+    if [[ "${cleanup_mode}" == "A" ]]; then
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
+      else
+        log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
+      fi
+      continue
+    fi
+
+    if [[ "${link_state}" == "yes" ]]; then
+      run_cmd "sudo ip link set ${nic} up" || true
+      log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
+    else
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
+      else
+        log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
+      fi
+    fi
+  done
+}
+
 list_nic_candidates() {
-  # lo, virbr*, vnet*, tap*, docker*, br*, ovs are excluded
-  ip -o link show | awk -F': ' '{print $2}' \
-    | grep -Ev '^(lo|virbr|vnet|tap|docker|br-|ovs)' \
-    || true
+  list_step01_phys_nics || true
 }
 
 # NIC identity helpers (PCI/MAC/resolve)
@@ -1742,6 +1989,9 @@ step_01_hw_detect() {
   ########################
   local nics nic_list nic name idx
 
+  # STEP 01 link scan: temp admin UP + ethtool detection + cleanup
+  step01_prepare_link_scan || log "[STEP 01] Link scan completed with warnings (continuing)"
+
   # list_nic_candidates defense so script doesn't die even if it fails due to set -e
   nics="$(list_nic_candidates || true)"
 
@@ -1755,7 +2005,7 @@ step_01_hw_detect() {
   idx=0
   while IFS= read -r name; do
     # IP information assigned to each NIC + ethtool Speed/Duplex Display
-    local ipinfo speed duplex et_out
+    local ipinfo speed duplex et_out link_state
 
     # IP information
     ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
@@ -1764,6 +2014,7 @@ step_01_hw_detect() {
     # default value
     speed="Unknown"
     duplex="Unknown"
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
 
     # ethtoolas  Speed / Duplex Get
     if command -v ethtool >/dev/null 2>&1; then
@@ -1779,18 +2030,15 @@ step_01_hw_detect() {
       [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
     fi
 
-    # whiptail in menu "speed=..., duplex=..., ip=..." in the form of Display
-    nic_list+=("${name}" "speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
+    # whiptail in menu "link=..., speed=..., duplex=..., ip=..." in the form of Display
+    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
     ((idx++))
   done <<< "${nics}"
 
   ########################
-  # 4) NIC Selection (NAT mode only)
+  # 4-1) Select NAT uplink NIC (mgt, NAT mode only)
   ########################
-  
-  # NAT Mode: Select only 1 NAT uplink NIC
   if [[ "${net_mode}" == "nat" ]]; then
-    # NAT Mode: Select only 1 NAT uplink NIC
     log "[STEP 01] NAT Mode - NAT uplink NIC selection (select one)"
     
     local nat_nic
@@ -1825,91 +2073,18 @@ step_01_hw_detect() {
   fi
 
   ########################
-  # 5) SPAN NIC Selection (Multiple selection)
-  ########################
-  local span_nic_list=()
-  while IFS= read -r name; do
-    # IP information assigned to each NIC + ethtool Speed/Duplex Display
-    local ipinfo speed duplex et_out
-
-    # IP information
-    ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
-    [[ -z "${ipinfo}" ]] && ipinfo="(no ip)"
-
-    # default value
-    speed="Unknown"
-    duplex="Unknown"
-
-    # ethtoolas  Speed / Duplex Get
-    if command -v ethtool >/dev/null 2>&1; then
-      # set -e protection: ethtool so script doesn't die even if it fails || true
-      et_out=$(ethtool "${name}" 2>/dev/null || true)
-
-      # Speed:
-      tmp_speed=$(printf '%s\n' "${et_out}" | awk -F': ' '/Speed:/ {print $2; exit}')
-      [[ -n "${tmp_speed}" ]] && speed="${tmp_speed}"
-
-      # Duplex:
-      tmp_duplex=$(printf '%s\n' "${et_out}" | awk -F': ' '/Duplex:/ {print $2; exit}')
-      [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
-    fi
-
-    # If existing SPAN_NIC is selected, set ON, otherwise OFF
-    local flag="OFF"
-    for s in ${SPAN_NICS}; do
-      if [[ "${s}" == "${name}" ]]; then
-        flag="ON"
-        break
-      fi
-    done
-    span_nic_list+=("${name}" "speed=${speed}, duplex=${duplex}, ip=${ipinfo}" "${flag}")
-  done <<< "${nics}"
-
-  local selected_span_nics
-  # Calculate menu size dynamically
-  menu_dims=$(calc_menu_size $((${#span_nic_list[@]} / 3)) 80 10)
-  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-  
-  # Center-align menu message
-  menu_msg=$(center_menu_message "Select NICs for sensor SPAN traffic collection.\n(At least 1 selection required)\n\nCurrent selection: ${SPAN_NICS:-<None>}" "${menu_height}")
-  
-  selected_span_nics=$(whiptail --title "STEP 01 - SPAN NIC Selection" \
-                                --checklist "${menu_msg}" \
-                                "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                                "${span_nic_list[@]}" \
-                                3>&1 1>&2 2>&3) || {
-    log "User canceled SPAN NIC selection."
-    return 1
-  }
-
-  # whiptail output is "nic1" "nic2" form → Remove double quotes(Important)
-  selected_span_nics=$(echo "${selected_span_nics}" | tr -d '"')
-
-  log "Selected SPAN NICs(All): ${selected_span_nics}"
-  SPAN_NICS="${selected_span_nics}"
-  save_config_var "SPAN_NICS" "${SPAN_NICS}"
-
-  # All SPAN NICs are assigned to mds (single sensor)
-  SPAN_NICS_MDS="${SPAN_NICS}"
-  save_config_var "SPAN_NICS_MDS" "${SPAN_NICS_MDS}"
-
-  log "SPAN NIC(mds): ${SPAN_NICS_MDS}"
-
-  ########################
-  # 5-1) Select HOST access NIC (for direct KVM host access only, 192.168.0.100/24)
+  # 4-2) Select HOST access NIC (direct KVM host access, 192.168.0.100/24)
   ########################
   log "[STEP 01] Host access NIC selection (for direct KVM host access)"
   
-  # Get available NICs (exclude already selected NICs)
+  # Get available NICs (exclude NAT uplink)
   # nic_list format: [NIC_name, description, NIC_name, description, ...]
   local available_nics=()
   local i
   for ((i=0; i<${#nic_list[@]}; i+=2)); do
     local nic_name="${nic_list[i]}"
     local nic_desc="${nic_list[i+1]}"
-    # Exclude already selected NICs
-    if [[ "${nic_name}" != "${HOST_NIC}" ]] && \
-       [[ ! "${SPAN_NICS}" =~ ${nic_name} ]]; then
+    if [[ "${nic_name}" != "${HOST_NIC}" ]]; then
       available_nics+=("${nic_name}" "${nic_desc}")
     fi
   done
@@ -1950,6 +2125,81 @@ step_01_hw_detect() {
       save_config_var "HOST_ACCESS_NIC" "${HOST_ACCESS_NIC}"
     fi
   fi
+
+  ########################
+  # 4-3) SPAN NIC Selection (Multiple selection)
+  ########################
+  local span_nic_list=()
+  while IFS= read -r name; do
+    if [[ "${name}" == "${HOST_NIC}" || "${name}" == "${HOST_ACCESS_NIC}" ]]; then
+      continue
+    fi
+    # IP information assigned to each NIC + ethtool Speed/Duplex Display
+    local ipinfo speed duplex et_out link_state
+
+    # IP information
+    ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
+    [[ -z "${ipinfo}" ]] && ipinfo="(no ip)"
+
+    # default value
+    speed="Unknown"
+    duplex="Unknown"
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
+
+    # ethtoolas  Speed / Duplex Get
+    if command -v ethtool >/dev/null 2>&1; then
+      # set -e protection: ethtool so script doesn't die even if it fails || true
+      et_out=$(ethtool "${name}" 2>/dev/null || true)
+
+      # Speed:
+      tmp_speed=$(printf '%s\n' "${et_out}" | awk -F': ' '/Speed:/ {print $2; exit}')
+      [[ -n "${tmp_speed}" ]] && speed="${tmp_speed}"
+
+      # Duplex:
+      tmp_duplex=$(printf '%s\n' "${et_out}" | awk -F': ' '/Duplex:/ {print $2; exit}')
+      [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
+    fi
+
+    # If existing SPAN_NIC is selected, set ON, otherwise OFF
+    local flag="OFF"
+    for s in ${SPAN_NICS}; do
+      if [[ "${s}" == "${name}" ]]; then
+        flag="ON"
+        break
+      fi
+    done
+    span_nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}" "${flag}")
+  done <<< "${nics}"
+
+  local selected_span_nics
+  # Calculate menu size dynamically
+  menu_dims=$(calc_menu_size $((${#span_nic_list[@]} / 3)) 80 10)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align menu message
+  menu_msg=$(center_menu_message "Select NICs for sensor SPAN traffic collection.\n(At least 1 selection required)\n\nCurrent selection: ${SPAN_NICS:-<None>}" "${menu_height}")
+  
+  selected_span_nics=$(whiptail --title "STEP 01 - SPAN NIC Selection" \
+                                --checklist "${menu_msg}" \
+                                "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                                "${span_nic_list[@]}" \
+                                3>&1 1>&2 2>&3) || {
+    log "User canceled SPAN NIC selection."
+    return 1
+  }
+
+  # whiptail output is "nic1" "nic2" form → Remove double quotes(Important)
+  selected_span_nics=$(echo "${selected_span_nics}" | tr -d '"')
+
+  log "Selected SPAN NICs(All): ${selected_span_nics}"
+  SPAN_NICS="${selected_span_nics}"
+  save_config_var "SPAN_NICS" "${SPAN_NICS}"
+
+  # All SPAN NICs are assigned to mds (single sensor)
+  SPAN_NICS_MDS="${SPAN_NICS}"
+  save_config_var "SPAN_NICS_MDS" "${SPAN_NICS_MDS}"
+
+  log "SPAN NIC(mds): ${SPAN_NICS_MDS}"
 
   ########################
   # 6) SPAN NIC PF PCI Address Collection (PCI passthrough specific)
@@ -2622,7 +2872,7 @@ EOF
     fi
 
     if [[ "${verify_failed}" -eq 1 ]]; then
-      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      whiptail_msgbox "STEP 03 - File Verification Failed" "Configuration file verification failed.\n\n${verify_errors}\n\nPlease check the files and re-run the step." 16 85
       log "[ERROR] STEP 03 file verification failed:${verify_errors}"
       return 1
     fi
@@ -7879,9 +8129,12 @@ menu_auto_continue_from_state() {
   fi
 
   for ((i=next_idx; i<NUM_STEPS; i++)); do
-    if ! run_step "${i}"; then
+    run_step "${i}"
+    if [[ "${RUN_STEP_STATUS}" == "CANCELED" ]]; then
+      return
+    elif [[ "${RUN_STEP_STATUS}" == "FAILED" ]]; then
       whiptail_msgbox "Automatic execution stopped" "An error occurred during STEP ${STEP_IDS[$i]} execution.\n\nAutomatic execution stopped." 10 70
-      break
+      return
     fi
   done
 }

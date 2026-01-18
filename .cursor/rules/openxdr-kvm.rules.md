@@ -139,3 +139,6 @@ State update rules:
 Script-specific validation is allowed,
 but output style and severity levels must remain identical.
 
+## (Additional) Language Standard
+- All UI, menu, validation, and log messages must be in English only.
+

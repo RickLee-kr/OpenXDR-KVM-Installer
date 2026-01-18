@@ -454,7 +454,7 @@ ensure_bridge_up_no_carrier_ok() {
 
   log "[Bridge Ensure] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
 
-  # 1) Bridge 존재 확인 및 생성
+  # 1) Check bridge existence and create
   if ! ip link show dev "${bridge_name}" >/dev/null 2>&1; then
     log "[Bridge Ensure] Bridge ${bridge_name} does not exist, creating it"
     if [[ "${_DRY}" -eq 1 ]]; then
@@ -470,7 +470,7 @@ ensure_bridge_up_no_carrier_ok() {
     log "[Bridge Ensure] Bridge ${bridge_name} already exists"
   fi
 
-  # 2) Bridge admin UP 보장
+  # 2) Ensure bridge admin UP
   if [[ "${_DRY}" -eq 1 ]]; then
     log "[DRY-RUN] ip link set dev ${bridge_name} up"
   else
@@ -481,7 +481,7 @@ ensure_bridge_up_no_carrier_ok() {
     log "[Bridge Ensure] Bridge ${bridge_name} set to admin UP"
   fi
 
-  # 3) 물리 NIC admin UP (enslave 전에 UP 상태로)
+  # 3) Physical NIC admin UP (bring up before enslave)
   if [[ -n "${phys_nic}" ]]; then
     if ip link show dev "${phys_nic}" >/dev/null 2>&1; then
       if [[ "${_DRY}" -eq 1 ]]; then
@@ -491,7 +491,7 @@ ensure_bridge_up_no_carrier_ok() {
         log "[Bridge Ensure] Physical NIC ${phys_nic} set to admin UP"
       fi
 
-      # 4) 물리 NIC을 bridge에 master로 연결 (enslave)
+      # 4) Enslave physical NIC to bridge (set master)
       local current_master
       current_master="$(ip link show dev "${phys_nic}" 2>/dev/null | grep -oP 'master \K\w+' || echo "")"
       if [[ "${current_master}" != "${bridge_name}" ]]; then
@@ -511,7 +511,7 @@ ensure_bridge_up_no_carrier_ok() {
     fi
   fi
 
-  # 5) STP/forward_delay 비활성화 (Sensor-Installer와 동일)
+  # 5) Disable STP/forward_delay (same as Sensor-Installer)
   if [[ "${_DRY}" -eq 1 ]]; then
     log "[DRY-RUN] echo 0 > /sys/class/net/${bridge_name}/bridge/stp_state"
     log "[DRY-RUN] echo 0 > /sys/class/net/${bridge_name}/bridge/forward_delay"
@@ -526,7 +526,7 @@ ensure_bridge_up_no_carrier_ok() {
     fi
   fi
 
-  # 6) Admin UP 여부 최종 확인 (operstate는 확인하지 않음)
+  # 6) Final admin UP check (operstate not enforced)
   if [[ "${_DRY}" -eq 0 ]]; then
     if ! ip -o link show dev "${bridge_name}" 2>/dev/null | grep -q "<.*UP.*>"; then
       log "[ERROR] Bridge ${bridge_name} exists but cannot be set ADMIN-UP"
@@ -534,7 +534,7 @@ ensure_bridge_up_no_carrier_ok() {
     fi
   fi
 
-  # 7) operstate 확인 (로그용, 실패 조건 아님)
+  # 7) Check operstate (log only, not a failure condition)
   if [[ "${_DRY}" -eq 0 ]]; then
     local operstate
     operstate="$(cat /sys/class/net/${bridge_name}/operstate 2>/dev/null || echo unknown)"
@@ -603,7 +603,7 @@ load_config() {
   : "${CLTR0_NIC_MAC:=}"
   : "${HOST_NIC_MAC:=}"
 
-  # Legacy compatibility (deprecated, use *_NIC_PCI/*_NIC_MAC instead)
+  # Compatibility (deprecated, use *_NIC_PCI/*_NIC_MAC instead)
   : "${MGT_PCI:=}"
   : "${CLTR0_PCI:=}"
   : "${HOST_PCI:=}"
@@ -698,7 +698,7 @@ MGT_NIC_MAC="${MGT_NIC_MAC//\"/\\\"}"
 CLTR0_NIC_MAC="${CLTR0_NIC_MAC//\"/\\\"}"
 HOST_NIC_MAC="${HOST_NIC_MAC//\"/\\\"}"
 
-# Legacy compatibility (deprecated)
+# Compatibility (deprecated)
 MGT_PCI="${MGT_PCI//\"/\\\"}"
 CLTR0_PCI="${CLTR0_PCI//\"/\\\"}"
 HOST_PCI="${HOST_PCI//\"/\\\"}"
@@ -780,7 +780,7 @@ save_config_var() {
     CLTR0_NIC_MAC) CLTR0_NIC_MAC="${value}" ;;
     HOST_NIC_MAC) HOST_NIC_MAC="${value}" ;;
 
-    # Legacy compatibility
+    # Compatibility
     MGT_PCI) MGT_PCI="${value}" ;;
     CLTR0_PCI) CLTR0_PCI="${value}" ;;
     HOST_PCI) HOST_PCI="${value}" ;;
@@ -801,7 +801,7 @@ save_config_var() {
 
     RENAMED_CONFLICT_IFACES) RENAMED_CONFLICT_IFACES="${value}" ;;
 
-    # Legacy compatibility (keep for backward compatibility)
+    # Compatibility (keep for backward compatibility)
     MGT_SELECTED_IFNAME) MGT_NIC_SELECTED="${value}" ;;
     CLTR0_SELECTED_IFNAME) CLTR0_NIC_SELECTED="${value}" ;;
     HOST_SELECTED_IFNAME) HOST_NIC_SELECTED="${value}" ;;
@@ -962,7 +962,16 @@ apply_pdf_xml_patch() {
   log "[PATCH] ${vm_name} :: PDF guide-based UEFI/XML conversion and Cloud-Init application starting"
 
   # 1. Stop VM and undefine existing definition
-  run_cmd "virsh destroy ${vm_name} || true"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] virsh destroy ${vm_name} || true"
+  else
+    local destroy_out
+    if destroy_out="$(virsh destroy "${vm_name}" 2>&1)"; then
+      log "[PATCH] ${vm_name}: virsh destroy completed"
+    else
+      log "[WARN] ${vm_name}: virsh destroy failed (likely not running): ${destroy_out}"
+    fi
+  fi
   run_cmd "virsh undefine ${vm_name} --nvram || virsh undefine ${vm_name} || true"
 
   # 2. Disk format conversion (QCOW2 -> RAW)
@@ -1159,6 +1168,7 @@ run_step() {
   local idx="$1"
   local step_id="${STEP_IDS[$idx]}"
   local step_name="${STEP_NAMES[$idx]}"
+  RUN_STEP_STATUS="UNKNOWN"
 
   # STEP 06 always includes SR-IOV driver installation + NTPsec
   if [[ "${step_id}" == "06_ntpsec" ]]; then
@@ -1184,6 +1194,7 @@ run_step() {
   if [[ ${confirm_rc} -ne 0 ]]; then
     # Treat cancel as normal flow (not an error)
     log "User canceled running STEP ${step_id}."
+    RUN_STEP_STATUS="CANCELED"
     return 0   # Must return 0 here to avoid set -e firing in main case
   fi
 
@@ -1242,8 +1253,10 @@ run_step() {
   if [[ "${rc}" -eq 2 ]]; then
     # Step was canceled by user - don't save state, don't reboot
     log "===== STEP CANCELED: ${step_id} - ${step_name} ====="
+    RUN_STEP_STATUS="CANCELED"
     return 0
   elif [[ "${rc}" -eq 0 ]]; then
+    RUN_STEP_STATUS="DONE"
     log "===== STEP DONE: ${step_id} - ${step_name} ====="
     save_state "${step_id}"
 
@@ -1273,6 +1286,7 @@ run_step() {
       done
     fi
   else
+    RUN_STEP_STATUS="FAILED"
     log "===== STEP FAILED (rc=${rc}): ${step_id} - ${step_name} ====="
     whiptail_msgbox "STEP failed - ${step_id}" "An error occurred while running STEP ${step_id} (${step_name}).\n\nCheck logs and rerun the STEP if needed.\nThe installer can continue to run." 14 80
   fi
@@ -1286,11 +1300,255 @@ run_step() {
 # Hardware detection utilities
 #######################################
 
+is_step01_excluded_iface() {
+  local name="$1"
+  [[ -z "${name}" ]] && return 0
+  [[ "${name}" == "lo" ]] && return 0
+  [[ "${name}" =~ ^(virbr|vnet|br|docker|tap|tun|vxlan|flannel|cni|cali|kube|veth|ovs) ]] && return 0
+  [[ -d "/sys/class/net/${name}/bridge" ]] && return 0
+  [[ ! -e "/sys/class/net/${name}/device" ]] && return 0
+  [[ -e "/sys/class/net/${name}/device/physfn" ]] && return 0
+  return 1
+}
+
+list_step01_phys_nics() {
+  local nic_path name
+  for nic_path in /sys/class/net/*; do
+    name="${nic_path##*/}"
+    if is_step01_excluded_iface "${name}"; then
+      continue
+    fi
+    echo "${name}"
+  done
+}
+
+list_auto_ifaces() {
+  local f
+  for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+    [[ -f "${f}" ]] || continue
+    awk '
+      tolower($1)=="auto" {
+        for (i=2; i<=NF; i++) print $i
+      }
+    ' "${f}" 2>/dev/null || true
+  done | sort -u
+}
+
+get_admin_state() {
+  local nic="$1"
+  local line
+  line="$(ip -o link show dev "${nic}" 2>/dev/null || true)"
+  if [[ -z "${line}" ]]; then
+    echo "UNKNOWN"
+    return 0
+  fi
+  if echo "${line}" | grep -q "UP"; then
+    echo "UP"
+  else
+    echo "DOWN"
+  fi
+}
+
+step01_write_admin_state_snapshot() {
+  local state_file="$1"
+  local nic
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would write STEP 01 admin snapshot: ${state_file}"
+    return 0
+  fi
+  mkdir -p "${STATE_DIR}" 2>/dev/null || true
+  {
+    echo "# nic|admin_state|mac"
+    for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+      echo "${nic}|${STEP01_ADMIN_STATE[${nic}]}|${STEP01_MAC[${nic}]}"
+    done
+  } > "${state_file}"
+}
+
+step01_get_link_state() {
+  local nic="$1"
+  local et_out link_state
+
+  link_state="unknown"
+
+  if command -v ethtool >/dev/null 2>&1; then
+    et_out="$(ethtool "${nic}" 2>/dev/null || true)"
+    if echo "${et_out}" | grep -q "Link detected: yes"; then
+      echo "yes"
+      return 0
+    fi
+    if echo "${et_out}" | grep -q "Link detected: no"; then
+      link_state="no"
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/carrier" ]]; then
+    local carrier
+    carrier="$(cat "/sys/class/net/${nic}/carrier" 2>/dev/null || echo "")"
+    if [[ "${carrier}" == "1" ]]; then
+      echo "yes"
+      return 0
+    elif [[ "${carrier}" == "0" && "${link_state}" != "yes" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  if [[ -f "/sys/class/net/${nic}/operstate" ]]; then
+    local operstate
+    operstate="$(cat "/sys/class/net/${nic}/operstate" 2>/dev/null || echo "")"
+    if [[ "${operstate}" == "up" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if [[ "${operstate}" == "down" || "${operstate}" == "dormant" ]]; then
+      echo "no"
+      return 0
+    fi
+  fi
+
+  echo "${link_state}"
+}
+
+step01_get_link_state_with_retry() {
+  local nic="$1"
+  local retries interval attempt state
+
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  attempt=1
+
+  while true; do
+    state="$(step01_get_link_state "${nic}")"
+    if [[ "${state}" == "yes" ]]; then
+      echo "yes"
+      return 0
+    fi
+    if (( attempt >= retries )); then
+      echo "${state}"
+      return 0
+    fi
+    sleep "${interval}"
+    attempt=$((attempt + 1))
+  done
+}
+
+step01_prepare_link_scan() {
+  local cleanup_mode="${STEP01_LINK_CLEANUP_MODE:-B}"
+  local state_file="${STATE_DIR}/step01_admin_state.txt"
+  local nics auto_list nic mac admin_state
+
+  nics="$(list_step01_phys_nics || true)"
+  if [[ -z "${nics}" ]]; then
+    log "[STEP 01] No physical NIC candidates found for link scan (skip)"
+    return 0
+  fi
+
+  declare -gA STEP01_ADMIN_STATE STEP01_LINK_STATE STEP01_MAC
+  declare -ga STEP01_CANDIDATE_NICS STEP01_TEMP_UP_NICS
+  STEP01_CANDIDATE_NICS=()
+  STEP01_TEMP_UP_NICS=()
+
+  while IFS= read -r nic; do
+    [[ -z "${nic}" ]] && continue
+    STEP01_CANDIDATE_NICS+=("${nic}")
+    mac="$(get_if_mac "${nic}")"
+    admin_state="$(get_admin_state "${nic}")"
+    STEP01_MAC["${nic}"]="${mac}"
+    STEP01_ADMIN_STATE["${nic}"]="${admin_state}"
+  done <<< "${nics}"
+
+  step01_write_admin_state_snapshot "${state_file}"
+  log "[STEP 01] Temp admin-up target NICs: ${STEP01_CANDIDATE_NICS[*]}"
+
+  auto_list="$(list_auto_ifaces || true)"
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    if echo "${auto_list}" | grep -qx "${nic}"; then
+      log "[STEP 01] Skip temp up (auto iface): ${nic}"
+      continue
+    fi
+    if [[ "${STEP01_ADMIN_STATE[${nic}]}" == "UP" ]]; then
+      log "[STEP 01] Skip temp up (already UP): ${nic}"
+      continue
+    fi
+    STEP01_TEMP_UP_NICS+=("${nic}")
+  done
+
+  if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
+    log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
+    for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
+      run_cmd "sudo ip link set ${nic} up" || true
+    done
+  fi
+
+  local initial_wait retries interval total_wait
+  initial_wait="${STEP01_LINK_INITIAL_WAIT:-3}"
+  retries="${STEP01_LINK_RETRIES:-5}"
+  interval="${STEP01_LINK_INTERVAL:-2}"
+  total_wait=$(( initial_wait + interval * (retries - 1) ))
+  log "[STEP 01] Link scan in progress. This can take longer depending on NIC count (often 10~20s). Please wait..."
+
+  # Allow link to settle after admin up
+  sleep "${initial_wait}"
+
+  local remaining_nics round
+  remaining_nics=("${STEP01_CANDIDATE_NICS[@]}")
+  round=1
+  while true; do
+    local new_remaining=()
+    for nic in "${remaining_nics[@]}"; do
+      local link_state
+      link_state="$(step01_get_link_state "${nic}")"
+      STEP01_LINK_STATE["${nic}"]="${link_state}"
+      if [[ "${link_state}" != "yes" ]]; then
+        new_remaining+=("${nic}")
+      fi
+    done
+    remaining_nics=("${new_remaining[@]}")
+    if [[ ${#remaining_nics[@]} -eq 0 || ${round} -ge ${retries} ]]; then
+      break
+    fi
+    sleep "${interval}"
+    round=$((round + 1))
+  done
+
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    log "[STEP 01] Link detected: ${nic}=${STEP01_LINK_STATE[${nic}]:-unknown}"
+  done
+
+  log "[STEP 01] Link scan cleanup policy: ${cleanup_mode}"
+  for nic in "${STEP01_CANDIDATE_NICS[@]}"; do
+    local link_state orig_state
+    link_state="${STEP01_LINK_STATE[${nic}]}"
+    orig_state="${STEP01_ADMIN_STATE[${nic}]}"
+
+    if [[ "${cleanup_mode}" == "A" ]]; then
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
+      else
+        log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
+      fi
+      continue
+    fi
+
+    if [[ "${link_state}" == "yes" ]]; then
+      run_cmd "sudo ip link set ${nic} up" || true
+      log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
+    else
+      if [[ "${orig_state}" == "DOWN" ]]; then
+        run_cmd "sudo ip link set ${nic} down" || true
+        log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
+      else
+        log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
+      fi
+    fi
+  done
+}
+
 list_nic_candidates() {
-  # Exclude lo, virbr*, vnet*, tap*, docker*, br*, ovs, etc.
-  ip -o link show | awk -F': ' '{print $2}' \
-    | grep -Ev '^(lo|virbr|vnet|tap|docker|br-|ovs)' \
-    || true
+  list_step01_phys_nics || true
 }
 
 # Find interface name by PCI address
@@ -1759,6 +2017,9 @@ step_01_hw_detect() {
   ########################
   local nics nic_list nic name idx
 
+  # STEP 01 link scan: temp admin UP + ethtool detection + cleanup
+  step01_prepare_link_scan || log "[STEP 01] Link scan completed with warnings (continuing)"
+
   # Guard against list_nic_candidates failure under set -e
   nics="$(list_nic_candidates || true)"
 
@@ -1772,7 +2033,7 @@ step_01_hw_detect() {
   idx=0
   while IFS= read -r name; do
     # Collect IP info and ethtool speed/duplex for each NIC
-    local ipinfo speed duplex et_out
+    local ipinfo speed duplex et_out link_state
 
     # IP info
     ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
@@ -1796,8 +2057,10 @@ step_01_hw_detect() {
       [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
     fi
 
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
+
     # Show as "speed=..., duplex=..., ip=..." in whiptail menu
-    nic_list+=("${name}" "speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
+    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
     ((idx++))
   done <<< "${nics}"
 
@@ -1832,60 +2095,12 @@ step_01_hw_detect() {
   save_config_var "MGT_NIC_SELECTED" "${mgt_nic}"
   save_config_var "MGT_NIC_PCI" "$(get_if_pci "${mgt_nic}")"
   save_config_var "MGT_NIC_MAC" "$(get_if_mac "${mgt_nic}")"
-  # Legacy compatibility
+  # Compatibility
   save_config_var "MGT_PCI" "$(get_if_pci "${mgt_nic}")"
   save_config_var "MGT_MAC" "$(get_if_mac "${mgt_nic}")"
 
   ########################
-  # 3) Select cltr0 NIC
-  ########################
-  # Warn if cltr0 NIC matches mgt NIC
-  local cltr0_nic
-  # Calculate menu size dynamically (reuse same calculation as mgt NIC)
-  menu_dims=$(calc_menu_size $((idx)) 90 8)
-  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-  
-  # Center-align the menu message based on terminal height
-  local msg_content="Select NIC for cluster (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${cltr0_display:-<none>}\n"
-  local centered_msg
-  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
-  
-  cltr0_nic=$(whiptail --title "STEP 01 - Select cltr0 NIC" \
-                       --menu "${centered_msg}" \
-                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
-                       3>&1 1>&2 2>&3) || {
-    log "User canceled cltr0 NIC selection."
-    return 1
-  }
-
-  if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
-    # Temporarily disable set -e to handle cancel gracefully
-    set +e
-    whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?"
-    local warn_rc=$?
-    set -e
-    
-    if [[ ${warn_rc} -ne 0 ]]; then
-      log "User canceled configuration with identical NICs."
-      return 2  # Return 2 to indicate cancellation
-    fi
-  fi
-
-
-  log "Selected cltr0 NIC: ${cltr0_nic}"
-  CLTR0_NIC="${cltr0_nic}"
-  save_config_var "CLTR0_NIC" "${CLTR0_NIC}"   ### Change 3
-  # Save stable identity for cltr0 NIC (PCI/MAC - hardware identifiers)
-  save_config_var "CLTR0_NIC_SELECTED" "${cltr0_nic}"
-  save_config_var "CLTR0_NIC_PCI" "$(get_if_pci "${cltr0_nic}")"
-  save_config_var "CLTR0_NIC_MAC" "$(get_if_mac "${cltr0_nic}")"
-  # Legacy compatibility
-  save_config_var "CLTR0_PCI" "$(get_if_pci "${cltr0_nic}")"
-  save_config_var "CLTR0_MAC" "$(get_if_mac "${cltr0_nic}")"
-
-  ########################
-  # 3-1) Select HOST access NIC (for direct KVM host access only)
+  # 3) Select HOST access NIC (for direct KVM host access only)
   ########################
   local host_nic
   # Calculate menu size dynamically (reuse same calculation as mgt/cltr0 NIC)
@@ -1920,12 +2135,65 @@ step_01_hw_detect() {
   save_config_var "HOST_NIC_SELECTED" "${host_nic}"
   save_config_var "HOST_NIC_PCI" "$(get_if_pci "${host_nic}")"
   save_config_var "HOST_NIC_MAC" "$(get_if_mac "${host_nic}")"
-  # Legacy compatibility
+  # Compatibility
   save_config_var "HOST_PCI" "$(get_if_pci "${host_nic}")"
   save_config_var "HOST_MAC" "$(get_if_mac "${host_nic}")"
 
   ########################
-  # 4) Select SSDs for data
+  # 4) Select cltr0 NIC
+  ########################
+  # Warn if cltr0 NIC matches mgt NIC
+  local cltr0_nic
+  # Calculate menu size dynamically (reuse same calculation as mgt NIC)
+  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  
+  # Center-align the menu message based on terminal height
+  local msg_content="Select NIC for cluster (cltr0).\n\nUsing a different NIC from mgt is recommended.\nCurrent: ${cltr0_display:-<none>}\n"
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+  
+  cltr0_nic=$(whiptail --title "STEP 01 - Select cltr0 NIC" \
+                      --menu "${centered_msg}" \
+                      "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                      "${nic_list[@]}" \
+                      3>&1 1>&2 2>&3) || {
+    log "User canceled cltr0 NIC selection."
+    return 1
+  }
+
+  if [[ "${cltr0_nic}" == "${host_nic}" ]]; then
+    whiptail_msgbox "Error" "cltr0 NIC cannot be the same as HOST_NIC.\n\n- HOST_NIC : ${host_nic}\n- CLTR0_NIC: ${cltr0_nic}" 12 80
+    log "CLTR0_NIC duplicate selection: ${cltr0_nic}"
+    return 1
+  fi
+
+  if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
+    # Temporarily disable set -e to handle cancel gracefully
+    set +e
+    whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?"
+    local warn_rc=$?
+    set -e
+    
+    if [[ ${warn_rc} -ne 0 ]]; then
+      log "User canceled configuration with identical NICs."
+      return 2  # Return 2 to indicate cancellation
+    fi
+  fi
+
+  log "Selected cltr0 NIC: ${cltr0_nic}"
+  CLTR0_NIC="${cltr0_nic}"
+  save_config_var "CLTR0_NIC" "${CLTR0_NIC}"   ### Change 3
+  # Save stable identity for cltr0 NIC (PCI/MAC - hardware identifiers)
+  save_config_var "CLTR0_NIC_SELECTED" "${cltr0_nic}"
+  save_config_var "CLTR0_NIC_PCI" "$(get_if_pci "${cltr0_nic}")"
+  save_config_var "CLTR0_NIC_MAC" "$(get_if_mac "${cltr0_nic}")"
+  # Compatibility
+  save_config_var "CLTR0_PCI" "$(get_if_pci "${cltr0_nic}")"
+  save_config_var "CLTR0_MAC" "$(get_if_mac "${cltr0_nic}")"
+
+  ########################
+  # 5) Select SSDs for data
   ########################
 
   # Initialize variables
@@ -2543,7 +2811,7 @@ step_03_nic_ifupdown() {
 
   # Uniqueness check (no duplicate identity)
   if ! check_unique_identities "${mgt_pci}" "" "${cltr0_pci}" "" "${host_pci}" ""; then
-    whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "선택한 NIC들이 중복되었습니다.\n\n같은 NIC이 2개 이상의 역할(mgt/cltr0/hostmgmt)에 지정되었습니다.\n\nSTEP 01에서 서로 다른 NIC을 선택해주세요." 12 70
+    whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "Selected NICs are duplicated.\n\nThe same NIC is assigned to more than one role (mgt/cltr0/hostmgmt).\n\nPlease select different NICs in STEP 01." 12 70
     log "[ERROR] Duplicate identity detected - STEP 03 failed"
     return 1
   fi
@@ -2884,7 +3152,7 @@ EOF
     fi
 
     if [[ "${verify_failed}" -eq 1 ]]; then
-      whiptail_msgbox "STEP 03 - File Verification Failed" "설정 파일 검증에 실패했습니다.\n\n${verify_errors}\n\n파일 내용을 확인 후 다시 실행해주세요." 16 85
+      whiptail_msgbox "STEP 03 - File Verification Failed" "Configuration file verification failed.\n\n${verify_errors}\n\nPlease check the files and re-run the step." 16 85
       log "[ERROR] STEP 03 file verification failed:${verify_errors}"
       return 1
     fi
@@ -2925,7 +3193,25 @@ EOF
   run_cmd "sudo systemctl enable networking || true"
 
   #######################################
-  # 6) Summary (reboot required for udev rename + ifupdown apply)
+  # 6) Keep link-up NICs admin UP (runtime safeguard)
+  #######################################
+  log "[STEP 03] Ensuring link-up NICs stay admin UP (ethtool link detected)"
+  if command -v ethtool >/dev/null 2>&1; then
+    local nic_path nic et_out
+    for nic_path in /sys/class/net/*; do
+      nic="${nic_path##*/}"
+      [[ "${nic}" == "lo" ]] && continue
+      et_out="$(ethtool "${nic}" 2>/dev/null || true)"
+      if echo "${et_out}" | grep -q "Link detected: yes"; then
+        run_cmd "sudo ip link set ${nic} up"
+      fi
+    done
+  else
+    log "[STEP 03] ethtool not found; skip link-up NIC protection"
+  fi
+
+  #######################################
+  # 7) Summary (reboot required for udev rename + ifupdown apply)
   #######################################
   local summary
   summary=$(cat <<EOF
@@ -2933,7 +3219,7 @@ EOF
   STEP 03: Network Configuration - Complete (Declarative)
 ═══════════════════════════════════════════════════════════
 
-✅ FILES WRITTEN (no runtime network changes performed):
+✅ FILES WRITTEN (no runtime config changes; link-up NICs set admin UP):
   • udev rules: ${udev_file}
     - ${mgt_pci}   → mgt
     - ${cltr0_pci} → cltr0
@@ -6060,11 +6346,11 @@ step_12_bridge_attach_v621() {
 
   local _DRY="${DRY_RUN:-0}"
   
-  # VM 이름 자동 감지: DL_HOSTNAME/DA_HOSTNAME이 없으면 virsh list에서 찾기
+  # Auto-detect VM names: if DL_HOSTNAME/DA_HOSTNAME not set, look in virsh list
   local DL_VM="${DL_HOSTNAME:-}"
   local DA_VM="${DA_HOSTNAME:-}"
   
-  # DL_VM 자동 감지
+  # Auto-detect DL_VM
   if [[ -z "${DL_VM}" ]]; then
     log "[STEP 12 Bridge] DL_HOSTNAME not set, auto-detecting DL VM from virsh list"
     DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
@@ -6076,7 +6362,7 @@ step_12_bridge_attach_v621() {
     fi
   fi
   
-  # DA_VM 자동 감지
+  # Auto-detect DA_VM
   if [[ -z "${DA_VM}" ]]; then
     log "[STEP 12 Bridge] DA_HOSTNAME not set, auto-detecting DA VM from virsh list"
     DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
@@ -6289,7 +6575,7 @@ Do you want to continue?"
 
   ###########################################################################
   # 2.5. Bridge runtime creation/UP guarantee (NO-CARRIER allowed)
-  # VM attach 직전에 bridge를 런타임으로 생성/UP 보장
+  # Ensure bridge is created/up at runtime right before VM attach
   ###########################################################################
   log "[STEP 12 Bridge] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
 
@@ -6688,11 +6974,11 @@ step_12_sriov_cpu_affinity_v621() {
 
   local _DRY="${DRY_RUN:-0}"
 
-  # VM 이름 자동 감지: DL_HOSTNAME/DA_HOSTNAME이 없으면 virsh list에서 찾기
+  # Auto-detect VM names: if DL_HOSTNAME/DA_HOSTNAME not set, look in virsh list
   local DL_VM="${DL_HOSTNAME:-}"
   local DA_VM="${DA_HOSTNAME:-}"
   
-  # DL_VM 자동 감지
+  # Auto-detect DL_VM
   if [[ -z "${DL_VM}" ]]; then
     log "[STEP 12] DL_HOSTNAME not set, auto-detecting DL VM from virsh list"
     DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
@@ -6704,7 +6990,7 @@ step_12_sriov_cpu_affinity_v621() {
     fi
   fi
   
-  # DA_VM 자동 감지
+  # Auto-detect DA_VM
   if [[ -z "${DA_VM}" ]]; then
     log "[STEP 12] DA_HOSTNAME not set, auto-detecting DA VM from virsh list"
     DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
@@ -6949,7 +7235,7 @@ CLOUD
   fi
 
   ###########################################################################
-  # Cluster Interface Type 분기 처리
+  # Cluster Interface Type branching
   ###########################################################################
   local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
   
@@ -9040,13 +9326,13 @@ EOF
 # STEP 12 – SR-IOV VF Passthrough + CPU Affinity + CD-ROM removal + DL data LV
 ###############################################################################
 #######################################
-# STEP 12 - Bridge Mode Attach (Legacy)
+# STEP 12 - Bridge Mode Attach
 #######################################
 step_12_bridge_attach_legacy() {
     local STEP_ID="12_bridge_attach"
 
     echo
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (Legacy) ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV ====="
 
     # Load config
     if type load_config >/dev/null 2>&1; then
@@ -9055,31 +9341,31 @@ step_12_bridge_attach_legacy() {
 
     local _DRY="${DRY_RUN:-0}"
     
-    # VM 이름 자동 감지: DL_HOSTNAME/DL_VM_NAME이 없으면 virsh list에서 찾기
+    # Auto-detect VM names: if DL_HOSTNAME/DL_VM_NAME not set, look in virsh list
     local DL_VM="${DL_HOSTNAME:-${DL_VM_NAME:-}}"
     local DA_VM="${DA_HOSTNAME:-${DA_VM_NAME:-}}"
     
-    # DL_VM 자동 감지
+    # Auto-detect DL_VM
     if [[ -z "${DL_VM}" ]]; then
-        log "[STEP 12 Bridge Legacy] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
+        log "[STEP 12 Bridge] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
         DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
         if [[ -n "${DL_VM}" ]]; then
-            log "[STEP 12 Bridge Legacy] Auto-detected DL VM: ${DL_VM}"
+            log "[STEP 12 Bridge] Auto-detected DL VM: ${DL_VM}"
         else
             DL_VM="dl-master"
-            log "[STEP 12 Bridge Legacy] No DL VM found, using default: ${DL_VM}"
+            log "[STEP 12 Bridge] No DL VM found, using default: ${DL_VM}"
         fi
     fi
     
-    # DA_VM 자동 감지
+    # Auto-detect DA_VM
     if [[ -z "${DA_VM}" ]]; then
-        log "[STEP 12 Bridge Legacy] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
+        log "[STEP 12 Bridge] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
         DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
         if [[ -n "${DA_VM}" ]]; then
-            log "[STEP 12 Bridge Legacy] Auto-detected DA VM: ${DA_VM}"
+            log "[STEP 12 Bridge] Auto-detected DA VM: ${DA_VM}"
         else
             DA_VM="da-master"
-            log "[STEP 12 Bridge Legacy] No DA VM found, using default: ${DA_VM}"
+            log "[STEP 12 Bridge] No DA VM found, using default: ${DA_VM}"
         fi
     fi
     
@@ -9280,7 +9566,7 @@ Do you want to continue?"
 
     ###########################################################################
     # 2.5. Bridge runtime creation/UP guarantee (NO-CARRIER allowed)
-    # VM attach 직전에 bridge를 런타임으로 생성/UP 보장
+    # Ensure bridge is created/up at runtime right before VM attach
     ###########################################################################
     log "[STEP 12 Bridge] Ensuring bridge ${bridge_name} is ready for VM attach (NO-CARRIER allowed)"
 
@@ -9658,10 +9944,10 @@ Do you want to continue?"
             whiptail_msgbox "STEP 12 – Bridge Attach / CPU Affinity / DL data LV (DRY-RUN)" "${dry_run_content}" "${dry_dialog_height}" "${dry_dialog_width}"
         fi
     else
-        show_paged "STEP 12 – Bridge Attach / CPU Affinity / DL data LV verification results (Legacy)" "${result_file}" "no-clear"
+        show_paged "STEP 12 – Bridge Attach / CPU Affinity / DL data LV verification results" "${result_file}" "no-clear"
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV (Legacy) ====="
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. Bridge Attach + CPU Affinity + CD-ROM removal + DL data LV ====="
     echo
 }
 
@@ -9707,48 +9993,48 @@ step_12_sriov_cpu_affinity() {
 
     local _DRY="${DRY_RUN:-0}"
     
-    # VM 이름 자동 감지: DL_HOSTNAME/DL_VM_NAME이 없으면 virsh list에서 찾기
+    # Auto-detect VM names: if DL_HOSTNAME/DL_VM_NAME not set, look in virsh list
     local DL_VM="${DL_HOSTNAME:-${DL_VM_NAME:-}}"
     local DA_VM="${DA_HOSTNAME:-${DA_VM_NAME:-}}"
     
-    # DL_VM 자동 감지
+    # Auto-detect DL_VM
     if [[ -z "${DL_VM}" ]]; then
-        log "[STEP 12 Legacy] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
+        log "[STEP 12] DL_HOSTNAME/DL_VM_NAME not set, auto-detecting DL VM from virsh list"
         DL_VM=$(virsh list --all --name 2>/dev/null | grep -E "^dl-" | head -n1 || echo "")
         if [[ -n "${DL_VM}" ]]; then
-            log "[STEP 12 Legacy] Auto-detected DL VM: ${DL_VM}"
+            log "[STEP 12] Auto-detected DL VM: ${DL_VM}"
         else
             DL_VM="dl-master"
-            log "[STEP 12 Legacy] No DL VM found, using default: ${DL_VM}"
+            log "[STEP 12] No DL VM found, using default: ${DL_VM}"
         fi
     fi
     
-    # DA_VM 자동 감지
+    # Auto-detect DA_VM
     if [[ -z "${DA_VM}" ]]; then
-        log "[STEP 12 Legacy] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
+        log "[STEP 12] DA_HOSTNAME/DA_VM_NAME not set, auto-detecting DA VM from virsh list"
         DA_VM=$(virsh list --all --name 2>/dev/null | grep -E "^da-" | head -n1 || echo "")
         if [[ -n "${DA_VM}" ]]; then
-            log "[STEP 12 Legacy] Auto-detected DA VM: ${DA_VM}"
+            log "[STEP 12] Auto-detected DA VM: ${DA_VM}"
         else
             DA_VM="da-master"
-            log "[STEP 12 Legacy] No DA VM found, using default: ${DA_VM}"
+            log "[STEP 12] No DA VM found, using default: ${DA_VM}"
         fi
     fi
 
     ###########################################################################
-    # Cluster Interface Type 분기 처리 (Legacy)
+    # Cluster Interface Type branching
     ###########################################################################
     local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
     
     if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
-      log "[STEP 12] Cluster Interface Type: BRIDGE - Executing bridge attach only (Legacy)"
+      log "[STEP 12] Cluster Interface Type: BRIDGE - Executing bridge attach only"
       step_12_bridge_attach_legacy
       local legacy_bridge_rc=$?
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV ====="
       echo
       return ${legacy_bridge_rc}
     elif [[ "${cluster_nic_type}" == "SRIOV" ]]; then
-      log "[STEP 12] Cluster Interface Type: SRIOV - Executing SR-IOV VF passthrough (Legacy)"
+      log "[STEP 12] Cluster Interface Type: SRIOV - Executing SR-IOV VF passthrough"
       # Execution start confirmation
       local start_msg
       if [[ "${_DRY}" -eq 1 ]]; then
@@ -11565,7 +11851,7 @@ menu_config() {
             ;;
         esac
         
-        # 모드 변경 확인
+        # Confirm mode change
         if [[ "${new_type}" != "${current_type}" ]]; then
           local switch_msg=""
           if [[ "${current_type}" == "SRIOV" ]] && [[ "${new_type}" == "BRIDGE" ]]; then
@@ -12875,7 +13161,10 @@ menu_auto_continue_from_state() {
 
   local i
   for ((i=next_idx; i<NUM_STEPS; i++)); do
-    if ! run_step "$i"; then
+    run_step "$i"
+    if [[ "${RUN_STEP_STATUS}" == "CANCELED" ]]; then
+      return 0
+    elif [[ "${RUN_STEP_STATUS}" == "FAILED" ]]; then
       # Calculate dialog size dynamically
       local dialog_dims
       dialog_dims=$(calc_dialog_size 10 70)
@@ -12885,7 +13174,7 @@ menu_auto_continue_from_state() {
       whiptail --title "XDR Installer" \
                --msgbox "STEP execution stopped.\n\nPlease check the log (${LOG_FILE}) for details." \
                "${dialog_height}" "${dialog_width}"
-      break
+      return 0
     fi
   done
 }

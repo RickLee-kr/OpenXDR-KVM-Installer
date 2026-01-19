@@ -69,7 +69,7 @@ STEP_NAMES=(
   "NIC Name/ifupdown Switch and Network Configuration"
   "KVM / Libvirt Installation and Basic Configuration"
   "Kernel Parameters / KSM / Swap Tuning"
-  "libvirt hooks Installation"
+  "libvirt hooks Installation + NTPsec"
   "Sensor LV Creation + Image/Script Download"
   "Sensor VM Deployment"
   "Sensor VM Network & SPAN Interface Configuration"
@@ -3622,21 +3622,239 @@ step_06_libvirt_hooks() {
   # Network Mode Check
   local net_mode="${SENSOR_NET_MODE:-bridge}"
   log "[STEP 06] Sensor Network Mode: ${net_mode}"
-  
+
+  local hooks_rc=0
   # mode branch Execution
   if [[ "${net_mode}" == "bridge" ]]; then
     log "[STEP 06] Bridge Mode - Installing sensor hooks"
-    step_06_bridge_hooks
-    return $?
+    step_06_bridge_hooks || hooks_rc=$?
   elif [[ "${net_mode}" == "nat" ]]; then
     log "[STEP 06] NAT Mode - Installing OpenXDR NAT hooks"
-    step_06_nat_hooks
-    return $?
+    step_06_nat_hooks || hooks_rc=$?
   else
     log "ERROR: Unknown SENSOR_NET_MODE: ${net_mode}"
     whiptail_msgbox "Network Mode Error" "Unknown sensor network mode: ${net_mode}\n\nPlease select a valid mode (bridge or nat) in environment configuration."
     return 1
   fi
+
+  if [[ ${hooks_rc} -ne 0 ]]; then
+    return ${hooks_rc}
+  fi
+
+  step_06_ntpsec_only
+  return $?
+}
+
+step_06_ntpsec_only() {
+  load_config
+
+  log "[STEP 06] Configure NTPsec"
+  
+  local tmp_info="/tmp/xdr_step06_ntpsec_info.txt"
+  : > "${tmp_info}"
+
+  #######################################
+  # 0) Summarize current time / NTP state
+  #######################################
+  {
+    echo "Current time / NTP status"
+    echo "--------------------------------"
+    echo
+    echo "# timedatectl"
+    timedatectl 2>/dev/null || echo "timedatectl failed"
+    echo
+    echo "# ntpsec package status (dpkg -l ntpsec)"
+    dpkg -l ntpsec 2>/dev/null || echo "No ntpsec package info"
+    echo
+    echo "# ntpsec service state (systemctl is-active ntpsec)"
+    local ntpsec_check
+    ntpsec_check=$(systemctl is-active ntpsec 2>/dev/null)
+    if [[ -z "${ntpsec_check}" ]] || [[ "${ntpsec_check}" != "active" ]]; then
+      echo "inactive"
+    else
+      echo "${ntpsec_check}"
+    fi
+    echo
+    echo "# ntpq -p (if available)"
+    ntpq -p 2>/dev/null || echo "ntpq -p failed or ntpsec not installed"
+  } >> "${tmp_info}"
+
+  show_textbox "STEP 06 - NTP status" "${tmp_info}"
+
+  # Temporarily disable set -e to handle cancel gracefully
+  set +e
+  whiptail_yesno "STEP 06 - confirmation" "Install and configure NTPsec on the host.\n\nProceed?"
+  local confirm_rc=$?
+  set -e
+  
+  if [[ ${confirm_rc} -ne 0 ]]; then
+    log "User canceled STEP 06."
+    return 2  # Return 2 to indicate cancellation
+  fi
+
+  #######################################
+  # 1) Install NTPsec
+  #######################################
+  log "[STEP 06] Installing NTPsec package"
+
+  run_cmd "sudo apt-get update"
+  run_cmd "sudo apt-get install -y ntpsec"
+
+  #######################################
+  # 2) Back up /etc/ntpsec/ntp.conf
+  #######################################
+  local NTP_CONF="/etc/ntpsec/ntp.conf"
+  local NTP_CONF_BACKUP="/etc/ntpsec/ntp.conf.orig.$(date +%Y%m%d-%H%M%S)"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      sudo cp -a "${NTP_CONF}" "${NTP_CONF_BACKUP}"
+      log "Backed up existing ${NTP_CONF} to ${NTP_CONF_BACKUP}."
+    else
+      log "[DRY-RUN] Would back up ${NTP_CONF} to ${NTP_CONF_BACKUP}"
+    fi
+  else
+    log "[STEP 06] ${NTP_CONF} not found (check ntpsec install state)"
+  fi
+
+  #######################################
+  # 3) Comment default Ubuntu NTP pool/server entries
+  #######################################
+  log "[STEP 06] Commenting default Ubuntu NTP pool/server entries"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would comment pool/server entries in ${NTP_CONF} (0~3 ubuntu pool, ntp.ubuntu.com)"
+    else
+      sudo sed -i 's/^pool 0.ubuntu.pool.ntp.org iburst/#pool 0.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 1.ubuntu.pool.ntp.org iburst/#pool 1.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 2.ubuntu.pool.ntp.org iburst/#pool 2.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 3.ubuntu.pool.ntp.org iburst/#pool 3.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^server ntp.ubuntu.com iburst/#server ntp.ubuntu.com iburst/' "${NTP_CONF}"
+    fi
+  fi
+
+  #######################################
+  # 4) Comment restrict default kod ... line
+  #######################################
+  log "[STEP 06] Commenting out restrict default kod ... rule"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would comment 'restrict default kod nomodify nopeer noquery limited' in ${NTP_CONF}"
+    else
+      sudo sed -i 's/^restrict default kod nomodify nopeer noquery limited/#restrict default kod nomodify nopeer noquery limited/' "${NTP_CONF}"
+    fi
+  fi
+
+  #######################################
+  # 5) Add Google NTP + us.pool servers, tinker panic 0, restrict default
+  #######################################
+  log "[STEP 06] Add Google NTP servers plus tinker panic 0, restrict default"
+
+  local TAG_BEGIN="# XDR_NTPSEC_CONFIG_BEGIN"
+  local TAG_END="# XDR_NTPSEC_CONFIG_END"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if grep -q "${TAG_BEGIN}" "${NTP_CONF}" 2>/dev/null; then
+      log "[STEP 06] XDR_NTPSEC_CONFIG block already present in ${NTP_CONF} → skip add"
+    else
+      local ntp_block
+      ntp_block=$(cat <<EOF
+
+${TAG_BEGIN}
+# Alternate NTP servers (per docs)
+server time1.google.com prefer
+server time2.google.com
+server time3.google.com
+server time4.google.com
+server 0.us.pool.ntp.org
+server 1.us.pool.ntp.org
+
+# Allow large time offsets to be corrected
+tinker panic 0
+
+# Update restrict rule
+restrict default nomodify nopeer noquery notrap
+${TAG_END}
+EOF
+)
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Would append block to ${NTP_CONF}:\n${ntp_block}"
+      else
+        printf "%s\n" "${ntp_block}" | sudo tee -a "${NTP_CONF}" >/dev/null
+        log "Added XDR_NTPSEC_CONFIG block to ${NTP_CONF}"
+      fi
+    fi
+  else
+    log "[STEP 06] ${NTP_CONF} missing; cannot append NTP server settings."
+  fi
+
+  #######################################
+  # 6) Restart and verify NTPsec
+  #######################################
+  log "[STEP 06] Restart NTPsec and check status"
+
+  run_cmd "sudo systemctl restart ntpsec"
+  run_cmd "systemctl status ntpsec --no-pager || true"
+  run_cmd "ntpq -p || true"
+
+  #######################################
+  # 7) Final summary
+  #######################################
+  : > "${tmp_info}"
+  {
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 06: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "ℹ️  In real execution mode, the following would be performed:"
+      echo "   • NTPsec package installation and configuration"
+      echo "   • NTPsec service restart and status check"
+    else
+      echo "✅ STEP 06 Execution Status: SUCCESS"
+      echo
+      echo "📋 ACTIONS COMPLETED:"
+      echo "   • NTPsec package installation and configuration"
+      echo "   • NTPsec service restarted and verified"
+      echo
+      echo "📊 NTPsec CONFIGURATION STATUS:"
+      echo "1️⃣  NTPsec Configuration File:"
+      if [[ -f "${NTP_CONF}" ]]; then
+        echo "     ✅ ${NTP_CONF} updated"
+      else
+        echo "     ⚠️  ${NTP_CONF} not found"
+        echo "     (NTPsec may not be installed)"
+      fi
+      echo
+      echo "2️⃣  NTPsec Service Status:"
+      local ntpsec_status
+      ntpsec_status=$(systemctl is-active ntpsec 2>/dev/null || echo "")
+      if [[ -z "${ntpsec_status}" ]] || [[ "${ntpsec_status}" != "active" ]]; then
+        echo "  ⚠️  ntpsec service is inactive"
+      else
+        echo "  ✅ ntpsec service is active"
+      fi
+      echo
+      echo "3️⃣  NTP Synchronization Status:"
+      if command -v ntpq >/dev/null 2>&1; then
+        echo "  (ntpq -p output below)"
+        ntpq -p 2>/dev/null || echo "  (NTPsec may not be running or not yet synchronized)"
+      else
+        echo "  (ntpq command not found)"
+      fi
+      echo
+      echo "💡 IMPORTANT NOTES:"
+      echo "  • NTPsec synchronization may take a few minutes"
+      echo "  • Check /etc/ntpsec/ntp.conf for server settings"
+      echo "  • If NTPsec is not synchronized, check network connectivity"
+    fi
+  } >> "${tmp_info}"
+
+  show_textbox "STEP 06 - NTPsec summary" "${tmp_info}"
 }
 
 #######################################

@@ -425,6 +425,23 @@ run_cmd() {
   fi
 }
 
+run_cmd_linkscan() {
+  local cmd="$*"
+
+  if [[ "${DRY_RUN}" -eq 1 && "${STEP01_LINK_SCAN_REAL:-1}" -ne 1 ]]; then
+    log "[DRY-RUN] ${cmd}"
+    return 0
+  fi
+
+  log "[RUN-LINKSCAN] ${cmd}"
+  eval "${cmd}" 2>&1 | tee -a "${LOG_FILE}"
+  local exit_code="${PIPESTATUS[0]}"
+  if [[ "${exit_code}" -ne 0 ]]; then
+    log "[ERROR] Link-scan command failed (exit code: ${exit_code}): ${cmd}"
+  fi
+  return "${exit_code}"
+}
+
 append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
@@ -569,6 +586,7 @@ load_config() {
 
   # Defaults (set only if missing)
   : "${DRY_RUN:=1}"  # Default DRY_RUN=1 (safe mode)
+  : "${STEP01_LINK_SCAN_REAL:=1}"
   : "${DP_VERSION:=6.2.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
@@ -1478,7 +1496,7 @@ step01_prepare_link_scan() {
   if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
     log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
     for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
     done
   fi
 
@@ -1525,7 +1543,7 @@ step01_prepare_link_scan() {
 
     if [[ "${cleanup_mode}" == "A" ]]; then
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+        run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
       else
         log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
@@ -1534,11 +1552,11 @@ step01_prepare_link_scan() {
     fi
 
     if [[ "${link_state}" == "yes" ]]; then
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
       log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
     else
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+        run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
       else
         log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
@@ -2212,9 +2230,9 @@ step_01_hw_detect() {
 
   # Iterate over disks
   while read -r d_name d_size d_model; do
-  # Check if any child of the disk (/dev/d_name) is mounted at /
+  # Check if any child of the disk (/dev/d_name) is mounted at /, /boot, or /boot/efi
   # Using lsblk -r (raw) to inspect all children mountpoints
-  if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^/$"; then
+  if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^(/|/boot|/boot/efi)$"; then
     # OS disk found -> omit from list; keep for notice
     root_info="OS Disk: ${d_name} (${d_size}) ${d_model} -> Ubuntu Linux (excluded)"
   else
@@ -12841,7 +12859,7 @@ show_usage_help() {
 
 
 ═══════════════════════════════════════════════════════════════
-🔰 **Scenario 1: Fresh Installation (Ubuntu 16.04)**
+🔰 **Scenario 1: Fresh Installation (Ubuntu 24.04)**
 ═══════════════════════════════════════════════════════════════
 
 Step-by-Step Process:

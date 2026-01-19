@@ -72,9 +72,9 @@ STEP_NAMES=(
   "03. NIC Name/ifupdown Switch and Network Configuration"
   "04. KVM / Libvirt Installation and Basic Configuration"
   "05. Kernel Parameters / KSM / Swap Tuning"
-  "06. libvirt Hooks Installation"
+  "06. libvirt Hooks Installation + NTPsec"
   "07. LVM Storage Configuration (AIO)"
-  "08. DP Download (AIO)"
+  "08. AIO Download"
   "09. AIO VM Deployment"
   "10. Sensor LV Creation + Image/Script Download"
   "11. Sensor VM Deployment"
@@ -454,6 +454,23 @@ run_cmd() {
   fi
 }
 
+run_cmd_linkscan() {
+  local cmd="$*"
+
+  if [[ "${DRY_RUN}" -eq 1 && "${STEP01_LINK_SCAN_REAL:-1}" -ne 1 ]]; then
+    log "[DRY-RUN] ${cmd}"
+    return 0
+  fi
+
+  log "[RUN-LINKSCAN] ${cmd}"
+  eval "${cmd}" 2>&1 | tee -a "${LOG_FILE}"
+  local exit_code="${PIPESTATUS[0]}"
+  if [[ "${exit_code}" -ne 0 ]]; then
+    log "[ERROR] Link-scan command failed (Exit code: ${exit_code}): ${cmd}"
+  fi
+  return "${exit_code}"
+}
+
 append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
@@ -596,11 +613,22 @@ load_config() {
 
   # default value (Set only when not present)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
-  : "${DP_VERSION:=6.2.0}"  # DP version for AIO deployment (default: 6.2.0)
+  : "${DP_VERSION:=6.2.0}"  # Legacy alias (kept for backward compatibility)
+  : "${AIO_VERSION:=}"      # AIO version for AIO deployment
   : "${SENSOR_VERSION:=6.2.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
   : "${ACPS_PASSWORD:=}"
+
+  # Normalize AIO/DP version values (keep in sync)
+  if [[ -n "${AIO_VERSION}" ]]; then
+    DP_VERSION="${AIO_VERSION}"
+  elif [[ -n "${DP_VERSION}" ]]; then
+    AIO_VERSION="${DP_VERSION}"
+  fi
+
+  # Link scan should run real admin up/down by default
+  : "${STEP01_LINK_SCAN_REAL:=1}"
 
   # Default values related to auto reboot
   : "${ENABLE_AUTO_REBOOT:=1}"
@@ -675,8 +703,8 @@ save_config() {
   mkdir -p "$(dirname "${CONFIG_FILE}")"
 
   # Replace " with \" in values (to prevent config file from breaking)
-  local esc_dp_version esc_sensor_version esc_acps_user esc_acps_pass esc_acps_url
-  esc_dp_version=${DP_VERSION//\"/\\\"}
+  local esc_aio_version esc_sensor_version esc_acps_user esc_acps_pass esc_acps_url
+  esc_aio_version=${AIO_VERSION//\"/\\\"}
   esc_sensor_version=${SENSOR_VERSION//\"/\\\"}
   esc_acps_user=${ACPS_USERNAME//\"/\\\"}
   esc_acps_pass=${ACPS_PASSWORD//\"/\\\"}
@@ -741,7 +769,8 @@ save_config() {
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer environment configuration (auto-generated)
 DRY_RUN=${DRY_RUN}
-DP_VERSION="${esc_dp_version}"
+DP_VERSION="${esc_aio_version}"
+AIO_VERSION="${esc_aio_version}"
 SENSOR_VERSION="${esc_sensor_version}"
 ACPS_USERNAME="${esc_acps_user}"
 ACPS_PASSWORD="${esc_acps_pass}"
@@ -816,8 +845,9 @@ save_config_var() {
 
   case "${key}" in
     DRY_RUN)        DRY_RUN="${value}" ;;
-    DP_VERSION)      DP_VERSION="${value}" ;;
-    SENSOR_VERSION)     SENSOR_VERSION="${value}" ;;
+    DP_VERSION)      DP_VERSION="${value}"; AIO_VERSION="${value}" ;;
+    AIO_VERSION)     AIO_VERSION="${value}"; DP_VERSION="${value}" ;;
+    SENSOR_VERSION)  SENSOR_VERSION="${value}" ;;
     ACPS_USERNAME)  ACPS_USERNAME="${value}" ;;
     ACPS_PASSWORD)  ACPS_PASSWORD="${value}" ;;
     ACPS_BASE_URL)  ACPS_BASE_URL="${value}" ;;
@@ -1225,7 +1255,7 @@ run_step() {
         else
           download_status="DRY-RUN"
         fi
-        verification_summary="DP download: ${download_status}"
+        verification_summary="AIO download: ${download_status}"
         ;;
       "09_aio_deploy")
         local aio_status="Unverified"
@@ -1601,7 +1631,7 @@ step01_prepare_link_scan() {
   if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
     log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
     for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
     done
   fi
 
@@ -1647,7 +1677,7 @@ step01_prepare_link_scan() {
 
     if [[ "${cleanup_mode}" == "A" ]]; then
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+      run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
       else
         log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
@@ -1656,11 +1686,11 @@ step01_prepare_link_scan() {
     fi
 
     if [[ "${link_state}" == "yes" ]]; then
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
       log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
     else
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+        run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
       else
         log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
@@ -1901,91 +1931,7 @@ step_01_hw_detect() {
   save_config_var "LV_LOCATION" "${LV_LOCATION}"
 
   ########################
-  # 3) Select data disks for LVM (AIO storage)
-  ########################
-  log "[STEP 01] Select data disks for LVM storage (AIO)"
-
-  # Initialize variables
-  local root_info="OS Disk: detection failed (needs check)"
-  local disk_list=()
-  local all_disks
-
-  # List all physical disks (exclude loop, ram; include only type disk)
-  all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
-
-  if [[ -z "${all_disks}" ]]; then
-    whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
-    return 1
-  fi
-
-  # Iterate over disks
-  while read -r d_name d_size d_model; do
-    # Check if any child of the disk is mounted at /
-    if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^/$"; then
-      # OS disk found -> omit from list; keep for notice
-      root_info="OS Disk: ${d_name} (${d_size}) ${d_model} -> Ubuntu Linux (excluded)"
-    else
-      # Data disk candidate -> add to checklist
-      local flag="OFF"
-      for selected in ${DATA_SSD_LIST:-}; do
-        if [[ "${selected}" == "${d_name}" ]]; then
-          flag="ON"
-          break
-        fi
-      done
-      disk_list+=("${d_name}" "${d_size}_${d_model}" "${flag}")
-    fi
-  done <<< "${all_disks}"
-
-  # If no data disk candidates
-  if [[ ${#disk_list[@]} -eq 0 ]]; then
-    whiptail_msgbox "Warning" "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
-    return 1
-  fi
-
-  # Build guidance message
-  local msg_guide="Select disks for LVM/ES data storage (AIO).\n(Space: toggle, Enter: confirm)\n\n"
-  msg_guide+="==================================================\n"
-  msg_guide+=" [System protection] ${root_info}\n"
-  msg_guide+="==================================================\n\n"
-  msg_guide+="Select data disks from the list below:"
-
-  # Calculate menu size dynamically for disk selection
-  local disk_count=$(( ${#disk_list[@]} / 3 ))
-  local menu_dims
-  menu_dims=$(calc_menu_size "${disk_count}" 90 8)
-  local menu_height menu_width menu_list_height
-  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-
-  # Center-align the menu message
-  local centered_msg
-  centered_msg=$(center_menu_message "${msg_guide}\n" "${menu_height}")
-
-  local selected_disks
-  selected_disks=$(whiptail --title "STEP 01 - Select data disks" \
-                             --checklist "${centered_msg}" \
-                             "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                             "${disk_list[@]}" \
-                             3>&1 1>&2 2>&3) || {
-    log "User canceled disk selection."
-    return 1
-  }
-
-  # whiptail output is like "sdb" "sdc" → remove quotes
-  selected_disks=$(echo "${selected_disks}" | tr -d '"')
-
-  if [[ -z "${selected_disks}" ]]; then
-    whiptail_msgbox "Warning" "No disks selected.\nCannot proceed with LVM configuration." 10 70
-    log "No data disk selected."
-    return 1
-  fi
-
-  log "Selected data disks: ${selected_disks}"
-  DATA_SSD_LIST="${selected_disks}"
-  save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
-
-  ########################
-  # 4) NIC Candidate Query and Selection
+  # 3) NIC Candidate Query and Selection
   ########################
   local nics nic_list nic name idx
 
@@ -2240,9 +2186,93 @@ step_01_hw_detect() {
   log "SPAN NIC list saved: ${SPAN_NIC_LIST}"
   log "SPAN attachment mode: ${SPAN_ATTACH_MODE}"
 
+  ########################
+  # 7) Select data disks for LVM (AIO storage)
+  ########################
+  log "[STEP 01] Select data disks for LVM storage (AIO)"
+
+  # Initialize variables
+  local root_info="OS Disk: detection failed (needs check)"
+  local disk_list=()
+  local all_disks
+
+  # List all physical disks (exclude loop, ram; include only type disk)
+  all_disks=$(lsblk -d -n -o NAME,SIZE,MODEL,TYPE | awk '$4=="disk" {print $1, $2, $3}')
+
+  if [[ -z "${all_disks}" ]]; then
+    whiptail_msgbox "STEP 01 - Disk detection failed" "No physical disks found.\nCheck lsblk output." 12 70
+    return 1
+  fi
+
+  # Iterate over disks
+  while read -r d_name d_size d_model; do
+    # Check if any child of the disk is mounted at /
+    if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^/$"; then
+      # OS disk found -> omit from list; keep for notice
+      root_info="OS Disk: ${d_name} (${d_size}) ${d_model} -> Ubuntu Linux (excluded)"
+    else
+      # Data disk candidate -> add to checklist
+      local flag="OFF"
+      for selected in ${DATA_SSD_LIST:-}; do
+        if [[ "${selected}" == "${d_name}" ]]; then
+          flag="ON"
+          break
+        fi
+      done
+      disk_list+=("${d_name}" "${d_size}_${d_model}" "${flag}")
+    fi
+  done <<< "${all_disks}"
+
+  # If no data disk candidates
+  if [[ ${#disk_list[@]} -eq 0 ]]; then
+    whiptail_msgbox "Warning" "No additional disks available for data.\n\nDetected OS disk:\n${root_info}" 12 70
+    return 1
+  fi
+
+  # Build guidance message
+  local msg_guide="Select disks for LVM/ES data storage (AIO).\n(Space: toggle, Enter: confirm)\n\n"
+  msg_guide+="==================================================\n"
+  msg_guide+=" [System protection] ${root_info}\n"
+  msg_guide+="==================================================\n\n"
+  msg_guide+="Select data disks from the list below:"
+
+  # Calculate menu size dynamically for disk selection
+  local disk_count=$(( ${#disk_list[@]} / 3 ))
+  local menu_dims
+  menu_dims=$(calc_menu_size "${disk_count}" 90 8)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+
+  # Center-align the menu message
+  local centered_msg
+  centered_msg=$(center_menu_message "${msg_guide}\n" "${menu_height}")
+
+  local selected_disks
+  selected_disks=$(whiptail --title "STEP 01 - Select data disks" \
+                             --checklist "${centered_msg}" \
+                             "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                             "${disk_list[@]}" \
+                             3>&1 1>&2 2>&3) || {
+    log "User canceled disk selection."
+    return 1
+  }
+
+  # whiptail output is like "sdb" "sdc" → remove quotes
+  selected_disks=$(echo "${selected_disks}" | tr -d '"')
+
+  if [[ -z "${selected_disks}" ]]; then
+    whiptail_msgbox "Warning" "No disks selected.\nCannot proceed with LVM configuration." 10 70
+    log "No data disk selected."
+    return 1
+  fi
+
+  log "Selected data disks: ${selected_disks}"
+  DATA_SSD_LIST="${selected_disks}"
+  save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
+
 
   ########################
-  # 7) Summary Display (Different messages per Network mode)
+  # 8) Summary Display (Different messages per Network mode)
   ########################
   local summary
   local pci_label="SPAN NIC PCIs (PF Passthrough)"
@@ -2939,6 +2969,7 @@ Network configuration:
 - NAT uplink NIC  : ${HOST_NIC} → mgt (${new_ip}/${netmask})
 - Gateway      : ${new_gw}
 - DNS          : ${new_dns}
+- AIO VM         : Connected to virbr0 NAT bridge (192.168.122.0/24)
 - Sensor VM      : Connected to virbr0 NAT bridge (192.168.122.0/24)${HOST_ACCESS_NIC:+
 - Host access NIC : ${HOST_ACCESS_NIC} → hostmgmt (192.168.0.100/24, no gateway)}
 - SPAN NICs   : ${SPAN_NIC_LIST:-None} (PCI passthrough specific)${span_summary_nat}
@@ -3675,8 +3706,222 @@ step_06_libvirt_hooks() {
   
   # Execute NAT mode only
     log "[STEP 06] NAT Mode - Installing OpenXDR NAT hooks"
-    step_06_nat_hooks
-    return $?
+    step_06_nat_hooks || return $?
+
+  step_06_ntpsec_only
+  return $?
+}
+
+step_06_ntpsec_only() {
+  load_config
+
+  log "[STEP 06] Configure NTPsec"
+  
+  local tmp_info="/tmp/xdr_step06_ntpsec_info.txt"
+  : > "${tmp_info}"
+
+  #######################################
+  # 0) Summarize current time / NTP state
+  #######################################
+  {
+    echo "Current time / NTP status"
+    echo "--------------------------------"
+    echo
+    echo "# timedatectl"
+    timedatectl 2>/dev/null || echo "timedatectl failed"
+    echo
+    echo "# ntpsec package status (dpkg -l ntpsec)"
+    dpkg -l ntpsec 2>/dev/null || echo "No ntpsec package info"
+    echo
+    echo "# ntpsec service state (systemctl is-active ntpsec)"
+    local ntpsec_check
+    ntpsec_check=$(systemctl is-active ntpsec 2>/dev/null)
+    if [[ -z "${ntpsec_check}" ]] || [[ "${ntpsec_check}" != "active" ]]; then
+      echo "inactive"
+    else
+      echo "${ntpsec_check}"
+    fi
+    echo
+    echo "# ntpq -p (if available)"
+    ntpq -p 2>/dev/null || echo "ntpq -p failed or ntpsec not installed"
+  } >> "${tmp_info}"
+
+  show_textbox "STEP 06 - NTP status" "${tmp_info}"
+
+  # Temporarily disable set -e to handle cancel gracefully
+  set +e
+  whiptail_yesno "STEP 06 - confirmation" "Install and configure NTPsec on the host.\n\nProceed?"
+  local confirm_rc=$?
+  set -e
+  
+  if [[ ${confirm_rc} -ne 0 ]]; then
+    log "User canceled STEP 06."
+    return 2  # Return 2 to indicate cancellation
+  fi
+
+  #######################################
+  # 1) Install NTPsec
+  #######################################
+  log "[STEP 06] Installing NTPsec package"
+
+  run_cmd "sudo apt-get update"
+  run_cmd "sudo apt-get install -y ntpsec"
+
+  #######################################
+  # 2) Back up /etc/ntpsec/ntp.conf
+  #######################################
+  local NTP_CONF="/etc/ntpsec/ntp.conf"
+  local NTP_CONF_BACKUP="/etc/ntpsec/ntp.conf.orig.$(date +%Y%m%d-%H%M%S)"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      sudo cp -a "${NTP_CONF}" "${NTP_CONF_BACKUP}"
+      log "Backed up existing ${NTP_CONF} to ${NTP_CONF_BACKUP}."
+    else
+      log "[DRY-RUN] Would back up ${NTP_CONF} to ${NTP_CONF_BACKUP}"
+    fi
+  else
+    log "[STEP 06] ${NTP_CONF} not found (check ntpsec install state)"
+  fi
+
+  #######################################
+  # 3) Comment default Ubuntu NTP pool/server entries
+  #######################################
+  log "[STEP 06] Commenting default Ubuntu NTP pool/server entries"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would comment pool/server entries in ${NTP_CONF} (0~3 ubuntu pool, ntp.ubuntu.com)"
+    else
+      sudo sed -i 's/^pool 0.ubuntu.pool.ntp.org iburst/#pool 0.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 1.ubuntu.pool.ntp.org iburst/#pool 1.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 2.ubuntu.pool.ntp.org iburst/#pool 2.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^pool 3.ubuntu.pool.ntp.org iburst/#pool 3.ubuntu.pool.ntp.org iburst/' "${NTP_CONF}"
+      sudo sed -i 's/^server ntp.ubuntu.com iburst/#server ntp.ubuntu.com iburst/' "${NTP_CONF}"
+    fi
+  fi
+
+  #######################################
+  # 4) Comment restrict default kod ... line
+  #######################################
+  log "[STEP 06] Commenting out restrict default kod ... rule"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would comment 'restrict default kod nomodify nopeer noquery limited' in ${NTP_CONF}"
+    else
+      sudo sed -i 's/^restrict default kod nomodify nopeer noquery limited/#restrict default kod nomodify nopeer noquery limited/' "${NTP_CONF}"
+    fi
+  fi
+
+  #######################################
+  # 5) Add Google NTP + us.pool servers, tinker panic 0, restrict default
+  #######################################
+  log "[STEP 06] Add Google NTP servers plus tinker panic 0, restrict default"
+
+  local TAG_BEGIN="# XDR_NTPSEC_CONFIG_BEGIN"
+  local TAG_END="# XDR_NTPSEC_CONFIG_END"
+
+  if [[ -f "${NTP_CONF}" ]]; then
+    if grep -q "${TAG_BEGIN}" "${NTP_CONF}" 2>/dev/null; then
+      log "[STEP 06] XDR_NTPSEC_CONFIG block already present in ${NTP_CONF} → skip add"
+    else
+      local ntp_block
+      ntp_block=$(cat <<EOF
+
+${TAG_BEGIN}
+# Alternate NTP servers (per docs)
+server time1.google.com prefer
+server time2.google.com
+server time3.google.com
+server time4.google.com
+server 0.us.pool.ntp.org
+server 1.us.pool.ntp.org
+
+# Allow large time offsets to be corrected
+tinker panic 0
+
+# Update restrict rule
+restrict default nomodify nopeer noquery notrap
+${TAG_END}
+EOF
+)
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] Would append block to ${NTP_CONF}:\n${ntp_block}"
+      else
+        printf "%s\n" "${ntp_block}" | sudo tee -a "${NTP_CONF}" >/dev/null
+        log "Added XDR_NTPSEC_CONFIG block to ${NTP_CONF}"
+      fi
+    fi
+  else
+    log "[STEP 06] ${NTP_CONF} missing; cannot append NTP server settings."
+  fi
+
+  #######################################
+  # 6) Restart and verify NTPsec
+  #######################################
+  log "[STEP 06] Restart NTPsec and check status"
+
+  run_cmd "sudo systemctl restart ntpsec"
+  run_cmd "systemctl status ntpsec --no-pager || true"
+  run_cmd "ntpq -p || true"
+
+  #######################################
+  # 7) Final summary
+  #######################################
+  : > "${tmp_info}"
+  {
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 06: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes were made"
+      echo
+      echo "ℹ️  In real execution mode, the following would be performed:"
+      echo "   • NTPsec package installation and configuration"
+      echo "   • NTPsec service restart and status check"
+    else
+      echo "✅ STEP 06 Execution Status: SUCCESS"
+      echo
+      echo "📋 ACTIONS COMPLETED:"
+      echo "   • NTPsec package installation and configuration"
+      echo "   • NTPsec service restarted and verified"
+      echo
+      echo "📊 NTPsec CONFIGURATION STATUS:"
+      echo "1️⃣  NTPsec Configuration File:"
+      if [[ -f "${NTP_CONF}" ]]; then
+        echo "     ✅ ${NTP_CONF} updated"
+      else
+        echo "     ⚠️  ${NTP_CONF} not found"
+        echo "     (NTPsec may not be installed)"
+      fi
+      echo
+      echo "2️⃣  NTPsec Service Status:"
+      local ntpsec_status
+      ntpsec_status=$(systemctl is-active ntpsec 2>/dev/null || echo "")
+      if [[ -z "${ntpsec_status}" ]] || [[ "${ntpsec_status}" != "active" ]]; then
+        echo "  ⚠️  ntpsec service is inactive"
+      else
+        echo "  ✅ ntpsec service is active"
+      fi
+      echo
+      echo "3️⃣  NTP Synchronization Status:"
+      if command -v ntpq >/dev/null 2>&1; then
+        echo "  (ntpq -p output below)"
+        ntpq -p 2>/dev/null || echo "  (NTPsec may not be running or not yet synchronized)"
+      else
+        echo "  (ntpq command not found)"
+      fi
+      echo
+      echo "💡 IMPORTANT NOTES:"
+      echo "  • NTPsec synchronization may take a few minutes"
+      echo "  • Check /etc/ntpsec/ntp.conf for server settings"
+      echo "  • If NTPsec is not synchronized, check network connectivity"
+    fi
+  } >> "${tmp_info}"
+
+  show_textbox "STEP 06 - NTPsec summary" "${tmp_info}"
 }
 
 #######################################
@@ -4516,7 +4761,7 @@ step_07_lvm_storage() {
     echo "  • Ensure all volumes are properly mounted before proceeding"
     echo
     echo "📝 NEXT STEPS:"
-    echo "  • Proceed to STEP 08 (DP Download)"
+    echo "  • Proceed to STEP 08 (AIO Download)"
   } > "${tmp_df}" 2>&1
 
   #######################################
@@ -4532,11 +4777,11 @@ step_07_lvm_storage() {
 
 step_08_dp_download() {
   local STEP_ID="08_dp_download"
-  local STEP_NAME="08. DP Download (AIO)"
+  local STEP_NAME="08. AIO Download"
   
   echo
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
-  log "[STEP 08] Download DP deploy script and image (virt_deploy_uvp_centos.sh + qcow2)"
+  log "[STEP 08] Download AIO deploy script and image (virt_deploy_uvp_centos.sh + qcow2)"
   log "[STEP 08] This step will download AIO deployment script and qcow2 image from ACPS."
   load_config
   local tmp_info="/tmp/xdr_step08_info.txt"
@@ -4544,12 +4789,12 @@ step_08_dp_download() {
   #######################################
   # 0) Check configuration values
   #######################################
-  local ver="${DP_VERSION:-6.2.0}"  # Default to 6.2.0 if not set
+  local ver="${AIO_VERSION:-6.2.0}"  # Default to 6.2.0 if not set
   local acps_user="${ACPS_USERNAME:-}"
   local acps_pass="${ACPS_PASSWORD:-}"
   local acps_url="${ACPS_BASE_URL:-https://acps.stellarcyber.ai}"
 
-  # Check required values (DP_VERSION now has default, so only check ACPS credentials)
+  # Check required values (AIO_VERSION now has default, so only check ACPS credentials)
   local missing=""
   [[ -z "${acps_user}" ]] && missing+="\n - ACPS_USERNAME"
   [[ -z "${acps_pass}" ]] && missing+="\n - ACPS_PASSWORD"
@@ -4589,7 +4834,7 @@ step_08_dp_download() {
   local url_sha1="${acps_url}/release/${ver}/dataprocessor/${sha1}"
 
   log "[STEP 08] Configuration summary:"
-  log "  - DP_VERSION   = ${ver}"
+  log "  - AIO_VERSION  = ${ver}"
   log "  - ACPS_USERNAME= ${acps_user}"
   log "  - ACPS_BASE_URL= ${acps_url}"
   log "  - download path= ${aio_img_dir}"
@@ -4876,7 +5121,7 @@ step_08_dp_download() {
   # 7) Summary
   #######################################
   {
-    echo "STEP 08 - DP Download Summary"
+    echo "STEP 08 - AIO Download Summary"
     echo "═══════════════════════════════════════════════════════════"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       echo "🔍 DRY-RUN MODE: No actual downloads were made"
@@ -4933,9 +5178,9 @@ step_08_dp_download() {
     fi
   } > "${tmp_info}"
 
-  show_textbox "STEP 08 - DP Download Summary" "${tmp_info}"
+  show_textbox "STEP 08 - AIO Download Summary" "${tmp_info}"
 
-  log "[STEP 08] DP download completed"
+  log "[STEP 08] AIO download completed"
   
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
   log "[STEP 08] AIO deployment script and image download completed successfully."
@@ -4973,8 +5218,8 @@ step_09_aio_deploy() {
     local AIO_GW="${AIO_GW:-192.168.122.1}"
     local AIO_DNS="${AIO_DNS:-8.8.8.8}"
 
-    # DP_VERSION is managed in config (default to 6.2.0 if not set)
-    local _DP_VERSION="${DP_VERSION:-6.2.0}"
+    # AIO_VERSION is managed in config (default to 6.2.0 if not set)
+    local _AIO_VERSION="${AIO_VERSION:-6.2.0}"
 
     # AIO image directory (same as STEP 08)
     local AIO_IMAGE_DIR="${AIO_INSTALL_DIR}/images"
@@ -5028,7 +5273,7 @@ step_09_aio_deploy() {
     fi
 
     # Check AIO image presence → if missing set nodownload=false
-    local QCOW2_PATH="${AIO_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
+    local QCOW2_PATH="${AIO_IMAGE_DIR}/aella-dataprocessor-${_AIO_VERSION}.qcow2"
     local AIO_NODOWNLOAD="true"
 
     if [ ! -f "${QCOW2_PATH}" ]; then
@@ -5229,7 +5474,7 @@ step_09_aio_deploy() {
     CMD="sudo bash '${DP_SCRIPT_PATH}' -- \
 --hostname=${AIO_HOSTNAME} \
 --cluster-size=${AIO_CLUSTERSIZE} \
---release=${_DP_VERSION} \
+--release=${_AIO_VERSION} \
 --local-ip=${AIO_IP} \
 --node-role=AIO \
 --bridge=${AIO_BRIDGE} \
@@ -5250,7 +5495,7 @@ step_09_aio_deploy() {
 
   Hostname      : ${AIO_HOSTNAME}
   Cluster size  : ${AIO_CLUSTERSIZE}
-  DP version    : ${_DP_VERSION}
+  AIO version   : ${_AIO_VERSION}
   Bridge        : ${AIO_BRIDGE}
   vCPU          : ${AIO_VCPUS}
   Memory        : ${AIO_MEMORY_GB} GB (${AIO_MEMORY_MB} MB)
@@ -7855,7 +8100,7 @@ menu_config() {
     local msg
     msg="Current Configuration\n\n"
     msg+="DRY_RUN        : ${DRY_RUN}\n"
-    msg+="DP_VERSION     : ${DP_VERSION:-<Not Set>}\n"
+    msg+="AIO_VERSION    : ${AIO_VERSION:-<Not Set>}\n"
     msg+="SENSOR_VERSION : ${SENSOR_VERSION:-<Not Set>}\n"
     msg+="ACPS_USER      : ${ACPS_USERNAME:-<Not Set>}\n"
     msg+="ACPS_PASSWORD  : ${acps_password_display}\n"
@@ -7880,7 +8125,7 @@ menu_config() {
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
                       "1" "Toggle DRY_RUN (0/1)" \
-                      "2" "Set DP_VERSION" \
+                      "2" "Set AIO Version" \
                       "3" "Set Sensor Version" \
                       "4" "Set ACPS Account/Password" \
                       "5" "Set ACPS URL" \
@@ -7942,18 +8187,18 @@ menu_config() {
         save_config_var "DRY_RUN" "${DRY_RUN}"
         ;;
       "2")
-        local new_dp_version
+        local new_aio_version
         # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_dp_version=$(whiptail_inputbox "DP Version Configuration" "Enter DP version (e.g., 6.2.0):" "${DP_VERSION:-}")
+        new_aio_version=$(whiptail_inputbox "AIO Version Configuration" "Enter AIO version (e.g., 6.2.0):" "${AIO_VERSION:-}")
         local ver_rc=$?
         set -e
-        if [[ ${ver_rc} -ne 0 ]] || [[ -z "${new_dp_version}" ]]; then
+        if [[ ${ver_rc} -ne 0 ]] || [[ -z "${new_aio_version}" ]]; then
           continue
         fi
-        if [[ -n "${new_dp_version}" ]]; then
-          save_config_var "DP_VERSION" "${new_dp_version}"
-          whiptail_msgbox "DP_VERSION Configuration" "DP_VERSION has been set to ${new_dp_version}." 8 60
+        if [[ -n "${new_aio_version}" ]]; then
+          save_config_var "AIO_VERSION" "${new_aio_version}"
+          whiptail_msgbox "AIO Version Configuration" "AIO_VERSION has been set to ${new_aio_version}." 8 60
         fi
         ;;
       "3")
@@ -8855,6 +9100,7 @@ show_usage_help() {
 │ 3. Configuration                                             │
 │    → Configure installation parameters:                      │
 │      • DRY_RUN: Simulation mode (default: 1)                 │
+│      • AIO_VERSION: AIO version to install                   │
 │      • SENSOR_VERSION: Sensor version to install             │
 │      • Network mode: NAT only (bridge mode not supported)      │
 │      • SPAN_ATTACH_MODE: pci only (bridge mode not supported) │
@@ -8891,7 +9137,7 @@ show_usage_help() {
 Step-by-Step Process:
 ────────────────────────────────────────────────────────────
 1. Initial Setup:
-   • Configure menu 3: Set DRY_RUN=0, SENSOR_VERSION, network mode,
+  • Configure menu 3: Set DRY_RUN=0, AIO_VERSION, SENSOR_VERSION, network mode,
      SPAN attachment mode, ACPS credentials
    • Select menu 1 to start automatic installation
 
@@ -8917,7 +9163,7 @@ Step-by-Step Process:
 6. Final Steps:
    STEP 06 → Libvirt hooks installation
    STEP 07 → LVM Storage Configuration (AIO)
-   STEP 08 → DP Download (AIO)
+   STEP 08 → AIO Download
    STEP 09 → AIO VM Deployment
    STEP 10 → Sensor LV Creation + Image/Script Download
    STEP 11 → Sensor VM (mds) Deployment
@@ -8968,7 +9214,7 @@ Common Use Cases:
   → VM resources (vCPU, memory) are automatically calculated
 
 • Update AIO Image:
-  → Menu 2 → STEP 08 (DP Download for AIO)
+  → Menu 2 → STEP 08 (AIO Download)
   → New image will be downloaded and deployed
 
 • Update Sensor Image:

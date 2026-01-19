@@ -448,6 +448,23 @@ run_cmd() {
   fi
 }
 
+run_cmd_linkscan() {
+  local cmd="$*"
+
+  if [[ "${DRY_RUN}" -eq 1 && "${STEP01_LINK_SCAN_REAL:-1}" -ne 1 ]]; then
+    log "[DRY-RUN] ${cmd}"
+    return 0
+  fi
+
+  log "[RUN-LINKSCAN] ${cmd}"
+  eval "${cmd}" 2>&1 | tee -a "${LOG_FILE}"
+  local exit_code="${PIPESTATUS[0]}"
+  if [[ "${exit_code}" -ne 0 ]]; then
+    log "[ERROR] Link-scan command failed (exit code: ${exit_code}): ${cmd}"
+  fi
+  return "${exit_code}"
+}
+
 append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
@@ -530,6 +547,7 @@ load_config() {
 
   # Default values (set only if not already set)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
+  : "${STEP01_LINK_SCAN_REAL:=1}"
   : "${SENSOR_VERSION:=6.2.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
@@ -1122,7 +1140,7 @@ step01_prepare_link_scan() {
   if [[ ${#STEP01_TEMP_UP_NICS[@]} -gt 0 ]]; then
     log "[STEP 01] Executing temp admin-up: ${STEP01_TEMP_UP_NICS[*]}"
     for nic in "${STEP01_TEMP_UP_NICS[@]}"; do
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
     done
   fi
 
@@ -1168,7 +1186,7 @@ step01_prepare_link_scan() {
 
     if [[ "${cleanup_mode}" == "A" ]]; then
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+        run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(A): ${nic} -> DOWN (restore)"
       else
         log "[STEP 01] Cleanup(A): ${nic} -> keep ${orig_state}"
@@ -1177,11 +1195,11 @@ step01_prepare_link_scan() {
     fi
 
     if [[ "${link_state}" == "yes" ]]; then
-      run_cmd "sudo ip link set ${nic} up" || true
+      run_cmd_linkscan "sudo ip link set ${nic} up" || true
       log "[STEP 01] Cleanup(B): ${nic} -> keep UP (link yes)"
     else
       if [[ "${orig_state}" == "DOWN" ]]; then
-        run_cmd "sudo ip link set ${nic} down" || true
+        run_cmd_linkscan "sudo ip link set ${nic} down" || true
         log "[STEP 01] Cleanup(B): ${nic} -> restore DOWN (link ${link_state})"
       else
         log "[STEP 01] Cleanup(B): ${nic} -> keep ${orig_state} (link ${link_state})"
@@ -2506,14 +2524,7 @@ EOF
       verify_failed=1
       verify_errors="${verify_errors}\n- udev rules missing"
     fi
-    if [[ ! -f "${udev_file}" ]] || \
-       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${hostmgmt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${nat_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${hostmgmt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
-      verify_failed=1
-      verify_errors="${verify_errors}\n- udev rules do not include mgt/hostmgmt mappings"
-    fi
+    # NAT mode udev mapping verification is handled in STEP 03 NAT mode
     if [[ ! -f "${iface_file}" ]] || \
        ! grep -qE '^[[:space:]]*source[[:space:]]+/etc/network/interfaces\.d/\*' "${iface_file}" 2>/dev/null; then
       verify_failed=1

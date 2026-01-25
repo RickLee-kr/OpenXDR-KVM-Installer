@@ -469,14 +469,17 @@ append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
 
-  if grep -qE"[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
-    log "fstab: ${mount_point} entry already exists. (Skipping addition)"
-    return 0
-  fi
-
   if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      log "[DRY-RUN] remove existing /etc/fstab entries for: ${mount_point}"
+    fi
     log "[DRY-RUN] Adding the following line to /etc/fstab: ${line}"
   else
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      local esc_mount_point="${mount_point//\//\\/}"
+      sed -i "/[[:space:]]${esc_mount_point}[[:space:]]/d" /etc/fstab
+      log "Removed existing /etc/fstab entries for: ${mount_point}"
+    fi
     echo "${line}" >> /etc/fstab
     log "Added entry to /etc/fstab: ${line}"
   fi
@@ -4321,9 +4324,9 @@ if [ "${1}" = "mds" ]; then
   HOST_SSH_PORT=2222
   GUEST_SSH_PORT=22
   # Sensor ports (based on OpenXDR datasensor)
-  TCP_PORTS=(514 2055 5044 5123 5100:5200 5500:5800 5900)
+  TCP_PORTS=(514 2055 5000:6000)
   VXLAN_PORTS=(4789 8472)
-  UDP_PORTS=(514 2055 5044 5100:5200 5500:5800 5900)
+  UDP_PORTS=(514 2055 5000:6000)
   BRIDGE='virbr0'
   MGT_INTF='mgt'
 
@@ -4443,6 +4446,21 @@ EOF
 step_07_sensor_download() {
   log "[STEP 07] Sensor LV Creation + Image/script Download"
   load_config
+
+  local SENSOR_VM="mds"
+  local SENSOR_INSTALL_DIR="/var/lib/libvirt/images/mds"
+  local SENSOR_IMAGE_DIR="${SENSOR_INSTALL_DIR}/images"
+  local SENSOR_VM_DIR="${SENSOR_IMAGE_DIR}/${SENSOR_VM}"
+
+  # If an existing Sensor VM is present, stop and remove it before LVM configuration
+  if virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
+    log "[STEP 07] Existing VM detected (${SENSOR_VM}). Destroying and undefining before LVM configuration."
+    run_cmd "virsh destroy ${SENSOR_VM} || true"
+    run_cmd "virsh undefine ${SENSOR_VM} --remove-all-storage || virsh undefine ${SENSOR_VM} || true"
+    if [[ -d "${SENSOR_VM_DIR}" ]]; then
+      run_cmd "sudo rm -rf ${SENSOR_VM_DIR}"
+    fi
+  fi
 
   # User Configuration  (OpenXDR Method: ubuntu-vg use)
   : "${LV_LOCATION:=ubuntu-vg}"

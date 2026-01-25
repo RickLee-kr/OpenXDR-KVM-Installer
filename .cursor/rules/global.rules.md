@@ -139,3 +139,36 @@ Allowed `type` values:
 Example:
 - `fix(sensor): return to main menu on auto-execute cancel`
 
+## X. UI Layout and Sizing Policy (Allowed UX Adjustment)
+
+### X.1 Fixed-Size UI Limitation Rule
+- Hard-coded UI size limits (e.g., fixed height or width values)
+  are allowed only when strictly required by terminal or tool limitations.
+- When a UI element unnecessarily restricts usability due to fixed sizing,
+  it is permitted to replace fixed dimensions with terminal-size-based
+  dynamic sizing.
+
+### X.2 Allowed Scope of Change
+The following changes are explicitly allowed and do NOT require
+contract revision, as long as behavior and messaging remain identical:
+- Replacing fixed width/height values with values derived from terminal size
+- Allowing UI components (e.g., textbox, message box) to expand within
+  available terminal dimensions
+- Improving readability without altering:
+  - UI text content
+  - Message tone
+  - Log output
+  - Control flow or user decisions
+
+### X.3 Non-Regression Requirement
+- UI layout changes must not:
+  - Change existing UI text
+  - Change menu options or ordering
+  - Introduce new prompts
+  - Alter Cancel / ESC semantics
+- The only permitted effect is improved visibility or readability.
+
+### X.4 Documentation Rule
+- Such UI sizing changes must be documented in commit messages or patch notes
+  as **layout or usability improvements**, not behavior changes.
+

@@ -446,14 +446,17 @@ append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
 
-  if grep -qE"[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
-    log "fstab: ${mount_point} entry already exists. (skip add)"
-    return 0
-  fi
-
   if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      log "[DRY-RUN] remove existing /etc/fstab entries for: ${mount_point}"
+    fi
     log "[DRY-RUN] add the following line to /etc/fstab: ${line}"
   else
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      local esc_mount_point="${mount_point//\//\\/}"
+      sed -i "/[[:space:]]${esc_mount_point}[[:space:]]/d" /etc/fstab
+      log "Removed existing /etc/fstab entries for: ${mount_point}"
+    fi
     echo "${line}" >> /etc/fstab
     log "Added entry to /etc/fstab: ${line}"
   fi
@@ -2093,7 +2096,7 @@ step_01_hw_detect() {
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message based on terminal height
-  local msg_content="Choose the management (mgt) NIC.\nCurrent: ${mgt_display:-<none>}\n"
+  local msg_content="Choose the management (mgt) NIC.\nThis is the external uplink for VM management traffic (NAT/bridge side).\nDo NOT select the hostmgmt NIC here.\nCurrent: ${mgt_display:-<none>}\n"
   local centered_msg
   centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
   
@@ -2126,7 +2129,7 @@ step_01_hw_detect() {
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message
-  local msg_content="Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_NIC:-<none>}\n"
+  local msg_content="Select NIC for direct access (hostmgmt) to the KVM host only.\nThis is NOT the mgt NIC. It is used for host access (no VM NAT).\nIt will be configured as 192.168.0.100/24 without gateway.\n\nCurrent setting: ${HOST_NIC:-<none>}\n"
   local centered_msg
   centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
   
@@ -4699,6 +4702,20 @@ step_07_lvm_storage() {
     run_cmd "sudo parted -s /dev/${d} mkpart primary ext4 1MiB 100%"
   done
 
+  # Ensure kernel/udev sees new partitions before pvcreate
+  for d in ${DATA_SSD_LIST}; do
+    run_cmd "sudo partprobe /dev/${d} || true"
+  done
+  run_cmd "sudo udevadm settle || true"
+
+  # Wait for partition device nodes (e.g., /dev/sdb1) to appear
+  for d in ${DATA_SSD_LIST}; do
+    for _ in {1..10}; do
+      [[ -b "/dev/${d}1" ]] && break
+      sleep 0.3
+    done
+  done
+
   #######################################
   # 2) Create PV / VG / LV (for ES data)
   #######################################
@@ -5071,6 +5088,8 @@ if [ "${1}" = "dl-master" ]; then
       /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
       #/sbin/iptables -t nat -D PREROUTING -p tcp ! -s 192.168.122.0/23 --dport $UI_PORT -j DNAT --to $GUEST_IP:PORT
     done
+    # Remove additional DNAT for DL Web UI via hostmgmt
+    /sbin/iptables -t nat -D PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443 2>/dev/null || true
   fi
 
   if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
@@ -5084,6 +5103,10 @@ if [ "${1}" = "dl-master" ]; then
       /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
       #/sbin/iptables -t nat -I PREROUTING -p tcp ! -s 192.168.122.0/23 --dport $UI_PORT -j DNAT --to $GUEST_IP:PORT
     done
+    # Additional DNAT for DL Web UI via hostmgmt (HTTPS only)
+    if ! /sbin/iptables -t nat -C PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443 2>/dev/null; then
+      /sbin/iptables -t nat -I PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443
+    fi
     # save last known good pid
     /usr/bin/last_known_good_pid ${1} > /dev/null 2>&1 &
   fi
@@ -5139,9 +5162,9 @@ if [ "${1}" = "datasensor" ]; then
   GUEST_IP=192.168.122.4
   HOST_SSH_PORT=2224
   GUEST_SSH_PORT=22
-  TCP_PORTS=(514 2055 5044 5123 5100:5200 5500:5800 5900)
+  TCP_PORTS=(514 2055 5000:6000)
   VXLAN_PORTS=(4789 8472)
-  UDP_PORTS=(514 2055 5044 5100:5200 5500:5800 5900)
+  UDP_PORTS=(514 2055 5000:6000)
   BRIDGE='virbr0'
   MGT_INTF='mgt'
 
@@ -5254,19 +5277,27 @@ EOF
     local check_vm_state_content
     check_vm_state_content=$(cat <<'EOF'
 #!/bin/bash
-VM_LIST=(dl-master da-master)
 RUN_DIR=/var/run/libvirt/qemu
 
-for VM in ${VM_LIST[@]}; do
-    # Detect if VM is down (.xml and .pid absent)
-    if [ ! -e ${RUN_DIR}/${VM}.xml -a ! -e ${RUN_DIR}/${VM}.pid ]; then
-        if [ -e ${RUN_DIR}/${VM}.lkg ]; then
-            LKG_PID=$(cat ${RUN_DIR}/${VM}.lkg)
+# Match any DL/DA VM (master or workerN) based on name
+VM_NAME_REGEX='^(dl|da)-(master|worker[0-9]+)$'
 
-            # Check dmesg to see if OOM-killer killed that PID
-            if dmesg | grep "Out of memory: Kill process $LKG_PID" > /dev/null 2>&1; then
-                virsh start $VM
-            fi
+for lkg in "${RUN_DIR}"/*.lkg; do
+    [ -e "${lkg}" ] || continue
+    VM="$(basename "${lkg}" .lkg)"
+
+    # Only handle DL/DA masters and workers
+    if ! [[ "${VM}" =~ ${VM_NAME_REGEX} ]]; then
+        continue
+    fi
+
+    # Detect if VM is down (.xml and .pid absent)
+    if [ ! -e "${RUN_DIR}/${VM}.xml" ] && [ ! -e "${RUN_DIR}/${VM}.pid" ]; then
+        LKG_PID="$(cat "${RUN_DIR}/${VM}.lkg")"
+
+        # Check dmesg to see if OOM-killer killed that PID
+        if dmesg | grep "Out of memory: Kill process $LKG_PID" > /dev/null 2>&1; then
+            virsh start "${VM}"
         fi
     fi
 done
@@ -12792,7 +12823,7 @@ show_usage_help() {
 
   local msg
   msg=$'═══════════════════════════════════════════════════════════════
-        ⭐ Stellar Cyber Open XDR Platform – KVM Installer Usage Guide ⭐
+        ⭐ Stellar Cyber Open XDR Platform – KVM DP Installer Usage Guide ⭐
 ═══════════════════════════════════════════════════════════════
 
 

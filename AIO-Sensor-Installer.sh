@@ -338,27 +338,14 @@ show_textbox() {
     WIDTH=100
   fi
 
-  # Set default values
   [ -z "${HEIGHT}" ] && HEIGHT=25
   [ -z "${WIDTH}" ] && WIDTH=100
-  
-  # Ensure minimum size and limit maximum size
-  [ "${HEIGHT}" -lt 20 ] && HEIGHT=20
-  [ "${HEIGHT}" -gt 50 ] && HEIGHT=50
-  [ "${WIDTH}" -lt 80 ] && WIDTH=80
-  [ "${WIDTH}" -gt 120 ] && WIDTH=120
-
-  # Ensure sufficient margin for scrolling in whiptail
-  local box_height=$((HEIGHT-6))
-  local box_width=$((WIDTH-6))
-  
-  # Ensure minimum display size
-  [ "${box_height}" -lt 15 ] && box_height=15
-  [ "${box_width}" -lt 70 ] && box_width=70
+  [ "${HEIGHT}" -lt 15 ] && HEIGHT=15
+  [ "${WIDTH}" -lt 60 ] && WIDTH=60
 
   if ! whiptail --title "${title}" \
                 --scrolltext \
-                --textbox "${file}" "${box_height}" "${box_width}"; then
+                --textbox "${file}" $((HEIGHT-4)) $((WIDTH-4)); then
     # Ignore cancel (ESC) and just return
     :
   fi
@@ -475,14 +462,17 @@ append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
 
-  if grep -qE"[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
-    log "fstab: ${mount_point} Entry already exists. (Addition skipped)"
-    return 0
-  fi
-
   if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      log "[DRY-RUN] remove existing /etc/fstab entries for: ${mount_point}"
+    fi
     log "[DRY-RUN] /etc/fstab Add the following line to: ${line}"
   else
+    if grep -qE "[[:space:]]${mount_point}[[:space:]]" /etc/fstab 2>/dev/null; then
+      local esc_mount_point="${mount_point//\//\\/}"
+      sed -i "/[[:space:]]${esc_mount_point}[[:space:]]/d" /etc/fstab
+      log "Removed existing /etc/fstab entries for: ${mount_point}"
+    fi
     echo "${line}" >> /etc/fstab
     log "/etc/fstab Add entry to: ${line}"
   fi
@@ -529,6 +519,7 @@ restart_vm_safely() {
 
   # 4. VM start
   log "   -> '${vm_name}' is restarting..."
+  log "   -> '${vm_name}' startup may take a while. Please wait..."
   virsh start "${vm_name}"
   
   if [ $? -eq 0 ]; then
@@ -1993,7 +1984,7 @@ step_01_hw_detect() {
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
     
     # Center-align menu message
-    menu_msg=$(center_menu_message "Select NAT network uplink NIC.\nThis NIC will be renamed to 'mgt' and used for external connections.\nSensor VM will be connected to virbr0 NAT bridge.\nCurrent setting: ${HOST_NIC:-<None>}" "${menu_height}")
+    menu_msg=$(center_menu_message "Select NAT network uplink NIC.\nThis NIC will be renamed to 'mgt' and used for external connections.\nDo NOT select the hostmgmt NIC here.\nSensor VM will be connected to virbr0 NAT bridge.\nCurrent setting: ${HOST_NIC:-<None>}" "${menu_height}")
     
     nat_nic=$(whiptail --title "STEP 01 - NAT uplink NIC Selection (NAT Mode)" \
                       --menu "${menu_msg}" \
@@ -2044,7 +2035,7 @@ step_01_hw_detect() {
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
     
     # Center-align menu message
-    local msg_content="Select NIC for direct access (management) to KVM host.\n(This NIC will be automatically configured with 192.168.0.100/24 without gateway.)\n\nCurrent setting: ${HOST_ACCESS_NIC:-<none>}\n"
+    local msg_content="Select NIC for direct access (hostmgmt) to the KVM host only.\nThis is NOT the mgt NIC. It is used for host access (no VM NAT).\nIt will be configured as 192.168.0.100/24 without gateway.\n\nCurrent setting: ${HOST_ACCESS_NIC:-<none>}\n"
     local centered_msg
     centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
     
@@ -2206,8 +2197,9 @@ step_01_hw_detect() {
 
   # Iterate over disks
   while read -r d_name d_size d_model; do
-    # Check if any child of the disk is mounted at /
-    if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^/$"; then
+    # Check if any child of the disk is mounted at /, /boot, or /boot/efi
+    # Using lsblk -r (raw) to inspect all children mountpoints
+    if lsblk "/dev/${d_name}" -r -o MOUNTPOINT | grep -qE "^(/|/boot|/boot/efi)$"; then
       # OS disk found -> omit from list; keep for notice
       root_info="OS Disk: ${d_name} (${d_size}) ${d_model} -> Ubuntu Linux (excluded)"
     else
@@ -4106,6 +4098,8 @@ if [ "${1}" = "aio" ]; then
     for PORT in ${UI_PORTS[@]}; do
       /sbin/iptables -t nat -D PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
     done
+    # Remove additional DNAT for AIO Web UI via hostmgmt
+    /sbin/iptables -t nat -D PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443 2>/dev/null || true
   fi
 
   if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
@@ -4120,6 +4114,10 @@ if [ "${1}" = "aio" ]; then
     for PORT in ${UI_PORTS[@]}; do
       /sbin/iptables -t nat -I PREROUTING -i $MGT_INTF -p tcp -m set ! --match-set $IPSET_UI src --dport $PORT -j DNAT --to $GUEST_IP:$PORT
     done
+    # Additional DNAT for AIO Web UI via hostmgmt (HTTPS only)
+    if ! /sbin/iptables -t nat -C PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443 2>/dev/null; then
+      /sbin/iptables -t nat -I PREROUTING -i hostmgmt -p tcp --dport 443 -j DNAT --to $GUEST_IP:443
+    fi
     # save last known good pid
     /usr/bin/last_known_good_pid ${1} > /dev/null 2>&1 &
   fi
@@ -4132,9 +4130,9 @@ if [ "${1}" = "mds" ]; then
   GUEST_IP=192.168.122.3
   HOST_SSH_PORT=2223
   GUEST_SSH_PORT=22
-  TCP_PORTS=(514 2055 5044 5123 5100:5200 5500:5800 5900)
+  TCP_PORTS=(514 2055 5000:6000)
   VXLAN_PORTS=(4789 8472)
-  UDP_PORTS=(514 2055 5044 5100:5200 5500:5800 5900)
+  UDP_PORTS=(514 2055 5000:6000)
   BRIDGE='virbr0'
   MGT_INTF='mgt'
 
@@ -4365,6 +4363,27 @@ step_07_lvm_storage() {
 
   load_config
 
+  local _DRY_RUN="${DRY_RUN:-0}"
+  local AIO_HOSTNAME="${AIO_HOSTNAME:-aio}"
+  local AIO_INSTALL_DIR="${AIO_INSTALL_DIR:-/stellar/aio}"
+  local AIO_IMAGE_DIR="${AIO_INSTALL_DIR}/images"
+
+  # If an existing AIO VM is present, stop and remove it before proceeding
+  if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
+    log "[STEP 07] Existing VM detected (${AIO_HOSTNAME}). Destroying and undefining before LVM configuration."
+    if [[ "${_DRY_RUN}" -eq 1 ]]; then
+      echo "[DRY_RUN] virsh destroy ${AIO_HOSTNAME} || true"
+      echo "[DRY_RUN] virsh undefine ${AIO_HOSTNAME} --nvram || virsh undefine ${AIO_HOSTNAME} || true"
+      echo "[DRY_RUN] rm -rf '${AIO_IMAGE_DIR}/${AIO_HOSTNAME}' || true"
+    else
+      virsh destroy "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+      virsh undefine "${AIO_HOSTNAME}" --nvram >/dev/null 2>&1 || virsh undefine "${AIO_HOSTNAME}" >/dev/null 2>&1 || true
+      if [ -d "${AIO_IMAGE_DIR}/${AIO_HOSTNAME}" ]; then
+        sudo rm -rf "${AIO_IMAGE_DIR:?}/${AIO_HOSTNAME}" 2>/dev/null || true
+      fi
+    fi
+  fi
+
   # Auto-detect OS VG name
   local root_dev
   root_dev=$(findmnt -n -o SOURCE /)
@@ -4568,6 +4587,20 @@ step_07_lvm_storage() {
   for d in ${DATA_SSD_LIST}; do
     run_cmd "sudo parted -s /dev/${d} mklabel gpt"
     run_cmd "sudo parted -s /dev/${d} mkpart primary ext4 1MiB 100%"
+  done
+
+  # Ensure kernel/udev sees new partitions before pvcreate
+  for d in ${DATA_SSD_LIST}; do
+    run_cmd "sudo partprobe /dev/${d} || true"
+  done
+  run_cmd "sudo udevadm settle || true"
+
+  # Wait for partition device nodes (e.g., /dev/sdb1) to appear
+  for d in ${DATA_SSD_LIST}; do
+    for _ in {1..10}; do
+      [[ -b "/dev/${d}1" ]] && break
+      sleep 0.3
+    done
   done
 
   #######################################
@@ -5322,14 +5355,9 @@ step_09_aio_deploy() {
         fi
     fi
 
-    # If aio already exists, warn and allow destroy/cleanup
+    # If aio already exists, destroy/cleanup automatically
     if virsh dominfo "${AIO_HOSTNAME}" >/dev/null 2>&1; then
-        if ! confirm_destroy_vm "${AIO_HOSTNAME}" "STEP 09 - AIO deploy"; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Existing VM detected, user kept it. Skipping."
-            return 0
-        fi
-
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Destroying and undefining existing ${AIO_HOSTNAME}..."
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] Existing VM detected. Destroying and undefining ${AIO_HOSTNAME}..."
 
         local AIO_VM_DIR="${AIO_IMAGE_DIR}/${AIO_HOSTNAME}"
 
@@ -5643,22 +5671,10 @@ step_10_sensor_lv_download() {
   #######################################
   # Prompt for Sensor LV size configuration
   #######################################
-  # Check total size of ubuntu-vg (OpenXDR method)
-  local ubuntu_vg_total_size
-  ubuntu_vg_total_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o size 2>/dev/null | tr -d ' ' || echo "0")
-
-  # Check ubuntu-lv usage size
-  local ubuntu_lv_size ubuntu_lv_gb=0
-  if command -v lvs >/dev/null 2>&1; then
-    ubuntu_lv_size=$(lvs ubuntu-vg/ubuntu-lv --noheadings --units g --nosuffix -o lv_size 2>/dev/null | tr -d ' ' || echo "0")
-    ubuntu_lv_gb=${ubuntu_lv_size%.*}
-  fi
-
-  # ubuntu-vg convert total size to integer
-  local ubuntu_vg_total_gb=${ubuntu_vg_total_size%.*}
-  
-  # Available space calculate
-  local available_gb=$((ubuntu_vg_total_gb - ubuntu_lv_gb))
+  # Check ubuntu-vg free space (accurate available space)
+  local ubuntu_vg_free_size
+  ubuntu_vg_free_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
+  local available_gb=${ubuntu_vg_free_size%.*}
   [[ ${available_gb} -lt 0 ]] && available_gb=0
   
   # Default LV size
@@ -5768,6 +5784,19 @@ step_10_sensor_lv_download() {
   # 1) LV create (mds single) - OpenXDR method (ubuntu-vg)
   #######################################
   if [[ "${skip_lv_creation}" == "no" ]]; then
+    # Re-check free space right before lvcreate (avoid race or stale info)
+    local available_mb available_mb_int required_mb
+    available_mb=$(vgs "${UBUNTU_VG}" --noheadings --units m --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
+    available_mb_int="${available_mb%.*}"
+    required_mb=$((SENSOR_LV_SIZE_GB_PER_VM * 1024))
+    if [[ "${available_mb_int}" -lt "${required_mb}" ]]; then
+      local available_gb_now
+      available_gb_now=$((available_mb_int / 1024))
+      whiptail_msgbox "STEP 10 - Insufficient VG Space" "Not enough free space in ${UBUNTU_VG}.\n\n- Required: ${SENSOR_LV_SIZE_GB_PER_VM}GB\n- Available: ${available_gb_now}GB\n\nReduce the LV size or free space in ${UBUNTU_VG} and retry." 12 80
+      log "[STEP 10] Insufficient VG space: required=${SENSOR_LV_SIZE_GB_PER_VM}GB, available=${available_gb_now}GB"
+      return 1
+    fi
+
     log "[STEP 07] Start creating/mounting LV for mds (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
 
     # mds LV
@@ -6634,6 +6663,65 @@ step_12_sensor_passthrough() {
         local VM_PCIS="${SENSOR_SPAN_VF_PCIS_MDS:-}"
 
         if [[ "${SPAN_ATTACH_MODE}" == "pci" && -n "${VM_PCIS}" ]]; then
+            # Cleanup: remove stale hostdev PCI devices not in current config
+            local vm_running=0
+            if virsh list --state-running | grep -q "^${SENSOR_VM}$"; then
+                vm_running=1
+            fi
+
+            # Normalize desired PCI list into a set
+            declare -A desired_pci_set
+            local p
+            for p in ${VM_PCIS}; do
+                local np
+                np="$(normalize_pci "${p}")"
+                np="$(echo "${np}" | tr '[:upper:]' '[:lower:]')"
+                desired_pci_set["${np}"]=1
+            done
+
+            # Extract current hostdev source PCI addresses (persistent config)
+            local current_pcis=()
+            while IFS= read -r pci_addr; do
+                [[ -z "${pci_addr}" ]] && continue
+                current_pcis+=("${pci_addr}")
+            done < <(virsh dumpxml "${SENSOR_VM}" --inactive 2>/dev/null | awk -F"'" '
+                /<hostdev / { in_hostdev=1; next }
+                in_hostdev && /address/ && /domain=/ && /bus=/ && /slot=/ && /function=/ && $0 !~ /type=.pci./ {
+                    addr_domain=$2
+                    addr_bus=$4
+                    addr_slot=$6
+                    addr_func=$8
+                    if (addr_domain != "" && addr_bus != "" && addr_slot != "" && addr_func != "") {
+                        printf "%s:%s:%s.%s\n", addr_domain, addr_bus, addr_slot, addr_func
+                    }
+                }
+                /<\/hostdev>/ { in_hostdev=0 }
+            ' | tr '[:upper:]' '[:lower:]')
+
+            if [[ ${#current_pcis[@]} -gt 0 ]]; then
+                for p in "${current_pcis[@]}"; do
+                    local np
+                    np="$(normalize_pci "${p}")"
+                    np="$(echo "${np}" | tr '[:upper:]' '[:lower:]')"
+                    if [[ -z "${desired_pci_set[${np}]:-}" ]]; then
+                        local detach_xml="${STATE_DIR}/pci_detach_${SENSOR_VM}_${np//[:.]/_}.xml"
+                        cat > "${detach_xml}" <<EOF
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x${np:0:4}' bus='0x${np:5:2}' slot='0x${np:8:2}' function='0x${np:11:1}'/>
+  </source>
+</hostdev>
+EOF
+                        log "[STEP 12] ${SENSOR_VM}: Detaching stale PCI device ${np}"
+                        if [[ "${vm_running}" -eq 1 ]]; then
+                            virsh detach-device "${SENSOR_VM}" "${detach_xml}" --live --config >/dev/null 2>&1 || true
+                        else
+                            virsh detach-device "${SENSOR_VM}" "${detach_xml}" --config >/dev/null 2>&1 || true
+                        fi
+                    fi
+                done
+            fi
+
             log "[STEP 12] ${SENSOR_VM}: Starting PCI passthrough device connection (pcis=${VM_PCIS})"
 
             for pci_full in ${VM_PCIS}; do
@@ -7018,11 +7106,54 @@ EOF
     local data_disk_attached=0
     local data_disk_status=""
     
+    # Helper: extract the full <disk>...</disk> XML block that contains target dev='vdb'
+    # NOTE: In libvirt XML, <source ...> often appears BEFORE <target ...>,
+    # so parsing with `grep -A ... "target dev='vdb'"` is unreliable.
+    # Args:
+    #   $1: vm name
+    #   $2: 0=live XML, 1=inactive XML
+    get_vdb_disk_block() {
+        local vm_name="$1"
+        local inactive="${2:-0}"
+        if [[ -z "${vm_name}" ]]; then
+            return 1
+        fi
+
+        local dump_cmd=(virsh dumpxml "${vm_name}")
+        if [[ "${inactive}" -eq 1 ]]; then
+            dump_cmd+=(--inactive)
+        fi
+
+        "${dump_cmd[@]}" 2>/dev/null | awk '
+            BEGIN { in_disk=0; buf="" }
+            /<disk[ >]/ { in_disk=1; buf=$0 ORS; next }
+            in_disk {
+                buf = buf $0 ORS
+                if ($0 ~ /<\/disk>/) {
+                    if (buf ~ /<target[[:space:]]+dev=.vdb./) { print buf; exit }
+                    in_disk=0; buf=""
+                }
+            }
+        '
+    }
+
+    # Helper: pretty-print live_ok for logs.
+    # For shutoff VMs, live verification is not applicable.
+    fmt_live_ok() {
+        local is_running="${1:-0}"
+        local val="${2:-0}"
+        if [[ "${is_running}" -eq 1 ]]; then
+            echo "${val}"
+        else
+            echo "N/A"
+        fi
+    }
+
     # Helper function to extract and normalize vdb source from VM XML
     get_vdb_source() {
         local vm_name="$1"
         local vdb_xml
-        vdb_xml=$(virsh dumpxml "${vm_name}" 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        vdb_xml="$(get_vdb_disk_block "${vm_name}" 0 || true)"
         
         if [[ -z "${vdb_xml}" ]]; then
             echo ""
@@ -7135,7 +7266,7 @@ EOF
         
         # Use --inactive to check persistent config
         local vdb_xml
-        vdb_xml=$(virsh dumpxml "${vm_name}" --inactive 2>/dev/null | grep -A 20 "target dev='vdb'" | head -20 || echo "")
+        vdb_xml="$(get_vdb_disk_block "${vm_name}" 1 || true)"
         
         if [[ -z "${vdb_xml}" ]]; then
             return 1  # vdb not found in config
@@ -7259,7 +7390,7 @@ EOF
                     live_ok=1
                 fi
                 
-                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=${live_ok}"
+                log "[STEP 12] Verification before attach: config_ok=${config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${live_ok})"
                 
                 # Determine if attachment is needed
                 local needs_attach=1
@@ -7424,7 +7555,7 @@ EOF
                             final_live_ok=1  # Not applicable for shutoff
                         fi
                         
-                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                        log "[STEP 12] Verification attempt ${verify_count}/${max_verify_attempts}: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                         
                         # Determine success based on VM state
                         if [[ ${aio_running} -eq 1 ]]; then
@@ -7532,14 +7663,14 @@ EOF
                         if [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 1 ]] && [[ ${final_config_ok} -eq 0 ]]; then
                             log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
                             log "[STEP 12] Status: Attached (live), persistence pending"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                             log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
                             log "[WARN] Please manually verify with: virsh dumpxml ${AIO_VM} --inactive | grep vdb"
                             data_disk_attached=1
                             data_disk_status="Attached (live), persistence pending"
                         else
                             log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (${attach_mode}) completed and verified"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                             data_disk_attached=1
                             data_disk_status="Attached successfully"
                         fi
@@ -7547,9 +7678,9 @@ EOF
                         # Only report as failed if live is also not OK (for running VM)
                         if [[ ${aio_running} -eq 1 ]] && [[ ${final_live_ok} -eq 0 ]]; then
                             log "[ERROR] ${AIO_VM} data disk(${DATA_LV}) attach failed after all attempts"
-                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                             log "[DEBUG] VM XML vdb section (config):"
-                            virsh dumpxml "${AIO_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                            get_vdb_disk_block "${AIO_VM}" 1 2>/dev/null | while read -r line; do
                                 log "[DEBUG]   ${line}"
                             done
                             log "[DEBUG] Live block list:"
@@ -7561,16 +7692,16 @@ EOF
                             # This should not happen due to verification_passed logic, but handle it anyway
                             log "[STEP 12] ${AIO_VM} data disk(${DATA_LV}) attached as vdb (live) - persistence pending"
                             log "[STEP 12] Status: Attached (live), persistence pending"
-                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[STEP 12] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                             log "[WARN] Config verification failed but live attachment is working. Persistence may not be saved."
                             log "[WARN] Please manually verify with: virsh dumpxml ${AIO_VM} --inactive | grep vdb"
                             data_disk_attached=1
                             data_disk_status="Attached (live), persistence pending"
                         else
                             log "[ERROR] ${AIO_VM} data disk(${DATA_LV}) attach failed after all attempts"
-                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=${final_live_ok}"
+                            log "[ERROR] Final verification: config_ok=${final_config_ok}, live_ok=$(fmt_live_ok ${aio_running} ${final_live_ok})"
                             log "[DEBUG] VM XML vdb section (config):"
-                            virsh dumpxml "${AIO_VM}" --inactive 2>/dev/null | grep -A 10 "target dev='vdb'" | while read -r line; do
+                            get_vdb_disk_block "${AIO_VM}" 1 2>/dev/null | while read -r line; do
                                 log "[DEBUG]   ${line}"
                             done
                             data_disk_status="Attach failed"
@@ -9063,13 +9194,13 @@ show_usage_help() {
 
 📌 **Prerequisites and Getting Started**
 ────────────────────────────────────────────────────────────
-• This installer requires *root privileges*.
+  • This installer requires *root privileges*.
   Setup steps:
     1) Switch to root: sudo -i
     2) Create directory: mkdir -p /root/xdr-installer
-    3) Save this script to that directory
-    4) Make executable: chmod +x installer.sh
-    5) Execute: ./installer.sh
+    3) Save this script as xdr-installer.sh in that directory
+    4) Make executable: chmod +x xdr-installer.sh
+    5) Execute: ./xdr-installer.sh
 
 • Navigation in this guide:
   - Press **SPACEBAR** or **↓** to scroll to next page

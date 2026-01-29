@@ -9233,9 +9233,10 @@ show_usage_help() {
 │      • DRY_RUN: Simulation mode (default: 1)                 │
 │      • AIO_VERSION: AIO version to install                   │
 │      • SENSOR_VERSION: Sensor version to install             │
-│      • Network mode: NAT only (bridge mode not supported)      │
-│      • SPAN_ATTACH_MODE: pci only (bridge mode not supported) │
 │      • ACPS credentials (username, password, URL)            │
+│      • AUTO_REBOOT: Auto reboot after STEP 03/05 (default: 1) │
+│      • SPAN_ATTACH_MODE: pci only (bridge mode not supported) │
+│      • Network mode: fixed NAT only (not configurable)        │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
@@ -9268,8 +9269,8 @@ show_usage_help() {
 Step-by-Step Process:
 ────────────────────────────────────────────────────────────
 1. Initial Setup:
-  • Configure menu 3: Set DRY_RUN=0, AIO_VERSION, SENSOR_VERSION, network mode,
-     SPAN attachment mode, ACPS credentials
+  • Configure menu 3: Set DRY_RUN=0, AIO_VERSION, SENSOR_VERSION, ACPS credentials
+     (AUTO_REBOOT optional; SPAN mode is fixed to pci)
    • Select menu 1 to start automatic installation
 
 2. Installation Flow:
@@ -9313,7 +9314,7 @@ When to Use:
 ────────────────────────────────────────────────────────────
 • Some steps already completed
 • Need to update specific components
-• Changing configuration (NIC, network mode, SPAN mode)
+• Changing configuration (NIC, SPAN NIC selection, storage)
 
 Process:
 ────────────────────────────────────────────────────────────
@@ -9322,8 +9323,8 @@ Process:
    • Check menu 4 (validation) for current status
 
 2. Configure if needed:
-   • Menu 3: Update DRY_RUN, SENSOR_VERSION, network mode,
-     SPAN attachment mode, or ACPS credentials
+   • Menu 3: Update DRY_RUN, AIO_VERSION, SENSOR_VERSION, ACPS credentials,
+     AUTO_REBOOT (SPAN mode is fixed to pci)
 
 3. Continue or re-run:
    • Menu 1: Auto-continue from next incomplete step
@@ -9358,11 +9359,7 @@ Common Use Cases:
 
 • SPAN NIC Reconfiguration:
   → Menu 2 → STEP 01 (SPAN NIC selection) → STEP 12 (PCI passthrough)
-  → SPAN attachment mode can be changed in menu 3
-
-• Change Network Mode (NAT only):
-  → Menu 3 → Update SENSOR_NET_MODE (NAT mode only)
-  → Menu 2 → STEP 01 → STEP 11 (to apply new network mode)
+  → SPAN attachment mode is fixed to pci (bridge not supported)
 
 
 ═══════════════════════════════════════════════════════════════
@@ -9422,7 +9419,7 @@ Server Specifications (Physical Server Recommended):
 • Disk:
   - Use ubuntu-vg volume group for OS and Sensor
   - Minimum free space: 100GB recommended (80GB minimum)
-  - Sensor LV is created automatically in STEP 07
+  - Sensor LV is created automatically in STEP 10
 
 • Network Interfaces:
   - Management (Host/MGT): 1GbE or more (for SSH access)
@@ -9479,7 +9476,7 @@ Network Configuration:
 
 Log Files:
 ────────────────────────────────────────────────────────────
-• Main log: /var/log/xdr-installer.log
+• Main log: /root/xdr-installer/state/xdr_install.log
 • View logs: Menu 6 (View Log)
 • Step logs: Displayed during each step execution
 • Validation logs: Available in menu 4 detailed view

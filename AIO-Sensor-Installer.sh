@@ -3109,18 +3109,39 @@ step_04_kvm_libvirt() {
   fi
 
   {
-    echo "Current KVM / Libvirt status"
-    echo "-----------------------"
-    echo "Network mode: ${net_mode}"
-    echo "KVM acceleration Use possible: ${kvm_ok}"
-    echo "libvirtd service active: ${libvirtd_ok}"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 04: KVM and Libvirt Installation"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "This STEP performs the following tasks:"
-    echo "  1) KVM / Libvirt related package installation"
-    echo "  2) Add user to libvirt group"
-    echo "  3) Enable libvirtd / virtlogd services"
-    echo "  4) default libvirt network(virbr0) NAT configure (NAT mode)"
-    echo "  5) KVM acceleration and virtualization function verify"
+    echo "📋 CURRENT STATUS:"
+    echo
+    echo "1️⃣  KVM Acceleration:"
+    if [[ "${kvm_ok}" == "yes" ]]; then
+      echo "  ✅ KVM acceleration can be used (kvm-ok)"
+    else
+      echo "  ⚠️  KVM acceleration not confirmed"
+    fi
+    echo
+    echo "2️⃣  libvirtd Service Status:"
+    if [[ "${libvirtd_ok}" == "yes" ]]; then
+      echo "  ✅ libvirtd service is active"
+    else
+      echo "  ⚠️  libvirtd service is inactive"
+    fi
+    echo
+    echo "3️⃣  Network Mode:"
+    echo "  • NAT only (virbr0 / 192.168.122.0/24)"
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Install KVM/libvirt related packages"
+    echo "  2. Add current user to libvirt group"
+    echo "  3. Enable libvirtd / virtlogd services"
+    echo "  4. Configure default libvirt network (virbr0 NAT)"
+    echo "  5. Verify KVM acceleration and libvirt status"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } > "${tmp_info}"
 
   show_textbox "STEP 04 - KVM/Libvirt install Overview" "${tmp_info}"
@@ -3302,8 +3323,10 @@ EOF
   fi
 
   {
-    echo "STEP 04 - KVM / Libvirt Installation Summary"
     echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 04: Execution Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       echo "🔍 DRY-RUN MODE: No actual changes were made"
       echo
@@ -3311,18 +3334,11 @@ EOF
       echo "  • KVM availability: ${final_kvm_ok}"
       echo "  • libvirtd service: ${final_libvirtd_ok}"
       echo
-      echo "ℹ️  In real execution mode, the following would occur:"
-      echo "  1. KVM/libvirt packages would be installed:"
-      echo "     - qemu-kvm, libvirt-daemon-system, libvirt-clients"
-      echo "     - bridge-utils, virt-manager, cpu-checker"
-      echo "     - qemu-utils, virtinst, genisoimage"
-      echo
-      echo "  2. Current user would be added to libvirt group"
-      echo "  3. libvirtd and virtlogd services would be enabled and started"
-      echo
-      echo "  4. NAT Mode Network Configuration:"
-      echo "     - OpenXDR NAT network (virbr0/192.168.122.0/24) would be created"
-      echo "     - AIO and Sensor VMs will use virbr0 NAT bridge"
+      echo "🔧 ACTIONS (SIMULATED):"
+      echo "  1. Install KVM/libvirt packages"
+      echo "  2. Add current user to libvirt group"
+      echo "  3. Enable libvirtd and virtlogd services"
+      echo "  4. Configure default libvirt NAT network (virbr0)"
       echo
       echo "⚠️  IMPORTANT NOTES:"
       echo "  • User group changes require logout/login or reboot to take effect"
@@ -3360,6 +3376,11 @@ EOF
       echo "  • BIOS/UEFI must have virtualization (VT-x/VT-d) enabled"
       echo "  • Verify KVM with: kvm-ok"
       echo "  • Verify libvirt with: virsh list --all"
+      echo
+      echo "📝 NEXT STEPS:"
+      echo "  • Proceed to STEP 05 (Kernel Tuning)"
+      echo "  • After STEP 05 completes, system will reboot automatically"
+      echo "  • After reboot, proceed to STEP 06 (libvirt hooks + NTPsec)"
     fi
   } > "${tmp_info}"
 
@@ -3403,20 +3424,48 @@ step_05_kernel_tuning() {
   fi
 
   {
-    echo "Current kernel tuning status"
-    echo "-------------------"
-    echo "GRUB IOMMU configuration: ${grub_has_iommu}"
-    echo "KSM disabled: ${ksm_disabled}"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 05: Kernel Tuning and System Configuration"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "This STEP performs the following tasks:"
-    echo "  1) Add IOMMU parameters to GRUB (intel_iommu=on iommu=pt)"
-    echo "  2) Kernel parameter tuning (/etc/sysctl.conf)"
+    echo "📋 CURRENT STATUS:"
+    echo
+    echo "1️⃣  GRUB IOMMU Configuration:"
+    if [[ "${grub_has_iommu}" == "yes" ]]; then
+      echo "  ✅ IOMMU parameters already configured"
+    else
+      echo "  ⚠️  IOMMU parameters not found in GRUB"
+    fi
+    echo
+    echo "2️⃣  KSM (Kernel Same-page Merging) Status:"
+    if [[ "${ksm_disabled}" == "yes" ]]; then
+      echo "  ✅ KSM is currently disabled"
+    else
+      echo "  ⚠️  KSM is currently enabled"
+    fi
+    echo
+    echo "3️⃣  Swap Status:"
+    if swapon --show 2>/dev/null | grep -q .; then
+      echo "  ⚠️  Swap is currently enabled"
+    else
+      echo "  ✅ Swap is currently disabled"
+    fi
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Add IOMMU parameters to GRUB (intel_iommu=on iommu=pt)"
+    echo "  2. Kernel parameter tuning (/etc/sysctl.conf)"
     echo "     - ARP flux prevention configuration"
     echo "     - Memory management optimization"
-    echo "  3) Disable KSM (Kernel Same-page Merging)"
-    echo "  4) Provide swap disable option"
+    echo "  3. Disable KSM (Kernel Same-page Merging)"
+    echo "  4. Optional swap disable and cleanup"
     echo
-    echo "※ is STEP after completion The system will automatically reboot."
+    echo "⚠️  IMPORTANT NOTES:"
+    echo "  • System reboot is required to apply GRUB changes"
+    echo "  • Auto reboot will occur after this step (if configured)"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } > "${tmp_status}"
 
   show_textbox "STEP 05 - kernel tuning Overview" "${tmp_status}"
@@ -3584,7 +3633,8 @@ step_05_kernel_tuning() {
   # 5) Result Summary
   #######################################
   {
-    echo "STEP 05 - Kernel Tuning Configuration Summary"
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 05: Execution Summary"
     echo "═══════════════════════════════════════════════════════════"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       echo "🔍 DRY-RUN MODE: No actual changes were made"
@@ -3594,21 +3644,11 @@ step_05_kernel_tuning() {
       echo "  • Kernel parameter tuning: Would be applied"
       echo "  • KSM disable: Would be applied"
       echo
-      echo "ℹ️  In real execution mode, the following would occur:"
-      echo "  1. GRUB Configuration:"
-      echo "     - /etc/default/grub would be modified"
-      echo "     - IOMMU parameters (intel_iommu=on iommu=pt) would be added"
-      echo "     - update-grub would be executed"
-      echo
-      echo "  2. Kernel Parameters:"
-      echo "     - /etc/sysctl.conf would be updated"
-      echo "     - net.ipv4.ip_forward = 1"
-      echo "     - vm.min_free_kbytes = 1048576"
-      echo "     - sysctl -p would be executed"
-      echo
-      echo "  3. KSM Disable:"
-      echo "     - /etc/default/qemu-kvm would be created/updated"
-      echo "     - KSM_ENABLED=0 would be set"
+      echo "🔧 ACTIONS (SIMULATED):"
+      echo "  1. Modify /etc/default/grub (intel_iommu=on iommu=pt)"
+      echo "  2. Update /etc/sysctl.conf (ip_forward, min_free_kbytes)"
+      echo "  3. Disable KSM (KSM_ENABLED=0)"
+      echo "  4. Optional swap disable and cleanup"
       echo
       local swap_status=""
       if swapon --show 2>/dev/null | grep -q .; then
@@ -3617,20 +3657,15 @@ step_05_kernel_tuning() {
         swap_status="disabled"
       fi
       if [[ "${swap_status}" == "enabled" ]]; then
-        echo "  4. Swap Disable:"
-        echo "     - All swap would be disabled (swapoff -a)"
-        echo "     - /etc/fstab swap entries would be commented out"
-        echo "     - Swap files would be removed"
-        echo "     - systemd-swap service would be disabled"
+        echo "  • Swap: Would be disabled (swapoff -a, fstab update)"
       else
-        echo "  4. Swap: Already disabled (no action needed)"
+        echo "  • Swap: Already disabled (no action needed)"
       fi
       echo
-      echo "⚠️  IMPORTANT:"
+      echo "⚠️  IMPORTANT NOTES:"
       echo "  • System reboot is required to apply all configuration changes"
       echo "  • GRUB changes will take effect after reboot"
-      echo "  • AUTO_REBOOT_AFTER_STEP_ID is configured"
-      echo "  • System will automatically reboot after STEP completion"
+      echo "  • System will automatically reboot after STEP completion (if configured)"
     else
       echo "✅ EXECUTION COMPLETED"
       echo
@@ -3664,15 +3699,17 @@ step_05_kernel_tuning() {
         echo "  • Swap: User chose to keep swap enabled"
       fi
       echo
-      echo "⚠️  IMPORTANT:"
+      echo "⚠️  IMPORTANT NOTES:"
       echo "  • System reboot is required to apply all configuration changes"
       echo "  • GRUB changes will take effect after reboot"
-      echo "  • AUTO_REBOOT_AFTER_STEP_ID is configured"
-      echo "  • System will automatically reboot after STEP completion"
+      echo "  • System will automatically reboot after STEP completion (if configured)"
       echo
       echo "💡 TIP: After reboot, verify IOMMU with:"
-      echo "   dmesg | grep -i iommu"
-      echo "   cat /proc/cmdline | grep iommu"
+      echo "  dmesg | grep -i iommu"
+      echo "  cat /proc/cmdline | grep iommu"
+      echo
+      echo "📝 NEXT STEPS:"
+      echo "  • After reboot, proceed to STEP 06 (libvirt hooks + NTPsec)"
     fi
   } > "${tmp_status}"
 
@@ -3935,29 +3972,41 @@ step_06_nat_hooks() {
   # 0) Current hooks status summary
   #######################################
   {
-    echo "NAT Mode libvirt Hooks Installation"
-    echo "=============================="
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  STEP 06: NAT Mode libvirt Hooks Installation"
+    echo "═══════════════════════════════════════════════════════════"
     echo
-    echo "Hooks to be installed:"
-    echo "- /etc/libvirt/hooks/network (NAT MASQUERADE)"
-    echo "- /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)"
+    echo "📋 CURRENT STATUS:"
     echo
-    echo "VM network configuration:"
-    echo "- AIO VM name: aio"
-    echo "- AIO internal IP: 192.168.122.2"
-    echo "- Sensor VM name: mds"
-    echo "- Sensor internal IP: 192.168.122.3"
-    echo "- NAT bridge: virbr0 (192.168.122.0/24)"
-    echo "- External interface: mgt"
+    echo "1️⃣  Hooks to be installed:"
+    echo "  • /etc/libvirt/hooks/network (NAT MASQUERADE)"
+    echo "  • /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)"
     echo
-    echo "DNAT port forwarding:"
-    echo "- AIO: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)"
-    echo "- Sensor: SSH(2223), sensor forwarder ports"
+    echo "2️⃣  VM Network Configuration:"
+    echo "  • AIO VM name: aio"
+    echo "  • AIO internal IP: 192.168.122.2"
+    echo "  • Sensor VM name: mds"
+    echo "  • Sensor internal IP: 192.168.122.3"
+    echo "  • NAT bridge: virbr0 (192.168.122.0/24)"
+    echo "  • External interface: mgt"
+    echo
+    echo "3️⃣  DNAT Port Forwarding:"
+    echo "  • AIO: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)"
+    echo "  • Sensor: SSH(2223), sensor forwarder ports"
+    echo
+    echo "🔧 ACTIONS TO BE PERFORMED:"
+    echo "  1. Create/update libvirt hook scripts"
+    echo "  2. Configure DNAT rules for AIO/Sensor"
+    echo "  3. Enable OOM monitoring helper scripts"
+    echo
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "🔍 DRY-RUN MODE: No actual changes will be made"
+    fi
   } > "${tmp_info}"
 
   show_textbox "STEP 06 NAT Mode - Installation Overview" "${tmp_info}"
 
-  if ! whiptail_yesno "STEP 06 NAT Mode Execution Confirmation" "Install libvirt hooks for NAT Mode.\n\n- Apply OpenXDR NAT structure\n- AIO VM (aio) DNAT configuration\n- Sensor VM (mds) DNAT configuration\n- OOM monitoring function\n\nDo you want to continue?" 16 70
+  if ! whiptail_yesno "STEP 06 NAT Mode Execution Confirmation" "Apply NAT mode hooks and DNAT rules now?\n\n✅ /etc/libvirt/hooks/network + /etc/libvirt/hooks/qemu\n✅ AIO (aio) DNAT rules\n✅ Sensor (mds) DNAT rules\n✅ OOM monitoring scripts\n\nContinue?" 16 70
   then
     log "User canceled STEP 06 NAT Mode execution."
     return 0
@@ -4309,28 +4358,30 @@ EOF
   #######################################
   local summary
   summary=$(cat <<EOF
-[STEP 06 NAT Mode Completed]
+═══════════════════════════════════════════════════════════
+  STEP 06: NAT Mode Hooks - Complete
+═══════════════════════════════════════════════════════════
 
-OpenXDR based NAT libvirt hooks have been installed.
+✅ INSTALLATION STATUS:
+  • NAT libvirt hooks installed successfully
+  • OOM monitoring scripts installed
 
-Installed hooks:
-- /etc/libvirt/hooks/network (NAT MASQUERADE)
-- /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)
+📦 INSTALLED HOOKS:
+  • /etc/libvirt/hooks/network (NAT MASQUERADE)
+  • /etc/libvirt/hooks/qemu (AIO & Sensor DNAT + OOM monitoring)
 
-VM network configuration:
-- AIO VM name: aio
-- AIO internal IP: 192.168.122.2
-- Sensor VM name: mds
-- Sensor internal IP: 192.168.122.3
-- NAT bridge: virbr0 (192.168.122.0/24)
-- External access: DNAT through mgt interface
+🌐 VM NETWORK CONFIGURATION:
+  • AIO VM: aio (192.168.122.2)
+  • Sensor VM: mds (192.168.122.3)
+  • NAT bridge: virbr0 (192.168.122.0/24)
+  • External access: DNAT via mgt interface
 
-AIO DNAT ports: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)
-Sensor DNAT ports: SSH(2223), sensor forwarder ports
-OOM monitoring: enabled
+🔐 DNAT PORTS:
+  • AIO: SSH(2222), UI(80,443), TCP(6640-6648,8443,8888,8889), UDP(162)
+  • Sensor: SSH(2223), sensor forwarder ports
 
 📝 NEXT STEPS:
-  • libvirtd restart is required for hooks to take effect
+  • Restart libvirtd for hooks to take effect
   • Proceed to STEP 07 (LVM Storage Configuration)
 EOF
 )
@@ -7914,7 +7965,7 @@ step_13_install_dp_cli() {
         load_config || true
     fi
 
-    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI package (dp_cli) on host and apply to stellar user.\n\n(Will download latest version from GitHub: https://github.com/RickLee-kr/Stellar-appliance-cli)\n\nDo you want to continue?" 15 85
+    if ! whiptail_yesno "STEP 13 Execution Confirmation" "Install DP Appliance CLI (dp_cli) on the host and apply to the stellar user.\n\n📦 Source: https://github.com/RickLee-kr/Stellar-appliance-cli\n\nProceed with installation?" 15 85
     then
         log "User canceled STEP 13 execution."
         return 0
@@ -7930,22 +7981,71 @@ step_13_install_dp_cli() {
     fi
 
     # 0-1) Install required packages first (before download/extraction)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Checking required packages for dp_cli + ACL persistence..."
+    local required_pkgs
+    local pkgs_to_install=()
+    required_pkgs=(python3-pip python3-venv wget curl unzip iptables netfilter-persistent iptables-persistent ipset-persistent)
+
+    for pkg in "${required_pkgs[@]}"; do
+        if dpkg -s "${pkg}" >/dev/null 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Package already installed: ${pkg}"
+        else
+            pkgs_to_install+=("${pkg}")
+        fi
+    done
+
+    local remove_ufw=0
+    if dpkg -s ufw >/dev/null 2>&1; then
+        remove_ufw=1
+    fi
+
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] apt-get update -y"
-        log "[DRY-RUN] apt-get install -y python3-pip python3-venv wget curl unzip"
+        log "[DRY-RUN] apt-get update -y (if needed)"
+        if [[ "${remove_ufw}" -eq 1 ]]; then
+            log "[DRY-RUN] apt-get purge -y ufw"
+        fi
+        if [[ "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            log "[DRY-RUN] apt-get install -y ${pkgs_to_install[*]}"
+        else
+            log "[DRY-RUN] Required packages already installed"
+        fi
     else
-        if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
-            return 1
+        if [[ "${remove_ufw}" -eq 1 || "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
         fi
-        if ! apt-get install -y python3-pip python3-venv wget curl unzip >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
-            return 1
+
+        if [[ "${remove_ufw}" -eq 1 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Removing ufw may take some time. Please wait."
+            if ! apt-get purge -y ufw >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to remove ufw" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ufw removed (to avoid conflicts)"
         fi
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Required packages installed successfully"
+
+        if [[ "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Package installation may take some time. Please wait."
+            # Preseed debconf to avoid interactive prompts (iptables/ipset persistent)
+            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+            echo "ipset-persistent ipset-persistent/autosave boolean true" | debconf-set-selections
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold \
+                "${pkgs_to_install[@]}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] Required packages installed successfully"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 13] All required packages already installed"
+        fi
     fi
 
     # 1) Download dp_cli from GitHub
@@ -8169,35 +8269,29 @@ EOF
 
     # Completion message box
     local completion_msg
-    completion_msg="STEP 13: DP Appliance CLI Installation Completed
+    completion_msg="═══════════════════════════════════════════════════════════
+  STEP 13: DP Appliance CLI Installation - Complete
+═══════════════════════════════════════════════════════════
 
-✅ Installation Summary:
-  • DP Appliance CLI package has been successfully installed
-  • Virtual environment created at: /opt/dp_cli_venv
-  • CLI commands available at: /usr/local/bin/aella_cli
-  • Login shell configured for stellar user
+✅ INSTALLATION SUMMARY:
+  • DP Appliance CLI package installed successfully
+  • Virtual environment created: /opt/dp_cli_venv
+  • CLI binary available: /usr/local/bin/aella_cli
+  • Login shell configured for the 'stellar' user
 
-📋 How to Use Appliance CLI:
+🧭 HOW TO USE:
+  1. Run CLI (manual):
+     aella_cli
 
-1. Test/Execute Appliance CLI:
-   Simply run: aella_cli
-   
-   This will launch the appliance CLI interface.
+  2. Automatic on login:
+     Logging in as 'stellar' launches the CLI automatically
 
-2. Automatic CLI on New Login:
-   When you connect to this KVM host as the 'stellar' user,
-   the appliance CLI will automatically appear.
-   
-   The login shell has been configured to use aella_cli,
-   so you don't need to run any commands manually.
+  3. Run from another user:
+     /usr/local/bin/aella_cli
 
-3. Manual Execution:
-   If you need to run it manually from another user:
-   /usr/local/bin/aella_cli
-
-💡 Note:
-   The appliance CLI is now ready to use for managing
-   your DP (Data Processor) appliances."
+💡 NOTES:
+  • The appliance CLI is ready for DP (Data Processor) operations
+  • If login shell was changed, reconnect to apply"
 
     # Calculate dialog size dynamically
     local dialog_dims

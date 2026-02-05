@@ -7437,22 +7437,71 @@ step_10_install_dp_cli() {
     fi
 
     # 0-1) Install required packages first (before download/extraction)
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Installing required packages (wget/curl, unzip, python3-pip, python3-venv)..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Checking required packages for dp_cli + ACL persistence..."
+    local required_pkgs
+    local pkgs_to_install=()
+    required_pkgs=(python3-pip python3-venv wget curl unzip iptables netfilter-persistent iptables-persistent ipset-persistent)
+
+    for pkg in "${required_pkgs[@]}"; do
+        if dpkg -s "${pkg}" >/dev/null 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Package already installed: ${pkg}"
+        else
+            pkgs_to_install+=("${pkg}")
+        fi
+    done
+
+    local remove_ufw=0
+    if dpkg -s ufw >/dev/null 2>&1; then
+        remove_ufw=1
+    fi
+
     if [[ "${_DRY}" -eq 1 ]]; then
-        log "[DRY-RUN] apt-get update -y"
-        log "[DRY-RUN] apt-get install -y python3-pip python3-venv wget curl unzip"
+        log "[DRY-RUN] apt-get update -y (if needed)"
+        if [[ "${remove_ufw}" -eq 1 ]]; then
+            log "[DRY-RUN] apt-get purge -y ufw"
+        fi
+        if [[ "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            log "[DRY-RUN] apt-get install -y ${pkgs_to_install[*]}"
+        else
+            log "[DRY-RUN] Required packages already installed"
+        fi
     else
-        if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
-            return 1
+        if [[ "${remove_ufw}" -eq 1 || "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            if ! apt-get update -y >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: apt-get update failed" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
         fi
-        if ! apt-get install -y python3-pip python3-venv wget curl unzip >>"${ERRLOG}" 2>&1; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
-            return 1
+
+        if [[ "${remove_ufw}" -eq 1 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing ufw may take some time. Please wait."
+            if ! apt-get purge -y ufw >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to remove ufw" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ufw removed (to avoid conflicts)"
         fi
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Required packages installed successfully"
+
+        if [[ "${#pkgs_to_install[@]}" -gt 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Package installation may take some time. Please wait."
+            # Preseed debconf to avoid interactive prompts (iptables/ipset persistent)
+            echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+            echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+            echo "ipset-persistent ipset-persistent/autosave boolean true" | debconf-set-selections
+            if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                -o Dpkg::Options::=--force-confdef \
+                -o Dpkg::Options::=--force-confold \
+                "${pkgs_to_install[@]}" >>"${ERRLOG}" 2>&1; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ERROR: Failed to install required packages" | tee -a "${ERRLOG}"
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] HINT: Please check ${ERRLOG} for details." | tee -a "${ERRLOG}"
+                return 1
+            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Required packages installed successfully"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] All required packages already installed"
+        fi
     fi
 
     # 1) Download dp_cli from GitHub

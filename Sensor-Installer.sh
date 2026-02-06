@@ -3095,16 +3095,38 @@ step_04_kvm_libvirt() {
   #######################################
   # 1) package Installation
   #######################################
-  echo "=== KVM/libvirt environment installation in progress (this may take some time) ==="
-  log "[STEP 04] Installing KVM / Libvirt packages"
-  log "[STEP 04] Installing essential packages for KVM/Libvirt environment..."
-
   local packages="qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager cpu-checker qemu-utils virtinst genisoimage"
-  
-  log "Installing KVM/Libvirt packages: ${packages}"
-  run_cmd "sudo DEBIAN_FRONTEND=noninteractive apt install -y ${packages}"
-  
-  echo "=== All KVM/libvirt package installation completed ==="
+  local packages_ok="no"
+  local services_ok="no"
+
+  if command -v dpkg >/dev/null 2>&1; then
+    local missing_pkg=0
+    local pkg
+    for pkg in ${packages}; do
+      if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
+        missing_pkg=1
+        break
+      fi
+    done
+    if [[ "${missing_pkg}" -eq 0 ]]; then
+      packages_ok="yes"
+    fi
+  fi
+
+  if is_systemd_unit_active_or_socket libvirtd && is_systemd_unit_active_or_socket virtlogd; then
+    services_ok="yes"
+  fi
+
+  if [[ "${packages_ok}" == "yes" && "${services_ok}" == "yes" ]]; then
+    log "[STEP 04] Required packages and services already present. Skipping package installation."
+  else
+    echo "=== KVM/libvirt environment installation in progress (this may take some time) ==="
+    log "[STEP 04] Installing KVM / Libvirt packages"
+    log "[STEP 04] Installing essential packages for KVM/Libvirt environment..."
+    log "Installing KVM/Libvirt packages: ${packages}"
+    run_cmd "sudo DEBIAN_FRONTEND=noninteractive apt install -y ${packages}"
+    echo "=== All KVM/libvirt package installation completed ==="
+  fi
 
   #######################################
   # 2) User libvirt  add

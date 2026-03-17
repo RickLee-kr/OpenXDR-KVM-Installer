@@ -971,7 +971,7 @@ free_reserved_name() {
 
 
 #######################################
-# PDF-based UEFI/XML patch function (for DP_VERSION >= 6.2.1)
+# PDF-based UEFI/XML patch function (for DP_VERSION >= 6.3)
 #######################################
 apply_pdf_xml_patch() {
   local vm_name="$1"
@@ -5420,11 +5420,11 @@ EOF
 
 
 #######################################
-# DP_VERSION >= 6.2.1: KT v1.8 Step 09~12 implementations
+# DP_VERSION >= 6.3: KT v1.8 Step 09~12 implementations (Ubuntu 24.04 based DL/DA)
 #######################################
 
 step_09_dp_download_v621() {
-  log "[STEP 09] Download DP deploy script and image (KT v1.8 logic for DP_VERSION >= 6.2.1)"
+  log "[STEP 09] Download DP deploy script and image (KT v1.8 logic for DP_VERSION >= 6.3)"
   load_config
   local tmp_info="/tmp/xdr_step09_info.txt"
 
@@ -5755,6 +5755,38 @@ step_09_dp_download_v621() {
   show_textbox "STEP 09 - Summary (v621)" "${tmp_info}"
 }
 
+# Show v6.3+ DL/DA deployment warning (AELDEV-65301) and confirm before proceeding
+show_v63_deployment_warning_and_confirm() {
+  local step_num="$1"
+  local role="$2"
+  local tmp_file
+  tmp_file=$(mktemp)
+  cat << 'WARN_EOF' > "${tmp_file}"
+IMPORTANT: Ubuntu 24.04 based DP deployment (v6.3+)
+
+- Starting from version 6.3, DP is deployed on Ubuntu 24.04-based images, which differs from the previous deployment method.
+
+- From version 6.3, due to bug AELDEV-65301, the deployment script may continuously output the following message and may not complete normally:
+
+  Starting install...
+  Creating domain...
+  Domain creation completed.
+  The installation is running in the background, and it may takes up to 30 minutes
+  You can exit this script anytime
+  Mon, 01 Dec 2025 20:15:13 -0800 SSH to dl-master-new using 192.168.122.2 with username 'aella'.
+  You can deploy another node now!
+  Checking the system service completed...
+  ..........................
+
+- When the above message (with dots) continues to appear, press CTRL+C on your keyboard to force exit and complete the DL/DA deployment.
+
+- After force exiting the DL/DA deployment and running Step 12, the deployment will complete normally.
+WARN_EOF
+  show_textbox "STEP ${step_num} - ${role} Deployment (v6.3+) - Read Before Proceeding" "${tmp_file}"
+  rm -f "${tmp_file}"
+  whiptail_yesno "Proceed with ${role} deployment?" "Do you want to proceed with the ${role} deployment?\n\n(You will need to press CTRL+C when the dots appear to complete deployment, then run Step 12.)" 14 80
+}
+
 step_10_dl_master_deploy_v621() {
   local STEP_ID="10_dl_master_deploy"
 
@@ -5767,6 +5799,12 @@ step_10_dl_master_deploy_v621() {
   fi
 
   local _DRY_RUN="${DRY_RUN:-0}"
+
+  # v6.3+ deployment warning (AELDEV-65301) - user must acknowledge before proceeding
+  if ! show_v63_deployment_warning_and_confirm "10" "DL"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled. Skipping DL-master deploy."
+    return 0
+  fi
 
   # VM hostname input (KT v1.8 feature)
   local default_hostname="${DL_HOSTNAME:-dl-master}"
@@ -6083,6 +6121,12 @@ step_11_da_master_deploy_v621() {
   fi
 
   local _DRY_RUN="${DRY_RUN:-0}"
+
+  # v6.3+ deployment warning (AELDEV-65301) - user must acknowledge before proceeding
+  if ! show_v63_deployment_warning_and_confirm "11" "DA"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled. Skipping DA-master deploy."
+    return 0
+  fi
 
   # VM hostname input (KT v1.8 feature)
   local default_hostname="${DA_HOSTNAME:-da-master}"
@@ -7842,9 +7886,9 @@ step_09_dp_download() {
   local ver="${DP_VERSION:-}"
   
   # DP_VERSION gate:
-  #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
-  #   - >= 6.2.1 : use KT v1.8 Step 09 behavior (v621)
-  if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
+  #   - < 6.3 : keep legacy DP-Installer logic (do not change)
+  #   - >= 6.3 : use KT v1.8 Step 09 behavior (Ubuntu 24.04 based DL/DA)
+  if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
     step_09_dp_download_v621
     return
   fi
@@ -8554,10 +8598,10 @@ step_10_dl_master_deploy() {
     fi
 
     # DP_VERSION gate:
-    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.2.1 : use KT v1.8 Step 10 behavior (v621)
+    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
+    #   - >= 6.3 : use KT v1.8 Step 10 behavior (Ubuntu 24.04 based DL/DA)
     local ver="${DP_VERSION:-}"
-    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
+    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
       step_10_dl_master_deploy_v621
       return
     fi
@@ -8983,10 +9027,10 @@ step_11_da_master_deploy() {
     fi
 
     # DP_VERSION gate:
-    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.2.1 : use KT v1.8 Step 11 behavior (v621)
+    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
+    #   - >= 6.3 : use KT v1.8 Step 11 behavior (Ubuntu 24.04 based DL/DA)
     local ver="${DP_VERSION:-}"
-    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
+    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
       step_11_da_master_deploy_v621
       return
     fi
@@ -10012,9 +10056,9 @@ step_12_sriov_cpu_affinity() {
     fi
 
     # DP_VERSION gate:
-    #   - <= 6.2.0 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.2.1 : use KT v1.8 Step 12 behavior (v621)
-    local ver="${DP_VERSION:-}"
+    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
+    #   - >= 6.3 : use KT v1.8 Step 12 behavior (Ubuntu 24.04 based DL/DA)
+   local ver="${DP_VERSION:-}"
     # Sanitize DP_VERSION: remove quotes and whitespace
     ver="$(echo "$ver" | tr -d '\"' | xargs)"
     
@@ -10026,7 +10070,7 @@ step_12_sriov_cpu_affinity() {
     fi
     
     # Compare version (after sanitization)
-    if version_ge "${ver}" "6.2.1"; then
+    if version_ge "${ver}" "6.3"; then
       step_12_sriov_cpu_affinity_v621
       local v621_rc=$?
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV ====="

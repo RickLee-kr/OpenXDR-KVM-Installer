@@ -458,6 +458,122 @@ run_cmd_linkscan() {
   return "${exit_code}"
 }
 
+# Expand ubuntu-vg from unallocated OS disk space when free extents are insufficient.
+# Args: step_label ubuntu_vg root_dev required_lv_mib [safety_buffer_mib]
+ensure_ubuntu_vg_free_space() {
+  local step_label="$1"
+  local ubuntu_vg="$2"
+  local root_dev="$3"
+  local required_lv_mib="$4"
+  local safety_buffer_mib="${5:-1024}"
+
+  local vg_free_mib
+  vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
+    | awk 'NF {print int($1); exit}')
+  [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+
+  if [[ "${vg_free_mib}" -ge "${required_lv_mib}" ]]; then
+    return 0
+  fi
+
+  log "[${step_label}] ${ubuntu_vg} free space is insufficient (${vg_free_mib}MiB < ${required_lv_mib}MiB). Expanding VG from OS disk free area."
+
+  local root_pv os_disk_base os_disk
+  root_pv=$(sudo lvs --noheadings -o devices "${root_dev}" 2>/dev/null \
+    | awk -F'[(), ]+' 'NF {print $1; exit}')
+  if [[ -z "${root_pv}" ]]; then
+    root_pv=$(sudo pvs --noheadings -o pv_name --select "vg_name=${ubuntu_vg}" 2>/dev/null \
+      | awk 'NF {print $1; exit}')
+  fi
+  if [[ -z "${root_pv}" ]]; then
+    log "[ERROR] Failed to detect root PV for ${ubuntu_vg}. Cannot continue safely."
+    return 1
+  fi
+
+  os_disk_base=$(lsblk -no PKNAME "${root_pv}" 2>/dev/null | awk 'NF {print $1; exit}')
+  if [[ -z "${os_disk_base}" ]]; then
+    os_disk_base=$(basename "${root_pv}")
+  fi
+  os_disk="/dev/${os_disk_base}"
+
+  if [[ ! -b "${os_disk}" ]]; then
+    log "[ERROR] Detected OS disk is invalid: ${os_disk}. Aborting."
+    return 1
+  fi
+
+  local required_partition_mib free_segment_info free_mib free_start_mib free_end_mib
+  required_partition_mib=$((required_lv_mib + safety_buffer_mib))
+
+  free_segment_info=$(sudo parted -m "${os_disk}" unit MiB print free 2>/dev/null \
+    | awk -F: '$1 ~ /^[0-9]+$/ && $NF ~ /free;$/ {
+                 gsub("MiB","",$2); gsub("MiB","",$3); gsub("MiB","",$4);
+                 size=int($4); start=int($2); end=int($3);
+                 if (size > max) {max=size; max_start=start; max_end=end}
+               }
+               END {
+                 if (max > 0) printf "%d %d %d\n", max, max_start, max_end;
+               }')
+  free_mib=$(awk '{print $1}' <<< "${free_segment_info}")
+  free_start_mib=$(awk '{print $2}' <<< "${free_segment_info}")
+  free_end_mib=$(awk '{print $3}' <<< "${free_segment_info}")
+
+  if [[ -z "${free_mib}" || -z "${free_start_mib}" || -z "${free_end_mib}" ]]; then
+    log "[ERROR] Could not determine free segment on ${os_disk}. Aborting."
+    return 1
+  fi
+  if [[ "${free_mib}" -lt "${required_partition_mib}" ]]; then
+    log "[ERROR] Insufficient unallocated space on ${os_disk}: required=${required_partition_mib}MiB, available=${free_mib}MiB."
+    return 1
+  fi
+
+  local new_part_end_mib
+  new_part_end_mib=$((free_start_mib + required_partition_mib - 1))
+  if [[ "${new_part_end_mib}" -gt "${free_end_mib}" ]]; then
+    log "[ERROR] Computed partition end exceeds free segment boundary on ${os_disk}. Aborting."
+    return 1
+  fi
+
+  local before_parts after_parts new_os_pv_partition
+  before_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+
+  run_cmd "sudo parted -s ${os_disk} -- mkpart primary ${free_start_mib}MiB ${new_part_end_mib}MiB"
+  run_cmd "sudo partprobe ${os_disk}"
+  run_cmd "sudo udevadm settle"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    new_os_pv_partition="${os_disk}<new-partition>"
+  else
+    local _wait_try
+    for _wait_try in {1..20}; do
+      after_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+      new_os_pv_partition=$(comm -13 <(printf '%s\n' "${before_parts}") <(printf '%s\n' "${after_parts}") | awk 'NF {print $1; exit}')
+      if [[ -n "${new_os_pv_partition}" && -b "${new_os_pv_partition}" ]]; then
+        break
+      fi
+      sleep 0.3
+    done
+    if [[ -z "${new_os_pv_partition}" || ! -b "${new_os_pv_partition}" ]]; then
+      log "[ERROR] Failed to detect newly created partition on ${os_disk}. Aborting."
+      return 1
+    fi
+  fi
+
+  log "[${step_label}] New OS-disk partition detected: ${new_os_pv_partition}"
+  run_cmd "sudo pvcreate ${new_os_pv_partition}"
+  run_cmd "sudo vgextend ${ubuntu_vg} ${new_os_pv_partition}"
+
+  vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${ubuntu_vg}" 2>/dev/null \
+    | awk 'NF {print int($1); exit}')
+  [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+  if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
+    log "[ERROR] ${ubuntu_vg} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
+    return 1
+  fi
+
+  log "[${step_label}] ${ubuntu_vg} successfully expanded (free=${vg_free_mib}MiB)."
+  return 0
+}
+
 append_fstab_if_missing() {
   local line="$1"
   local mount_point="$2"
@@ -4680,6 +4796,17 @@ step_07_lvm_storage() {
   #######################################
   log "[STEP 07] Create AIO Root LV (${UBUNTU_VG}/${AIO_ROOT_LV})"
 
+  local required_lv_mib=0
+  if ! lvs "${UBUNTU_VG}/${AIO_ROOT_LV}" >/dev/null 2>&1; then
+    required_lv_mib=$((545 * 1024))
+  fi
+
+  if [[ "${required_lv_mib}" -gt 0 ]]; then
+    if ! ensure_ubuntu_vg_free_space "STEP 07" "${UBUNTU_VG}" "${root_dev}" "${required_lv_mib}" $((10 * 1024)); then
+      return 1
+    fi
+  fi
+
   if lvs "${UBUNTU_VG}/${AIO_ROOT_LV}" >/dev/null 2>&1; then
     log "LV ${UBUNTU_VG}/${AIO_ROOT_LV} already exists → skip create"
   else
@@ -5719,12 +5846,24 @@ step_10_sensor_lv_download() {
   SENSOR_VM_COUNT=1  # Fixed to 1 for single mds deployment
   save_config_var "SENSOR_VM_COUNT" "${SENSOR_VM_COUNT}"
 
+  local root_dev
+  root_dev=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+  local UBUNTU_VG
+  UBUNTU_VG=$(sudo lvs --noheadings -o vg_name "${root_dev}" 2>/dev/null | awk '{print $1}')
+  if [[ -z "${UBUNTU_VG}" ]]; then
+    UBUNTU_VG="${LV_LOCATION:-ubuntu-vg}"
+    log "[WARN] Could not detect OS VG from root device; fallback to ${UBUNTU_VG}"
+  else
+    log "[STEP 10] Detected OS VG: ${UBUNTU_VG} (root=${root_dev})"
+    LV_LOCATION="${UBUNTU_VG}"
+  fi
+
   #######################################
   # Prompt for Sensor LV size configuration
   #######################################
   # Check ubuntu-vg free space (accurate available space)
   local ubuntu_vg_free_size
-  ubuntu_vg_free_size=$(vgs ubuntu-vg --noheadings --units g --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
+  ubuntu_vg_free_size=$(vgs "${UBUNTU_VG}" --noheadings --units g --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
   local available_gb=${ubuntu_vg_free_size%.*}
   [[ ${available_gb} -lt 0 ]] && available_gb=0
   
@@ -5735,7 +5874,7 @@ step_10_sensor_lv_download() {
   local lv_size_gb
   while true; do
     lv_size_gb=$(whiptail_inputbox "STEP 10 - Sensor (MDS) Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ubuntu-vg (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
                          "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
                          18 80) || {
       log "User canceled sensor storage size configuration."
@@ -5778,7 +5917,6 @@ step_10_sensor_lv_download() {
   local lv_exists_mds="no"
   local mounted_mds="no"
 
-  local UBUNTU_VG="ubuntu-vg"
   local LV_MDS="lv_sensor_root_mds"
 
   local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
@@ -5835,25 +5973,17 @@ step_10_sensor_lv_download() {
   # 1) LV create (mds single) - OpenXDR method (ubuntu-vg)
   #######################################
   if [[ "${skip_lv_creation}" == "no" ]]; then
-    # Re-check free space right before lvcreate (avoid race or stale info)
-    local available_mb available_mb_int required_mb
-    available_mb=$(vgs "${UBUNTU_VG}" --noheadings --units m --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
-    available_mb_int="${available_mb%.*}"
-    required_mb=$((SENSOR_LV_SIZE_GB_PER_VM * 1024))
-    if [[ "${available_mb_int}" -lt "${required_mb}" ]]; then
-      local available_gb_now
-      available_gb_now=$((available_mb_int / 1024))
-      whiptail_msgbox "STEP 10 - Insufficient VG Space" "Not enough free space in ${UBUNTU_VG}.\n\n- Required: ${SENSOR_LV_SIZE_GB_PER_VM}GB\n- Available: ${available_gb_now}GB\n\nReduce the LV size or free space in ${UBUNTU_VG} and retry." 12 80
-      log "[STEP 10] Insufficient VG space: required=${SENSOR_LV_SIZE_GB_PER_VM}GB, available=${available_gb_now}GB"
-      return 1
-    fi
-
-    log "[STEP 07] Start creating/mounting LV for mds (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
+    log "[STEP 10] Start creating/mounting LV for mds (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
 
     # mds LV
     if lvs "${lv_path_mds}" >/dev/null 2>&1; then
-      log "[STEP 07] LV ${lv_path_mds} already exists → skip creation"
+      log "[STEP 10] LV ${lv_path_mds} already exists → skip creation"
     else
+      local required_lv_mib
+      required_lv_mib=$((SENSOR_LV_SIZE_GB_PER_VM * 1024))
+      if ! ensure_ubuntu_vg_free_space "STEP 10" "${UBUNTU_VG}" "${root_dev}" "${required_lv_mib}" 1024; then
+        return 1
+      fi
       run_cmd "sudo lvcreate -L ${SENSOR_LV_SIZE_GB_PER_VM}G -n ${LV_MDS} ${UBUNTU_VG}"
       run_cmd "sudo mkfs.ext4 -F /dev/${lv_path_mds}"
     fi

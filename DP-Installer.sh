@@ -54,6 +54,7 @@ STEP_IDS=(
   "11_da_master_deploy"
   "12_sriov_cpu_affinity"
   "13_install_dp_cli"
+  "14_configure_nfs_backup"
 )
 
 # STEP display names (shown in UI)
@@ -71,6 +72,7 @@ STEP_NAMES=(
   "Deploy DA-master VM"
   "SR-IOV / CPU Affinity / PCI Passthrough"
   "Install DP Appliance CLI package"
+  "Configure NFS backup server (DP configuration backup only)"
 )
 
 NUM_STEPS=${#STEP_IDS[@]}
@@ -601,6 +603,20 @@ load_config() {
 
   # Ensure NIC / disk selections are always defined
   : "${MGT_NIC:=}"
+  : "${MGT_REDUNDANCY_MODE:=single}"
+  : "${MGT_ACTIVE_NIC:=}"
+  : "${MGT_PASSIVE_NIC:=}"
+  : "${MGT_ACTIVE_NIC_PCI:=}"
+  : "${MGT_ACTIVE_NIC_MAC:=}"
+  : "${MGT_PASSIVE_NIC_PCI:=}"
+  : "${MGT_PASSIVE_NIC_MAC:=}"
+  : "${MGT_ACTIVE_NIC_SELECTED:=}"
+  : "${MGT_PASSIVE_NIC_SELECTED:=}"
+  : "${MGT_ACTIVE_NIC_EFFECTIVE:=}"
+  : "${MGT_PASSIVE_NIC_EFFECTIVE:=}"
+  : "${MGT_BOND_NAME:=mgt}"
+  : "${MGT_BOND_PRIMARY_NAME:=mgtpri}"
+  : "${MGT_BOND_BACKUP_NAME:=mgtbak}"
   : "${CLTR0_NIC:=}"
   : "${HOST_NIC:=}"
   : "${DATA_SSD_LIST:=}"
@@ -658,6 +674,12 @@ load_config() {
   : "${DA_VCPUS:=46}"
   : "${DA_MEMORY_GB:=80}"
   : "${DA_DISK_GB:=500}"
+
+  # NFS backup (STEP 14) — DP configuration backup only
+  : "${NFS_BACKUP_EXPORT_DIR:=/stellarcyber}"
+  : "${NFS_BACKUP_ALLOWED_CLIENT:=192.168.122.2}"
+  : "${NFS_BACKUP_ALLOWED_CLIENT_CIDR:=192.168.122.2/24}"
+  : "${NFS_BACKUP_CLIENT_MODE:=single}"
 }
 
 
@@ -680,6 +702,15 @@ save_config() {
   esc_data_ssd=${DATA_SSD_LIST//\"/\\\"}
   esc_cluster_nic_type=${CLUSTER_NIC_TYPE//\"/\\\"}
   esc_cluster_bridge_name=${CLUSTER_BRIDGE_NAME//\"/\\\"}
+  local esc_mgt_redundancy_mode esc_mgt_active_nic esc_mgt_passive_nic
+  esc_mgt_redundancy_mode=${MGT_REDUNDANCY_MODE//\"/\\\"}
+  esc_mgt_active_nic=${MGT_ACTIVE_NIC//\"/\\\"}
+  esc_mgt_passive_nic=${MGT_PASSIVE_NIC//\"/\\\"}
+  local esc_nfs_export_dir esc_nfs_allowed_client esc_nfs_allowed_cidr esc_nfs_client_mode
+  esc_nfs_export_dir=${NFS_BACKUP_EXPORT_DIR//\"/\\\"}
+  esc_nfs_allowed_client=${NFS_BACKUP_ALLOWED_CLIENT//\"/\\\"}
+  esc_nfs_allowed_cidr=${NFS_BACKUP_ALLOWED_CLIENT_CIDR//\"/\\\"}
+  esc_nfs_client_mode=${NFS_BACKUP_CLIENT_MODE//\"/\\\"}
 
   # VM configuration values (set defaults if not already set)
   : "${DL_VCPUS:=42}"
@@ -688,6 +719,16 @@ save_config() {
   : "${DA_VCPUS:=46}"
   : "${DA_MEMORY_GB:=80}"
   : "${DA_DISK_GB:=500}"
+
+  : "${NFS_BACKUP_EXPORT_DIR:=/stellarcyber}"
+  : "${NFS_BACKUP_ALLOWED_CLIENT:=192.168.122.2}"
+  : "${NFS_BACKUP_ALLOWED_CLIENT_CIDR:=192.168.122.2/24}"
+  : "${NFS_BACKUP_CLIENT_MODE:=single}"
+
+  : "${MGT_REDUNDANCY_MODE:=single}"
+  : "${MGT_BOND_NAME:=mgt}"
+  : "${MGT_BOND_PRIMARY_NAME:=mgtpri}"
+  : "${MGT_BOND_BACKUP_NAME:=mgtbak}"
 
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer configuration (auto-generated)
@@ -701,6 +742,20 @@ AUTO_REBOOT_AFTER_STEP_ID="${AUTO_REBOOT_AFTER_STEP_ID}"
 
 # NIC / disk selected in STEP 01
 MGT_NIC="${esc_mgt_nic}"
+MGT_REDUNDANCY_MODE="${esc_mgt_redundancy_mode}"
+MGT_ACTIVE_NIC="${esc_mgt_active_nic}"
+MGT_PASSIVE_NIC="${esc_mgt_passive_nic}"
+MGT_ACTIVE_NIC_PCI="${MGT_ACTIVE_NIC_PCI//\"/\\\"}"
+MGT_PASSIVE_NIC_PCI="${MGT_PASSIVE_NIC_PCI//\"/\\\"}"
+MGT_ACTIVE_NIC_MAC="${MGT_ACTIVE_NIC_MAC//\"/\\\"}"
+MGT_PASSIVE_NIC_MAC="${MGT_PASSIVE_NIC_MAC//\"/\\\"}"
+MGT_ACTIVE_NIC_SELECTED="${MGT_ACTIVE_NIC_SELECTED//\"/\\\"}"
+MGT_PASSIVE_NIC_SELECTED="${MGT_PASSIVE_NIC_SELECTED//\"/\\\"}"
+MGT_ACTIVE_NIC_EFFECTIVE="${MGT_ACTIVE_NIC_EFFECTIVE//\"/\\\"}"
+MGT_PASSIVE_NIC_EFFECTIVE="${MGT_PASSIVE_NIC_EFFECTIVE//\"/\\\"}"
+MGT_BOND_NAME="${MGT_BOND_NAME//\"/\\\"}"
+MGT_BOND_PRIMARY_NAME="${MGT_BOND_PRIMARY_NAME//\"/\\\"}"
+MGT_BOND_BACKUP_NAME="${MGT_BOND_BACKUP_NAME//\"/\\\"}"
 CLTR0_NIC="${esc_cltr0_nic}"
 HOST_NIC="${esc_host_nic}"
 DATA_SSD_LIST="${esc_data_ssd}"
@@ -754,6 +809,12 @@ DL_DISK_GB=${DL_DISK_GB}
 DA_VCPUS=${DA_VCPUS}
 DA_MEMORY_GB=${DA_MEMORY_GB}
 DA_DISK_GB=${DA_DISK_GB}
+
+# NFS backup (STEP 14)
+NFS_BACKUP_EXPORT_DIR="${esc_nfs_export_dir}"
+NFS_BACKUP_ALLOWED_CLIENT="${esc_nfs_allowed_client}"
+NFS_BACKUP_ALLOWED_CLIENT_CIDR="${esc_nfs_allowed_cidr}"
+NFS_BACKUP_CLIENT_MODE="${esc_nfs_client_mode}"
 EOF
 }
 
@@ -775,6 +836,20 @@ save_config_var() {
 
     # Add additional keys here
     MGT_NIC)        MGT_NIC="${value}" ;;
+    MGT_REDUNDANCY_MODE) MGT_REDUNDANCY_MODE="${value}" ;;
+    MGT_ACTIVE_NIC) MGT_ACTIVE_NIC="${value}" ;;
+    MGT_PASSIVE_NIC) MGT_PASSIVE_NIC="${value}" ;;
+    MGT_ACTIVE_NIC_PCI) MGT_ACTIVE_NIC_PCI="${value}" ;;
+    MGT_PASSIVE_NIC_PCI) MGT_PASSIVE_NIC_PCI="${value}" ;;
+    MGT_ACTIVE_NIC_MAC) MGT_ACTIVE_NIC_MAC="${value}" ;;
+    MGT_PASSIVE_NIC_MAC) MGT_PASSIVE_NIC_MAC="${value}" ;;
+    MGT_ACTIVE_NIC_SELECTED) MGT_ACTIVE_NIC_SELECTED="${value}" ;;
+    MGT_PASSIVE_NIC_SELECTED) MGT_PASSIVE_NIC_SELECTED="${value}" ;;
+    MGT_ACTIVE_NIC_EFFECTIVE) MGT_ACTIVE_NIC_EFFECTIVE="${value}" ;;
+    MGT_PASSIVE_NIC_EFFECTIVE) MGT_PASSIVE_NIC_EFFECTIVE="${value}" ;;
+    MGT_BOND_NAME) MGT_BOND_NAME="${value}" ;;
+    MGT_BOND_PRIMARY_NAME) MGT_BOND_PRIMARY_NAME="${value}" ;;
+    MGT_BOND_BACKUP_NAME) MGT_BOND_BACKUP_NAME="${value}" ;;
     CLTR0_NIC)      CLTR0_NIC="${value}" ;;
     HOST_NIC)       HOST_NIC="${value}" ;;
     DATA_SSD_LIST)  DATA_SSD_LIST="${value}" ;;
@@ -838,6 +913,10 @@ save_config_var() {
     MGT_EFFECTIVE_IFNAME) ;; # Ignore, always "mgt"
     CLTR0_EFFECTIVE_IFNAME) ;; # Ignore, always "cltr0"
     HOST_EFFECTIVE_IFNAME) ;; # Ignore, always "hostmgmt"
+    NFS_BACKUP_EXPORT_DIR) NFS_BACKUP_EXPORT_DIR="${value}" ;;
+    NFS_BACKUP_ALLOWED_CLIENT) NFS_BACKUP_ALLOWED_CLIENT="${value}" ;;
+    NFS_BACKUP_ALLOWED_CLIENT_CIDR) NFS_BACKUP_ALLOWED_CLIENT_CIDR="${value}" ;;
+    NFS_BACKUP_CLIENT_MODE) NFS_BACKUP_CLIENT_MODE="${value}" ;;
     *)
       # Ignore unknown keys for now (extend here if needed)
       ;;
@@ -1131,6 +1210,18 @@ LAST_RUN_TIME="$(date '+%F %T')"
 
 # NIC identity and effective names (updated after STEP 01/03)
 MGT_NIC="${MGT_NIC}"
+MGT_REDUNDANCY_MODE="${MGT_REDUNDANCY_MODE:-single}"
+MGT_ACTIVE_NIC="${MGT_ACTIVE_NIC:-}"
+MGT_PASSIVE_NIC="${MGT_PASSIVE_NIC:-}"
+MGT_ACTIVE_NIC_PCI="${MGT_ACTIVE_NIC_PCI:-}"
+MGT_ACTIVE_NIC_MAC="${MGT_ACTIVE_NIC_MAC:-}"
+MGT_PASSIVE_NIC_PCI="${MGT_PASSIVE_NIC_PCI:-}"
+MGT_PASSIVE_NIC_MAC="${MGT_PASSIVE_NIC_MAC:-}"
+MGT_ACTIVE_NIC_EFFECTIVE="${MGT_ACTIVE_NIC_EFFECTIVE:-}"
+MGT_PASSIVE_NIC_EFFECTIVE="${MGT_PASSIVE_NIC_EFFECTIVE:-}"
+MGT_BOND_NAME="${MGT_BOND_NAME:-mgt}"
+MGT_BOND_PRIMARY_NAME="${MGT_BOND_PRIMARY_NAME:-mgtpri}"
+MGT_BOND_BACKUP_NAME="${MGT_BOND_BACKUP_NAME:-mgtbak}"
 CLTR0_NIC="${CLTR0_NIC}"
 HOST_NIC="${HOST_NIC}"
 MGT_NIC_PCI="${MGT_NIC_PCI}"
@@ -1263,6 +1354,9 @@ run_step() {
       ;;
     "13_install_dp_cli")
       step_13_install_dp_cli || rc=$?
+      ;;
+    "14_configure_nfs_backup")
+      step_14_configure_nfs_backup || rc=$?
       ;;
     *)
       log "ERROR: Undefined STEP ID: ${step_id}"
@@ -1908,6 +2002,8 @@ check_unique_identities() {
   local cltr0_mac="$4"
   local host_pci="$5"
   local host_mac="$6"
+  local mgt_bak_pci="${7:-}"
+  local mgt_bak_mac="${8:-}"
   
   # Normalize all values
   if [[ -n "$mgt_pci" ]]; then
@@ -1919,6 +2015,9 @@ check_unique_identities() {
   if [[ -n "$host_pci" ]]; then
     host_pci="$(normalize_pci "$host_pci")"
   fi
+  if [[ -n "$mgt_bak_pci" ]]; then
+    mgt_bak_pci="$(normalize_pci "$mgt_bak_pci")"
+  fi
   if [[ -n "$mgt_mac" ]]; then
     mgt_mac="$(normalize_mac "$mgt_mac")"
   fi
@@ -1927,6 +2026,9 @@ check_unique_identities() {
   fi
   if [[ -n "$host_mac" ]]; then
     host_mac="$(normalize_mac "$host_mac")"
+  fi
+  if [[ -n "$mgt_bak_mac" ]]; then
+    mgt_bak_mac="$(normalize_mac "$mgt_bak_mac")"
   fi
   
   # Check PCI duplicates (if PCI is available)
@@ -1941,6 +2043,22 @@ check_unique_identities() {
   if [[ -n "$cltr0_pci" && -n "$host_pci" && "$cltr0_pci" == "$host_pci" ]]; then
     log "[ERROR] Duplicate identity: cltr0 and hostmgmt share the same PCI: ${cltr0_pci}"
     return 1
+  fi
+
+  # Management bond backup slave (active-passive): must differ from mgt primary, cltr0, host
+  if [[ -n "$mgt_bak_pci" ]]; then
+    if [[ -n "$mgt_pci" && "$mgt_bak_pci" == "$mgt_pci" ]]; then
+      log "[ERROR] Duplicate identity: mgt primary and backup share the same PCI: ${mgt_pci}"
+      return 1
+    fi
+    if [[ -n "$cltr0_pci" && "$mgt_bak_pci" == "$cltr0_pci" ]]; then
+      log "[ERROR] Duplicate identity: mgt backup and cltr0 share the same PCI: ${mgt_bak_pci}"
+      return 1
+    fi
+    if [[ -n "$host_pci" && "$mgt_bak_pci" == "$host_pci" ]]; then
+      log "[ERROR] Duplicate identity: mgt backup and hostmgmt share the same PCI: ${mgt_bak_pci}"
+      return 1
+    fi
   fi
   
   # Check MAC duplicates (if PCI is not available, use MAC)
@@ -1959,6 +2077,21 @@ check_unique_identities() {
   if [[ -z "$cltr0_pci" && -z "$host_pci" ]]; then
     if [[ -n "$cltr0_mac" && -n "$host_mac" && "$cltr0_mac" == "$host_mac" ]]; then
       log "[ERROR] Duplicate identity: cltr0 and hostmgmt share the same MAC: ${cltr0_mac}"
+      return 1
+    fi
+  fi
+
+  if [[ -n "$mgt_bak_mac" ]]; then
+    if [[ -z "$mgt_pci" && -z "$cltr0_pci" && -n "$mgt_mac" && -n "$cltr0_mac" && "$mgt_bak_mac" == "$cltr0_mac" ]]; then
+      log "[ERROR] Duplicate identity: mgt backup and cltr0 share the same MAC: ${mgt_bak_mac}"
+      return 1
+    fi
+    if [[ -z "$mgt_pci" && -z "$host_pci" && -n "$mgt_mac" && -n "$host_mac" && "$mgt_bak_mac" == "$host_mac" ]]; then
+      log "[ERROR] Duplicate identity: mgt backup and hostmgmt share the same MAC: ${mgt_bak_mac}"
+      return 1
+    fi
+    if [[ -n "$mgt_mac" && "$mgt_bak_mac" == "$mgt_mac" ]]; then
+      log "[ERROR] Duplicate identity: mgt primary and backup share the same MAC: ${mgt_mac}"
       return 1
     fi
   fi
@@ -1999,9 +2132,17 @@ step_01_hw_detect() {
 
   # Set defaults to avoid set -u issues (empty when undefined)
   : "${MGT_NIC:=}"
+  : "${MGT_REDUNDANCY_MODE:=single}"
+  : "${MGT_ACTIVE_NIC:=}"
+  : "${MGT_PASSIVE_NIC:=}"
   : "${CLTR0_NIC:=}"
   : "${HOST_NIC:=}"
   : "${DATA_SSD_LIST:=}"
+
+  local mgt_mode="${MGT_REDUNDANCY_MODE:-single}"
+  if [[ "${mgt_mode}" != "single" && "${mgt_mode}" != "active-passive" ]]; then
+    mgt_mode="single"
+  fi
 
   ########################
   # 0) Reuse existing selections?
@@ -2011,23 +2152,35 @@ step_01_hw_detect() {
   cltr0_display="${CLTR0_NIC_EFFECTIVE:-${CLTR0_NIC}}"
   host_display="${HOST_NIC_EFFECTIVE:-${HOST_NIC}}"
 
-  if [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
-    # Temporarily disable set -e to handle cancel gracefully
+  if [[ "${mgt_mode}" == "single" ]] && \
+     [[ -n "${MGT_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
     set +e
-    whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_NIC: ${mgt_display}\n- CLTR0_NIC: ${cltr0_display}\n- HOST_NIC: ${host_display}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
+    whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_REDUNDANCY_MODE: ${mgt_mode}\n- MGT_NIC: ${mgt_display}\n- CLTR0_NIC: ${cltr0_display}\n- HOST_NIC: ${host_display}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
     local reuse_rc=$?
     set -e
     
     if [[ ${reuse_rc} -eq 0 ]]; then
       log "User chose to reuse existing STEP 01 selections (skip STEP 01)."
-
-      # Ensure config is updated even when reusing
       save_config_var "MGT_NIC"       "${MGT_NIC}"
       save_config_var "CLTR0_NIC"     "${CLTR0_NIC}"
       save_config_var "HOST_NIC"      "${HOST_NIC}"
       save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
-
-      # Reuse counts as success with no further work → return 0
+      return 0
+    fi
+  elif [[ "${mgt_mode}" == "active-passive" ]] && \
+       [[ -n "${MGT_ACTIVE_NIC}" && -n "${MGT_PASSIVE_NIC}" && -n "${CLTR0_NIC}" && -n "${HOST_NIC}" && -n "${DATA_SSD_LIST}" ]]; then
+    set +e
+    whiptail_yesno "STEP 01 - Reuse previous selections" "The following values are already set:\n\n- MGT_REDUNDANCY_MODE: active-passive\n- Logical mgt: mgt (bond)\n- MGT active NIC:  ${MGT_ACTIVE_NIC}\n- MGT passive NIC: ${MGT_PASSIVE_NIC}\n- CLTR0_NIC: ${cltr0_display}\n- HOST_NIC: ${host_display}\n- DATA_SSD_LIST: ${DATA_SSD_LIST}\n\nReuse these and skip STEP 01?\n\n(Choose No to re-select NICs/disks.)"
+    local reuse_rc=$?
+    set -e
+    if [[ ${reuse_rc} -eq 0 ]]; then
+      log "User chose to reuse existing STEP 01 selections (skip STEP 01)."
+      save_config_var "MGT_NIC"       "${MGT_NIC:-mgt}"
+      save_config_var "MGT_ACTIVE_NIC" "${MGT_ACTIVE_NIC}"
+      save_config_var "MGT_PASSIVE_NIC" "${MGT_PASSIVE_NIC}"
+      save_config_var "CLTR0_NIC"     "${CLTR0_NIC}"
+      save_config_var "HOST_NIC"      "${HOST_NIC}"
+      save_config_var "DATA_SSD_LIST" "${DATA_SSD_LIST}"
       return 0
     fi
   fi
@@ -2086,39 +2239,91 @@ step_01_hw_detect() {
   done <<< "${nics}"
 
   ########################
-  # 2) Select mgt NIC
+  # 2) Select mgt NIC(s)
   ########################
-  local mgt_nic
+  local mgt_nic=""
+  local mgt_nic_active=""
+  local mgt_nic_passive=""
   # Calculate menu size dynamically based on terminal size and number of NICs
   local menu_dims
   menu_dims=$(calc_menu_size $((idx)) 90 8)
   local menu_height menu_width menu_list_height
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
-  # Center-align the menu message based on terminal height
-  local msg_content="Choose the management (mgt) NIC.\nThis is the external uplink for VM management traffic (NAT/bridge side).\nDo NOT select the hostmgmt NIC here.\nCurrent: ${mgt_display:-<none>}\n"
-  local centered_msg
-  centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
-  
-  mgt_nic=$(whiptail --title "STEP 01 - Select mgt NIC" \
-                     --menu "${centered_msg}" \
-                     "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                     "${nic_list[@]}" \
-                     3>&1 1>&2 2>&3) || {
-    log "User canceled mgt NIC selection."
-    return 1
-  }
-
-  log "Selected mgt NIC: ${mgt_nic}"
-  MGT_NIC="${mgt_nic}"
-  save_config_var "MGT_NIC" "${MGT_NIC}"   ### Change 2: assign to variable before saving
-  # Save stable identity for mgt NIC (PCI/MAC - hardware identifiers)
-  save_config_var "MGT_NIC_SELECTED" "${mgt_nic}"
-  save_config_var "MGT_NIC_PCI" "$(get_if_pci "${mgt_nic}")"
-  save_config_var "MGT_NIC_MAC" "$(get_if_mac "${mgt_nic}")"
-  # Compatibility
-  save_config_var "MGT_PCI" "$(get_if_pci "${mgt_nic}")"
-  save_config_var "MGT_MAC" "$(get_if_mac "${mgt_nic}")"
+  if [[ "${mgt_mode}" == "single" ]]; then
+    local msg_content="Choose the management (mgt) NIC.\nThis is the external uplink for VM management traffic (NAT/bridge side).\nDo NOT select the hostmgmt NIC here.\nCurrent: ${mgt_display:-<none>}\n"
+    local centered_msg
+    centered_msg=$(center_menu_message "${msg_content}" "${menu_height}")
+    mgt_nic=$(whiptail --title "STEP 01 - Select mgt NIC" \
+                       --menu "${centered_msg}" \
+                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                       "${nic_list[@]}" \
+                       3>&1 1>&2 2>&3) || {
+      log "User canceled mgt NIC selection."
+      return 1
+    }
+    log "Selected mgt NIC: ${mgt_nic}"
+    MGT_NIC="${mgt_nic}"
+    save_config_var "MGT_NIC" "${MGT_NIC}"
+    save_config_var "MGT_NIC_SELECTED" "${mgt_nic}"
+    save_config_var "MGT_NIC_PCI" "$(get_if_pci "${mgt_nic}")"
+    save_config_var "MGT_NIC_MAC" "$(get_if_mac "${mgt_nic}")"
+    save_config_var "MGT_PCI" "$(get_if_pci "${mgt_nic}")"
+    save_config_var "MGT_MAC" "$(get_if_mac "${mgt_nic}")"
+    save_config_var "MGT_ACTIVE_NIC" ""
+    save_config_var "MGT_PASSIVE_NIC" ""
+    save_config_var "MGT_ACTIVE_NIC_SELECTED" ""
+    save_config_var "MGT_PASSIVE_NIC_SELECTED" ""
+    save_config_var "MGT_ACTIVE_NIC_PCI" ""
+    save_config_var "MGT_ACTIVE_NIC_MAC" ""
+    save_config_var "MGT_PASSIVE_NIC_PCI" ""
+    save_config_var "MGT_PASSIVE_NIC_MAC" ""
+  else
+    local msg_a msg_b centered_a centered_b
+    msg_a="Choose the preferred active management NIC (mgtpri).\nIt becomes the primary bond slave (${MGT_BOND_PRIMARY_NAME:-mgtpri}) after STEP 03.\nCurrent: ${MGT_ACTIVE_NIC:-<none>}\n"
+    centered_a=$(center_menu_message "${msg_a}" "${menu_height}")
+    mgt_nic_active=$(whiptail --title "STEP 01 - Select mgt active NIC (primary)" \
+                       --menu "${centered_a}" \
+                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                       "${nic_list[@]}" \
+                       3>&1 1>&2 2>&3) || {
+      log "User canceled mgt active NIC selection."
+      return 1
+    }
+    msg_b="Choose the backup management NIC (mgtbak).\nFailover slave for the mgt bond.\nMust differ from active: ${mgt_nic_active}\nCurrent: ${MGT_PASSIVE_NIC:-<none>}\n"
+    centered_b=$(center_menu_message "${msg_b}" "${menu_height}")
+    mgt_nic_passive=$(whiptail --title "STEP 01 - Select mgt passive NIC (backup)" \
+                       --menu "${centered_b}" \
+                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
+                       "${nic_list[@]}" \
+                       3>&1 1>&2 2>&3) || {
+      log "User canceled mgt passive NIC selection."
+      return 1
+    }
+    if [[ "${mgt_nic_active}" == "${mgt_nic_passive}" ]]; then
+      whiptail_msgbox "Error" "Active and passive management NICs must be different.\n\n- active : ${mgt_nic_active}\n- passive: ${mgt_nic_passive}" 12 80
+      log "MGT active/passive duplicate selection"
+      return 1
+    fi
+    MGT_NIC="mgt"
+    MGT_ACTIVE_NIC="${mgt_nic_active}"
+    MGT_PASSIVE_NIC="${mgt_nic_passive}"
+    save_config_var "MGT_NIC" "mgt"
+    save_config_var "MGT_ACTIVE_NIC" "${MGT_ACTIVE_NIC}"
+    save_config_var "MGT_PASSIVE_NIC" "${MGT_PASSIVE_NIC}"
+    save_config_var "MGT_ACTIVE_NIC_SELECTED" "${mgt_nic_active}"
+    save_config_var "MGT_PASSIVE_NIC_SELECTED" "${mgt_nic_passive}"
+    save_config_var "MGT_ACTIVE_NIC_PCI" "$(get_if_pci "${mgt_nic_active}")"
+    save_config_var "MGT_ACTIVE_NIC_MAC" "$(get_if_mac "${mgt_nic_active}")"
+    save_config_var "MGT_PASSIVE_NIC_PCI" "$(get_if_pci "${mgt_nic_passive}")"
+    save_config_var "MGT_PASSIVE_NIC_MAC" "$(get_if_mac "${mgt_nic_passive}")"
+    save_config_var "MGT_NIC_PCI" "$(get_if_pci "${mgt_nic_active}")"
+    save_config_var "MGT_NIC_MAC" "$(get_if_mac "${mgt_nic_active}")"
+    save_config_var "MGT_NIC_SELECTED" "${mgt_nic_active}"
+    save_config_var "MGT_PCI" "$(get_if_pci "${mgt_nic_active}")"
+    save_config_var "MGT_MAC" "$(get_if_mac "${mgt_nic_active}")"
+    log "Selected mgt bond: active=${mgt_nic_active} passive=${mgt_nic_passive} (logical mgt)"
+  fi
 
   ########################
   # 3) Select HOST access NIC (for direct KVM host access only)
@@ -2143,10 +2348,18 @@ step_01_hw_detect() {
   }
 
   # Prevent duplicates (same NIC as mgt/cltr0 is not allowed)
-  if [[ "${host_nic}" == "${MGT_NIC}" || "${host_nic}" == "${CLTR0_NIC}" ]]; then
-    whiptail_msgbox "Error" "HOST_NIC cannot be the same as MGT_NIC or CLTR0_NIC.\n\n- MGT_NIC : ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 12 80
-    log "HOST_NIC duplicate selection: ${host_nic}"
-    return 1
+  if [[ "${mgt_mode}" == "single" ]]; then
+    if [[ "${host_nic}" == "${MGT_NIC}" || "${host_nic}" == "${CLTR0_NIC}" ]]; then
+      whiptail_msgbox "Error" "HOST_NIC cannot be the same as MGT_NIC or CLTR0_NIC.\n\n- MGT_NIC : ${MGT_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 12 80
+      log "HOST_NIC duplicate selection: ${host_nic}"
+      return 1
+    fi
+  else
+    if [[ "${host_nic}" == "${MGT_ACTIVE_NIC}" || "${host_nic}" == "${MGT_PASSIVE_NIC}" || "${host_nic}" == "${CLTR0_NIC}" ]]; then
+      whiptail_msgbox "Error" "HOST_NIC cannot match mgt active/passive or CLTR0_NIC.\n\n- MGT active : ${MGT_ACTIVE_NIC}\n- MGT passive: ${MGT_PASSIVE_NIC}\n- CLTR0_NIC: ${CLTR0_NIC}\n- HOST_NIC : ${host_nic}" 14 80
+      log "HOST_NIC duplicate selection: ${host_nic}"
+      return 1
+    fi
   fi
 
   log "Selected HOST_NIC: ${host_nic}"
@@ -2189,16 +2402,22 @@ step_01_hw_detect() {
     return 1
   fi
 
-  if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
-    # Temporarily disable set -e to handle cancel gracefully
-    set +e
-    whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?"
-    local warn_rc=$?
-    set -e
-    
-    if [[ ${warn_rc} -ne 0 ]]; then
-      log "User canceled configuration with identical NICs."
-      return 2  # Return 2 to indicate cancellation
+  if [[ "${mgt_mode}" == "single" ]]; then
+    if [[ "${cltr0_nic}" == "${mgt_nic}" ]]; then
+      set +e
+      whiptail_yesno "Warning" "mgt NIC and cltr0 NIC are identical.\nThis is not recommended.\nContinue anyway?"
+      local warn_rc=$?
+      set -e
+      if [[ ${warn_rc} -ne 0 ]]; then
+        log "User canceled configuration with identical NICs."
+        return 2
+      fi
+    fi
+  else
+    if [[ "${cltr0_nic}" == "${MGT_ACTIVE_NIC}" || "${cltr0_nic}" == "${MGT_PASSIVE_NIC}" ]]; then
+      whiptail_msgbox "Error" "cltr0 NIC cannot be the same as mgt active or passive NIC.\n\n- MGT active : ${MGT_ACTIVE_NIC}\n- MGT passive: ${MGT_PASSIVE_NIC}\n- CLTR0_NIC: ${cltr0_nic}\n\nSelect a different NIC for cltr0." 14 80
+      log "CLTR0_NIC duplicates mgt bond member: ${cltr0_nic}"
+      return 1
     fi
   fi
 
@@ -2305,12 +2524,14 @@ step_01_hw_detect() {
   # 5) Show summary
   ########################
   local summary
-  summary=$(cat <<EOF
+  if [[ "${mgt_mode}" == "single" ]]; then
+    summary=$(cat <<EOF
 ═══════════════════════════════════════════════════════════
   STEP 01: Hardware Detection and Selection - Complete
 ═══════════════════════════════════════════════════════════
 
 ✅ SELECTED HARDWARE:
+  • MGT_REDUNDANCY_MODE:      ${mgt_mode}
   • Management NIC (mgt):     ${MGT_NIC}
   • Cluster NIC (cltr0):      ${CLTR0_NIC}
   • Host access NIC:          ${HOST_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
@@ -2330,6 +2551,36 @@ step_01_hw_detect() {
   • Proceed to STEP 02 (HWE Kernel Installation)
 EOF
 )
+  else
+    summary=$(cat <<EOF
+═══════════════════════════════════════════════════════════
+  STEP 01: Hardware Detection and Selection - Complete
+═══════════════════════════════════════════════════════════
+
+✅ SELECTED HARDWARE:
+  • MGT_REDUNDANCY_MODE:      active-passive (Linux bonding active-backup)
+  • Logical management iface: mgt (bond master after STEP 03 / reboot)
+  • MGT active NIC (mgtpri):  ${MGT_ACTIVE_NIC}
+  • MGT passive NIC (mgtbak): ${MGT_PASSIVE_NIC}
+  • Cluster NIC (cltr0):      ${CLTR0_NIC}
+  • Host access NIC:          ${HOST_NIC} (will set 192.168.0.100/24, no gateway in STEP 03)
+  • Data disks (LVM):         ${DATA_SSD_LIST}
+
+📁 CONFIGURATION:
+  • Config file: ${CONFIG_FILE}
+  • Settings saved successfully
+
+💡 IMPORTANT NOTES:
+  • These selections will be used in subsequent steps
+  • STEP 03 will write bond + udev; reboot applies mgt/mgtpri/mgtbak
+  • STEP 07 will configure LVM using selected data disks
+  • To change selections, re-run STEP 01
+
+📝 NEXT STEPS:
+  • Proceed to STEP 02 (HWE Kernel Installation)
+EOF
+)
+  fi
 
   whiptail_msgbox "STEP 01 complete" "${summary}"
 
@@ -2562,15 +2813,41 @@ step_03_bridge_mode() {
   fi
 
   # Prevent selecting the same physical NIC for mgt and cluster (prefer identity compare)
-  if [[ -n "${MGT_NIC_PCI:-}" && -n "${CLTR0_NIC_PCI:-}" && "${MGT_NIC_PCI}" == "${CLTR0_NIC_PCI}" ]]; then
-    whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same physical NIC (same PCI).\n\nMGT PCI: ${MGT_NIC_PCI}\nCLTR0 PCI: ${CLTR0_NIC_PCI}\n\nPlease select different NICs in STEP 01." 14 80
-    log "[ERROR] Duplicate PCI selection: mgt and cltr0 are the same (${MGT_NIC_PCI})"
-    return 1
-  fi
-  if [[ -z "${MGT_NIC_PCI:-}" && -n "${desired_mgt_if}" && "${desired_mgt_if}" == "${desired_cltr0_if}" ]]; then
-    whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same interface.\n\nMGT: ${desired_mgt_if}\nCLTR0: ${desired_cltr0_if}\n\nPlease select different NICs in STEP 01." 12 75
-    log "[ERROR] Duplicate ifname selection: mgt=${desired_mgt_if} cltr0=${desired_cltr0_if}"
-    return 1
+  local br_mgt_mode="${MGT_REDUNDANCY_MODE:-single}"
+  if [[ "${br_mgt_mode}" == "active-passive" ]]; then
+    local br_pri br_bak
+    br_pri="$(resolve_ifname_by_identity "${MGT_ACTIVE_NIC_PCI:-}" "${MGT_ACTIVE_NIC_MAC:-}")"
+    br_bak="$(resolve_ifname_by_identity "${MGT_PASSIVE_NIC_PCI:-}" "${MGT_PASSIVE_NIC_MAC:-}")"
+    [[ -z "${br_pri}" ]] && br_pri="${MGT_ACTIVE_NIC:-}"
+    [[ -z "${br_bak}" ]] && br_bak="${MGT_PASSIVE_NIC:-}"
+    if [[ -n "${MGT_ACTIVE_NIC_PCI:-}" && -n "${CLTR0_NIC_PCI:-}" && "${MGT_ACTIVE_NIC_PCI}" == "${CLTR0_NIC_PCI}" ]]; then
+      whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and an mgt bond member cannot be the same physical NIC (same PCI).\n\nMGT active PCI: ${MGT_ACTIVE_NIC_PCI}\nCLTR0 PCI: ${CLTR0_NIC_PCI}\n\nPlease select different NICs in STEP 01." 14 80
+      log "[ERROR] Duplicate PCI: mgt active and cltr0"
+      return 1
+    fi
+    if [[ -n "${MGT_PASSIVE_NIC_PCI:-}" && -n "${CLTR0_NIC_PCI:-}" && "${MGT_PASSIVE_NIC_PCI}" == "${CLTR0_NIC_PCI}" ]]; then
+      whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and an mgt bond member cannot be the same physical NIC (same PCI).\n\nMGT passive PCI: ${MGT_PASSIVE_NIC_PCI}\nCLTR0 PCI: ${CLTR0_NIC_PCI}\n\nPlease select different NICs in STEP 01." 14 80
+      log "[ERROR] Duplicate PCI: mgt passive and cltr0"
+      return 1
+    fi
+    if [[ -z "${MGT_ACTIVE_NIC_PCI:-}" && -z "${MGT_PASSIVE_NIC_PCI:-}" ]]; then
+      if [[ "${desired_cltr0_if}" == "${br_pri}" || "${desired_cltr0_if}" == "${br_bak}" ]]; then
+        whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management bond member cannot be the same interface.\n\nCLTR0: ${desired_cltr0_if}\n\nPlease select different NICs in STEP 01." 12 75
+        log "[ERROR] Duplicate ifname: cltr0 vs mgt bond member"
+        return 1
+      fi
+    fi
+  else
+    if [[ -n "${MGT_NIC_PCI:-}" && -n "${CLTR0_NIC_PCI:-}" && "${MGT_NIC_PCI}" == "${CLTR0_NIC_PCI}" ]]; then
+      whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same physical NIC (same PCI).\n\nMGT PCI: ${MGT_NIC_PCI}\nCLTR0 PCI: ${CLTR0_NIC_PCI}\n\nPlease select different NICs in STEP 01." 14 80
+      log "[ERROR] Duplicate PCI selection: mgt and cltr0 are the same (${MGT_NIC_PCI})"
+      return 1
+    fi
+    if [[ -z "${MGT_NIC_PCI:-}" && -n "${desired_mgt_if}" && "${desired_mgt_if}" == "${desired_cltr0_if}" ]]; then
+      whiptail_msgbox "STEP 03 - Bridge Mode" "Cluster NIC and Management NIC cannot be the same interface.\n\nMGT: ${desired_mgt_if}\nCLTR0: ${desired_cltr0_if}\n\nPlease select different NICs in STEP 01." 12 75
+      log "[ERROR] Duplicate ifname selection: mgt=${desired_mgt_if} cltr0=${desired_cltr0_if}"
+      return 1
+    fi
   fi
 
   #######################################
@@ -2659,6 +2936,87 @@ EOF
   return 0
 }
 
+# Detect rendered mgt mode from existing files (best-effort; no errors).
+detect_existing_mgt_render_mode() {
+  local mgt_cfg="/etc/network/interfaces.d/01-mgt.cfg"
+  if [[ -f "${mgt_cfg}" ]]; then
+    if grep -q 'bond-mode active-backup' "${mgt_cfg}" 2>/dev/null; then
+      echo "active-passive"
+      return 0
+    fi
+    if grep -qE '^[[:space:]]*iface[[:space:]]+mgt[[:space:]]+inet[[:space:]]+static' "${mgt_cfg}" 2>/dev/null; then
+      echo "single"
+      return 0
+    fi
+  fi
+  local bond_mod="/etc/modules-load.d/xdr-installer-mgt-bond.conf"
+  if [[ -f "${bond_mod}" ]]; then
+    echo "active-passive"
+    return 0
+  fi
+  echo "unknown"
+  return 0
+}
+
+# Validate 01-mgt.cfg content matches target redundancy mode (after write).
+step03_validate_mgt_cfg_written() {
+  local mgt_cfg="$1"
+  local mode="$2"
+  local bn_pri="${3:-mgtpri}"
+  local bn_bak="${4:-mgtbak}"
+  if [[ ! -f "${mgt_cfg}" ]]; then
+    log "[ERROR] STEP 03: ${mgt_cfg} missing after write"
+    return 1
+  fi
+  if [[ "${mode}" == "single" ]]; then
+    if grep -qE 'bond-mode|bond-slaves|bond-primary' "${mgt_cfg}" 2>/dev/null; then
+      log "[ERROR] STEP 03: single-mode ${mgt_cfg} must not contain bond-mode, bond-slaves, or bond-primary"
+      return 1
+    fi
+  else
+    if ! grep -q 'bond-mode active-backup' "${mgt_cfg}" 2>/dev/null; then
+      log "[ERROR] STEP 03: active-passive ${mgt_cfg} must contain bond-mode active-backup"
+      return 1
+    fi
+    if ! grep -qF "bond-slaves ${bn_pri} ${bn_bak}" "${mgt_cfg}" 2>/dev/null; then
+      log "[ERROR] STEP 03: active-passive ${mgt_cfg} must contain bond-slaves ${bn_pri} ${bn_bak}"
+      return 1
+    fi
+    if ! grep -qF "bond-primary ${bn_pri}" "${mgt_cfg}" 2>/dev/null; then
+      log "[ERROR] STEP 03: active-passive ${mgt_cfg} must contain bond-primary ${bn_pri}"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Remove script-owned mgt artifacts before rewriting for single <-> active-passive transition (declarative only; no ip/ifup).
+step03_cleanup_previous_mgt_mode() {
+  local target_mode="$1"
+  local mgt_cfg="/etc/network/interfaces.d/01-mgt.cfg"
+  local bond_modfile="/etc/modules-load.d/xdr-installer-mgt-bond.conf"
+  local detected
+  detected="$(detect_existing_mgt_render_mode)"
+  log "[STEP 03] Existing MGT mode: ${detected}"
+  log "[STEP 03] Target MGT mode: ${target_mode}"
+  if [[ "${detected}" != "${target_mode}" ]]; then
+    log "[STEP 03] Cleaning stale MGT configuration for mode transition: ${detected} → ${target_mode}"
+  else
+    log "[STEP 03] Re-rendering MGT configuration in same mode: ${target_mode}"
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would remove ${mgt_cfg}"
+    if [[ "${target_mode}" == "single" ]]; then
+      log "[DRY-RUN] Would remove ${bond_modfile}"
+    fi
+    return 0
+  fi
+  rm -f "${mgt_cfg}" 2>/dev/null || true
+  if [[ "${target_mode}" == "single" ]]; then
+    rm -f "${bond_modfile}" 2>/dev/null || true
+  fi
+}
+
 
 step_03_nic_ifupdown() {
   log "[STEP 03] NIC naming / ifupdown switch and network config (Declarative, no runtime ip changes)"
@@ -2680,6 +3038,23 @@ step_03_nic_ifupdown() {
 
   local cluster_nic_type="${CLUSTER_NIC_TYPE:-SRIOV}"
   : "${CLUSTER_BRIDGE_NAME:=br-cluster}"
+
+  local mgt_mode="${MGT_REDUNDANCY_MODE:-single}"
+  if [[ "${mgt_mode}" != "single" && "${mgt_mode}" != "active-passive" ]]; then
+    mgt_mode="single"
+  fi
+  local bn_mgt="${MGT_BOND_NAME:-mgt}"
+  local bn_pri="${MGT_BOND_PRIMARY_NAME:-mgtpri}"
+  local bn_bak="${MGT_BOND_BACKUP_NAME:-mgtbak}"
+  local bond_modfile="/etc/modules-load.d/xdr-installer-mgt-bond.conf"
+
+  if [[ "${mgt_mode}" == "active-passive" ]]; then
+    if [[ -z "${MGT_ACTIVE_NIC_PCI:-}" || -z "${MGT_PASSIVE_NIC_PCI:-}" ]]; then
+      whiptail_msgbox "STEP 03 - Missing mgt bond settings" "active-passive mode requires MGT_ACTIVE_NIC / MGT_PASSIVE_NIC PCI identity from STEP 01.\n\nRe-run STEP 01." 12 78
+      log "ERROR: MGT bond PCI identity missing"
+      return 1
+    fi
+  fi
 
   #######################################
   # Helpers (NO ip command usage)
@@ -2731,20 +3106,40 @@ step_03_nic_ifupdown() {
   # 1) Resolve desired interfaces by identity (PCI/MAC) using sysfs-only helpers
   #######################################
   local resolved_mgt resolved_cltr0 resolved_host
-  resolved_mgt="$(resolve_ifname_by_identity "${MGT_NIC_PCI:-}" "${MGT_NIC_MAC:-}")"
+  local desired_mgt_if desired_cltr0_if desired_host_if
+  local desired_mgt_pri_if desired_mgt_bak_if
   resolved_cltr0="$(resolve_ifname_by_identity "${CLTR0_NIC_PCI:-}" "${CLTR0_NIC_MAC:-}")"
   resolved_host="$(resolve_ifname_by_identity "${HOST_NIC_PCI:-}" "${HOST_NIC_MAC:-}")"
+  desired_cltr0_if="${resolved_cltr0:-${CLTR0_NIC}}"
+  desired_host_if="${resolved_host:-${HOST_NIC}}"
 
-  local desired_mgt_if="${resolved_mgt:-${MGT_NIC}}"
-  local desired_cltr0_if="${resolved_cltr0:-${CLTR0_NIC}}"
-  local desired_host_if="${resolved_host:-${HOST_NIC}}"
+  if [[ "${mgt_mode}" == "single" ]]; then
+    resolved_mgt="$(resolve_ifname_by_identity "${MGT_NIC_PCI:-}" "${MGT_NIC_MAC:-}")"
+    desired_mgt_if="${resolved_mgt:-${MGT_NIC}}"
+    if [[ ! -d "/sys/class/net/${desired_mgt_if}" ]]; then
+      whiptail_msgbox "STEP 03 - NIC Not Found" "MGT_NIC '${desired_mgt_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+      log "ERROR: MGT_NIC '${desired_mgt_if}' not found in /sys/class/net"
+      return 1
+    fi
+  else
+    desired_mgt_pri_if="$(resolve_ifname_by_identity "${MGT_ACTIVE_NIC_PCI:-}" "${MGT_ACTIVE_NIC_MAC:-}")"
+    desired_mgt_bak_if="$(resolve_ifname_by_identity "${MGT_PASSIVE_NIC_PCI:-}" "${MGT_PASSIVE_NIC_MAC:-}")"
+    [[ -z "${desired_mgt_pri_if}" ]] && desired_mgt_pri_if="${MGT_ACTIVE_NIC:-}"
+    [[ -z "${desired_mgt_bak_if}" ]] && desired_mgt_bak_if="${MGT_PASSIVE_NIC:-}"
+    if [[ ! -d "/sys/class/net/${desired_mgt_pri_if}" ]]; then
+      whiptail_msgbox "STEP 03 - NIC Not Found" "MGT active NIC '${desired_mgt_pri_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+      log "ERROR: MGT active NIC '${desired_mgt_pri_if}' not found in /sys/class/net"
+      return 1
+    fi
+    if [[ ! -d "/sys/class/net/${desired_mgt_bak_if}" ]]; then
+      whiptail_msgbox "STEP 03 - NIC Not Found" "MGT passive NIC '${desired_mgt_bak_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
+      log "ERROR: MGT passive NIC '${desired_mgt_bak_if}' not found in /sys/class/net"
+      return 1
+    fi
+    desired_mgt_if="${desired_mgt_pri_if}"
+  fi
 
   # Validate existence via sysfs only
-  if [[ ! -d "/sys/class/net/${desired_mgt_if}" ]]; then
-    whiptail_msgbox "STEP 03 - NIC Not Found" "MGT_NIC '${desired_mgt_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
-    log "ERROR: MGT_NIC '${desired_mgt_if}' not found in /sys/class/net"
-    return 1
-  fi
   if [[ ! -d "/sys/class/net/${desired_host_if}" ]]; then
     whiptail_msgbox "STEP 03 - NIC Not Found" "HOST_NIC '${desired_host_if}' does not exist on this system.\n\nRe-run STEP 01 and select correct NIC." 12 70
     log "ERROR: HOST_NIC '${desired_host_if}' not found in /sys/class/net"
@@ -2802,6 +3197,8 @@ step_03_nic_ifupdown() {
   save_config_var "MGT_GW" "${new_gw}"
   save_config_var "MGT_DNS" "${new_dns}"
 
+  step03_cleanup_previous_mgt_mode "${mgt_mode}"
+
   #######################################
   # 3) Build udev rules (declarative only)
   #######################################
@@ -2809,14 +3206,24 @@ step_03_nic_ifupdown() {
   local udev_lib_file="/usr/lib/udev/rules.d/99-custom-ifnames.rules"
 
   # Determine PCI for udev matching (use stored PCI from STEP 01; fallback to sysfs path)
-  local mgt_pci cltr0_pci host_pci
-  mgt_pci="${MGT_NIC_PCI:-}"
+  local mgt_pci cltr0_pci host_pci mgt_bak_pci=""
+  if [[ "${mgt_mode}" == "single" ]]; then
+    mgt_pci="${MGT_NIC_PCI:-}"
+    if [[ -z "${mgt_pci}" ]]; then
+      mgt_pci="$(readlink -f "/sys/class/net/${desired_mgt_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+    fi
+  else
+    mgt_pci="${MGT_ACTIVE_NIC_PCI:-}"
+    mgt_bak_pci="${MGT_PASSIVE_NIC_PCI:-}"
+    if [[ -z "${mgt_pci}" ]]; then
+      mgt_pci="$(readlink -f "/sys/class/net/${desired_mgt_pri_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+    fi
+    if [[ -z "${mgt_bak_pci}" ]]; then
+      mgt_bak_pci="$(readlink -f "/sys/class/net/${desired_mgt_bak_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
+    fi
+  fi
   cltr0_pci="${CLTR0_NIC_PCI:-}"
   host_pci="${HOST_NIC_PCI:-}"
-
-  if [[ -z "${mgt_pci}" ]]; then
-    mgt_pci="$(readlink -f "/sys/class/net/${desired_mgt_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
-  fi
   if [[ -z "${cltr0_pci}" ]]; then
     cltr0_pci="$(readlink -f "/sys/class/net/${desired_cltr0_if}/device" 2>/dev/null | awk -F'/' '{print $NF}' || true)"
   fi
@@ -2829,9 +3236,14 @@ step_03_nic_ifupdown() {
     log "ERROR: PCI info missing for one or more NICs."
     return 1
   fi
+  if [[ "${mgt_mode}" == "active-passive" && -z "${mgt_bak_pci}" ]]; then
+    whiptail_msgbox "STEP 03 - PCI info error" "Cannot fetch PCI for mgt passive NIC.\n\nRe-run STEP 01." 12 70
+    log "ERROR: mgt passive PCI missing"
+    return 1
+  fi
 
   # Uniqueness check (no duplicate identity)
-  if ! check_unique_identities "${mgt_pci}" "" "${cltr0_pci}" "" "${host_pci}" ""; then
+  if ! check_unique_identities "${mgt_pci}" "" "${cltr0_pci}" "" "${host_pci}" "" "${mgt_bak_pci}" ""; then
     whiptail_msgbox "STEP 03 - Duplicate NIC Selection" "Selected NICs are duplicated.\n\nThe same NIC is assigned to more than one role (mgt/cltr0/hostmgmt).\n\nPlease select different NICs in STEP 01." 12 70
     log "[ERROR] Duplicate identity detected - STEP 03 failed"
     return 1
@@ -2849,13 +3261,24 @@ step_03_nic_ifupdown() {
   fi
 
   local udev_content
-  udev_content=$(cat <<EOF
+  if [[ "${mgt_mode}" == "single" ]]; then
+    udev_content=$(cat <<EOF
 # XDR Installer persistent interface names (declarative)
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${mgt_pci}", NAME:="mgt"
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${cltr0_pci}", NAME:="cltr0"${cltr0_extra}
 ACTION=="add", SUBSYSTEM=="net", KERNELS=="${host_pci}", NAME:="hostmgmt"
 EOF
 )
+  else
+    udev_content=$(cat <<EOF
+# XDR Installer persistent interface names (declarative)
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${mgt_pci}", NAME:="${bn_pri}"
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${mgt_bak_pci}", NAME:="${bn_bak}"
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${cltr0_pci}", NAME:="cltr0"${cltr0_extra}
+ACTION=="add", SUBSYSTEM=="net", KERNELS=="${host_pci}", NAME:="hostmgmt"
+EOF
+)
+  fi
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Will write to ${udev_file}:\n${udev_content}"
@@ -2874,6 +3297,23 @@ EOF
     if command -v lsinitramfs >/dev/null 2>&1; then
       log "[STEP 03] Checking initramfs for ${udev_lib_file}"
       lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null | grep -F "${udev_lib_file}" >/dev/null || true
+    fi
+
+    # bonding module for mgt active-backup (persistent)
+    if [[ "${mgt_mode}" == "active-passive" ]]; then
+      printf '%s\n' 'bonding' > "${bond_modfile}"
+      chmod 644 "${bond_modfile}" || true
+      log "[STEP 03] Wrote ${bond_modfile} (bonding)"
+    else
+      rm -f "${bond_modfile}" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if [[ "${mgt_mode}" == "active-passive" ]]; then
+      log "[DRY-RUN] Would write ${bond_modfile} with: bonding"
+    else
+      log "[DRY-RUN] Would remove ${bond_modfile} if present (single mgt mode)"
     fi
   fi
 
@@ -2896,7 +3336,15 @@ EOF
   fi
 
   # Save effective ifnames for later steps (state stability)
-  save_config_var "MGT_NIC_EFFECTIVE" "mgt"
+  if [[ "${mgt_mode}" == "single" ]]; then
+    save_config_var "MGT_NIC_EFFECTIVE" "mgt"
+    save_config_var "MGT_ACTIVE_NIC_EFFECTIVE" ""
+    save_config_var "MGT_PASSIVE_NIC_EFFECTIVE" ""
+  else
+    save_config_var "MGT_NIC_EFFECTIVE" "mgt"
+    save_config_var "MGT_ACTIVE_NIC_EFFECTIVE" "${bn_pri}"
+    save_config_var "MGT_PASSIVE_NIC_EFFECTIVE" "${bn_bak}"
+  fi
   save_config_var "CLTR0_NIC_EFFECTIVE" "cltr0"
   save_config_var "HOST_NIC_EFFECTIVE" "hostmgmt"
 
@@ -2932,7 +3380,8 @@ EOF
 
   # mgt config in interfaces.d (preferred)
   local mgt_content
-  mgt_content=$(cat <<EOF
+  if [[ "${mgt_mode}" == "single" ]]; then
+    mgt_content=$(cat <<EOF
 auto mgt
 iface mgt inet static
     address ${new_ip}
@@ -2941,10 +3390,40 @@ iface mgt inet static
     dns-nameservers ${new_dns}
 EOF
 )
+  else
+    mgt_content=$(cat <<EOF
+auto ${bn_pri}
+iface ${bn_pri} inet manual
+    bond-master ${bn_mgt}
+    bond-primary yes
+
+auto ${bn_bak}
+iface ${bn_bak} inet manual
+    bond-master ${bn_mgt}
+
+auto ${bn_mgt}
+iface ${bn_mgt} inet static
+    address ${new_ip}
+    netmask ${netmask}
+    gateway ${new_gw}
+    dns-nameservers ${new_dns}
+    bond-slaves ${bn_pri} ${bn_bak}
+    bond-mode active-backup
+    bond-miimon 100
+    bond-updelay 200
+    bond-downdelay 200
+    bond-primary ${bn_pri}
+    bond-primary-reselect always
+EOF
+)
+  fi
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] Will write to ${mgt_cfg}:\n${mgt_content}"
   else
     printf "%s\n" "${mgt_content}" > "${mgt_cfg}"
+    if ! step03_validate_mgt_cfg_written "${mgt_cfg}" "${mgt_mode}" "${bn_pri}" "${bn_bak}"; then
+      return 1
+    fi
   fi
 
   # hostmgmt fixed IP (no gateway)
@@ -3059,17 +3538,34 @@ EOF
     local verify_failed=0
     local verify_errors=""
 
-    if [[ ! -f "${udev_file}" ]] || [[ ! -f "${udev_lib_file}" ]] || \
-       ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_lib_file}" 2>/dev/null || \
-       ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
-      verify_failed=1
-      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_file}"
-      verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_lib_file}"
-      verify_errors="${verify_errors}\n  expected: mgt=${mgt_pci}, cltr0=${cltr0_pci}, hostmgmt=${host_pci}"
+    if [[ "${mgt_mode}" == "single" ]]; then
+      if [[ ! -f "${udev_file}" ]] || [[ ! -f "${udev_lib_file}" ]] || \
+         ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"mgt\"" "${udev_lib_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_lib_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_file}"
+        verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_lib_file}"
+        verify_errors="${verify_errors}\n  expected: mgt=${mgt_pci}, cltr0=${cltr0_pci}, hostmgmt=${host_pci}"
+      fi
+    else
+      if [[ ! -f "${udev_file}" ]] || [[ ! -f "${udev_lib_file}" ]] || \
+         ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"${bn_pri}\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${mgt_bak_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"${bn_bak}\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${mgt_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"${bn_pri}\"" "${udev_lib_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${mgt_bak_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"${bn_bak}\"" "${udev_lib_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${cltr0_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"cltr0\"" "${udev_lib_file}" 2>/dev/null || \
+         ! grep -qE "KERNELS==\"${host_pci}\"[[:space:]]*,[[:space:]]*NAME:=\"hostmgmt\"" "${udev_lib_file}" 2>/dev/null; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- udev rules missing or invalid (mgt bond): ${udev_file}"
+        verify_errors="${verify_errors}\n- udev rules missing or invalid: ${udev_lib_file}"
+        verify_errors="${verify_errors}\n  expected: ${bn_pri}=${mgt_pci}, ${bn_bak}=${mgt_bak_pci}, cltr0=${cltr0_pci}, hostmgmt=${host_pci}"
+      fi
     fi
 
     if [[ ! -f "${iface_file}" ]] || \
@@ -3082,43 +3578,61 @@ EOF
     fi
 
     local mgt_addr mgt_netmask mgt_gw mgt_dns
-    mgt_addr="$(extract_iface_value "${mgt_cfg}" "mgt" "address")"
-    mgt_netmask="$(extract_iface_value "${mgt_cfg}" "mgt" "netmask")"
-    mgt_gw="$(extract_iface_value "${mgt_cfg}" "mgt" "gateway")"
-    mgt_dns="$(extract_dns_list "${mgt_cfg}" "mgt")"
+    local mgt_verify_iface="mgt"
+    [[ "${mgt_mode}" == "active-passive" ]] && mgt_verify_iface="${bn_mgt}"
+    mgt_addr="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "address")"
+    mgt_netmask="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "netmask")"
+    mgt_gw="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "gateway")"
+    mgt_dns="$(extract_dns_list "${mgt_cfg}" "${mgt_verify_iface}")"
     if [[ -z "${mgt_addr}" ]]; then
-      mgt_addr="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_addr="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*address/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_netmask}" ]]; then
-      mgt_netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_netmask="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*netmask/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_gw}" ]]; then
-      mgt_gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_gw="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*gateway/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_dns}" ]]; then
-      mgt_dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_dns="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*dns-nameservers/{sub(/^[^ ]+ /,"");print;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     mgt_addr="$(normalize_value "${mgt_addr}")"
     mgt_netmask="$(normalize_value "${mgt_netmask}")"
     mgt_gw="$(normalize_value "${mgt_gw}")"
     mgt_dns="$(normalize_list "${mgt_dns}")"
 
-    if [[ ! -f "${mgt_cfg}" ]] || \
-       ! grep -qE '^[[:space:]]*iface[[:space:]]+mgt[[:space:]]+inet[[:space:]]+static' "${mgt_cfg}" 2>/dev/null || \
-       [[ "${mgt_addr}" != "${new_ip}" ]] || \
-       [[ "${mgt_netmask}" != "${netmask}" ]] || \
-       [[ "${mgt_gw}" != "${new_gw}" ]] || \
-       [[ -z "${mgt_dns}" ]] || ! dns_contains_all "${new_dns}" "${mgt_dns}"; then
-      verify_failed=1
-      verify_errors="${verify_errors}\n- mgt config invalid: ${mgt_cfg}"
-      verify_errors="${verify_errors}\n  expected: address=${new_ip} netmask=${netmask} gateway=${new_gw} dns=${new_dns}"
-      verify_errors="${verify_errors}\n  actual  : address=${mgt_addr:-<empty>} netmask=${mgt_netmask:-<empty>} gateway=${mgt_gw:-<empty>} dns=${mgt_dns:-<empty>}"
-      if [[ -n "${mgt_dns}" ]]; then
-        local dns_missing
-        dns_missing="$(dns_missing_tokens "${new_dns}" "${mgt_dns}")"
-        if [[ -n "${dns_missing}" ]]; then
-          verify_errors="${verify_errors}\n  dns missing: ${dns_missing}"
+    if [[ "${mgt_mode}" == "single" ]]; then
+      if [[ ! -f "${mgt_cfg}" ]] || \
+         ! grep -qE '^[[:space:]]*iface[[:space:]]+mgt[[:space:]]+inet[[:space:]]+static' "${mgt_cfg}" 2>/dev/null || \
+         [[ "${mgt_addr}" != "${new_ip}" ]] || \
+         [[ "${mgt_netmask}" != "${netmask}" ]] || \
+         [[ "${mgt_gw}" != "${new_gw}" ]] || \
+         [[ -z "${mgt_dns}" ]] || ! dns_contains_all "${new_dns}" "${mgt_dns}"; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- mgt config invalid: ${mgt_cfg}"
+        verify_errors="${verify_errors}\n  expected: address=${new_ip} netmask=${netmask} gateway=${new_gw} dns=${new_dns}"
+        verify_errors="${verify_errors}\n  actual  : address=${mgt_addr:-<empty>} netmask=${mgt_netmask:-<empty>} gateway=${mgt_gw:-<empty>} dns=${mgt_dns:-<empty>}"
+        if [[ -n "${mgt_dns}" ]]; then
+          local dns_missing
+          dns_missing="$(dns_missing_tokens "${new_dns}" "${mgt_dns}")"
+          if [[ -n "${dns_missing}" ]]; then
+            verify_errors="${verify_errors}\n  dns missing: ${dns_missing}"
+          fi
         fi
+      fi
+    else
+      if [[ ! -f "${mgt_cfg}" ]] || \
+         ! grep -qE "^[[:space:]]*iface[[:space:]]+${bn_mgt}[[:space:]]+inet[[:space:]]+static" "${mgt_cfg}" 2>/dev/null || \
+         ! grep -qE '^[[:space:]]*bond-mode[[:space:]]+active-backup' "${mgt_cfg}" 2>/dev/null || \
+         ! grep -qE '^[[:space:]]*bond-slaves[[:space:]]+' "${mgt_cfg}" 2>/dev/null || \
+         [[ "${mgt_addr}" != "${new_ip}" ]] || \
+         [[ "${mgt_netmask}" != "${netmask}" ]] || \
+         [[ "${mgt_gw}" != "${new_gw}" ]] || \
+         [[ -z "${mgt_dns}" ]] || ! dns_contains_all "${new_dns}" "${mgt_dns}"; then
+        verify_failed=1
+        verify_errors="${verify_errors}\n- mgt bond config invalid: ${mgt_cfg}"
+        verify_errors="${verify_errors}\n  expected: iface ${bn_mgt} static + active-backup + bond-slaves; address=${new_ip} netmask=${netmask} gateway=${new_gw} dns=${new_dns}"
+        verify_errors="${verify_errors}\n  actual  : address=${mgt_addr:-<empty>} netmask=${mgt_netmask:-<empty>} gateway=${mgt_gw:-<empty>} dns=${mgt_dns:-<empty>}"
       fi
     fi
 
@@ -3214,33 +3728,16 @@ EOF
   run_cmd "sudo systemctl enable networking || true"
 
   #######################################
-  # 6) Keep link-up NICs admin UP (runtime safeguard)
-  #######################################
-  log "[STEP 03] Ensuring link-up NICs stay admin UP (ethtool link detected)"
-  if command -v ethtool >/dev/null 2>&1; then
-    local nic_path nic et_out
-    for nic_path in /sys/class/net/*; do
-      nic="${nic_path##*/}"
-      [[ "${nic}" == "lo" ]] && continue
-      et_out="$(ethtool "${nic}" 2>/dev/null || true)"
-      if echo "${et_out}" | grep -q "Link detected: yes"; then
-        run_cmd "sudo ip link set ${nic} up"
-      fi
-    done
-  else
-    log "[STEP 03] ethtool not found; skip link-up NIC protection"
-  fi
-
-  #######################################
-  # 7) Summary (reboot required for udev rename + ifupdown apply)
+  # 6) Summary (reboot required for udev rename + ifupdown apply)
   #######################################
   local summary
-  summary=$(cat <<EOF
+  if [[ "${mgt_mode}" == "single" ]]; then
+    summary=$(cat <<EOF
 ═══════════════════════════════════════════════════════════
   STEP 03: Network Configuration - Complete (Declarative)
 ═══════════════════════════════════════════════════════════
 
-✅ FILES WRITTEN (no runtime config changes; link-up NICs set admin UP):
+✅ FILES WRITTEN (declarative configuration; applied after reboot):
   • udev rules: ${udev_file}
     - ${mgt_pci}   → mgt
     - ${cltr0_pci} → cltr0
@@ -3253,6 +3750,28 @@ EOF
     - ${cltr0_cfg}
 EOF
 )
+  else
+    summary=$(cat <<EOF
+═══════════════════════════════════════════════════════════
+  STEP 03: Network Configuration - Complete (Declarative)
+═══════════════════════════════════════════════════════════
+
+✅ FILES WRITTEN (declarative configuration; applied after reboot):
+  • udev rules: ${udev_file}
+    - ${mgt_pci}   → ${bn_pri} (bond primary slave)
+    - ${mgt_bak_pci} → ${bn_bak} (bond backup slave)
+    - ${cltr0_pci} → cltr0
+    - ${host_pci}  → hostmgmt
+  • bonding module: ${bond_modfile}
+
+  • ifupdown:
+    - ${iface_file}
+    - ${mgt_cfg} (active-backup bond ${bn_mgt})
+    - ${host_cfg}
+    - ${cltr0_cfg}
+EOF
+)
+  fi
 
   if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
     summary="${summary}
@@ -4741,6 +5260,131 @@ step_07_lvm_storage() {
   # 3) Create DL / DA Root LV (ubuntu-vg)
   #######################################
   log "[STEP 07] Create DL/DA Root LV (${UBUNTU_VG}/${DL_ROOT_LV}, ${UBUNTU_VG}/${DA_ROOT_LV})"
+
+  local need_dl_root_lv=1
+  local need_da_root_lv=1
+  local required_lv_mib=0
+  local vg_free_mib=0
+
+  if lvs "${UBUNTU_VG}/${DL_ROOT_LV}" >/dev/null 2>&1; then
+    need_dl_root_lv=0
+  else
+    required_lv_mib=$((required_lv_mib + (545 * 1024)))
+  fi
+
+  if lvs "${UBUNTU_VG}/${DA_ROOT_LV}" >/dev/null 2>&1; then
+    need_da_root_lv=0
+  else
+    required_lv_mib=$((required_lv_mib + (545 * 1024)))
+  fi
+
+  if [[ "${required_lv_mib}" -gt 0 ]]; then
+    vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${UBUNTU_VG}" 2>/dev/null \
+      | awk 'NF {print int($1); exit}')
+    [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+
+    if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
+      log "[STEP 07] ${UBUNTU_VG} free space is insufficient (${vg_free_mib}MiB < ${required_lv_mib}MiB). Expanding VG from OS disk free area."
+
+      local root_pv os_disk_base os_disk
+      root_pv=$(sudo lvs --noheadings -o devices "${root_dev}" 2>/dev/null \
+        | awk -F'[(), ]+' 'NF {print $1; exit}')
+      if [[ -z "${root_pv}" ]]; then
+        root_pv=$(sudo pvs --noheadings -o pv_name --select "vg_name=${UBUNTU_VG}" 2>/dev/null \
+          | awk 'NF {print $1; exit}')
+      fi
+
+      if [[ -z "${root_pv}" ]]; then
+        log "[ERROR] Failed to detect root PV for ${UBUNTU_VG}. Cannot continue STEP 07 safely."
+        return 1
+      fi
+
+      os_disk_base=$(lsblk -no PKNAME "${root_pv}" 2>/dev/null | awk 'NF {print $1; exit}')
+      if [[ -z "${os_disk_base}" ]]; then
+        os_disk_base=$(basename "${root_pv}")
+      fi
+      os_disk="/dev/${os_disk_base}"
+
+      if [[ ! -b "${os_disk}" ]]; then
+        log "[ERROR] Detected OS disk is invalid: ${os_disk}. Aborting."
+        return 1
+      fi
+
+      local required_partition_mib free_segment_info free_mib free_start_mib free_end_mib
+      required_partition_mib=$((required_lv_mib + (10 * 1024)))  # 10GiB metadata/safety buffer
+
+      free_segment_info=$(sudo parted -m "${os_disk}" unit MiB print free 2>/dev/null \
+        | awk -F: '$1 ~ /^[0-9]+$/ && $NF ~ /free;$/ {
+                     gsub("MiB","",$2); gsub("MiB","",$3); gsub("MiB","",$4);
+                     size=int($4); start=int($2); end=int($3);
+                     if (size > max) {max=size; max_start=start; max_end=end}
+                   }
+                   END {
+                     if (max > 0) printf "%d %d %d\n", max, max_start, max_end;
+                   }')
+
+      free_mib=$(awk '{print $1}' <<< "${free_segment_info}")
+      free_start_mib=$(awk '{print $2}' <<< "${free_segment_info}")
+      free_end_mib=$(awk '{print $3}' <<< "${free_segment_info}")
+
+      if [[ -z "${free_mib}" || -z "${free_start_mib}" || -z "${free_end_mib}" ]]; then
+        log "[ERROR] Could not determine free segment on ${os_disk}. Aborting."
+        return 1
+      fi
+
+      if [[ "${free_mib}" -lt "${required_partition_mib}" ]]; then
+        log "[ERROR] Insufficient unallocated space on ${os_disk}: required=${required_partition_mib}MiB, available=${free_mib}MiB. Need at least ~1100GiB free for DL/DA LVs."
+        return 1
+      fi
+
+      local new_part_end_mib
+      new_part_end_mib=$((free_start_mib + required_partition_mib - 1))
+      if [[ "${new_part_end_mib}" -gt "${free_end_mib}" ]]; then
+        log "[ERROR] Computed partition end exceeds free segment boundary on ${os_disk}. Aborting."
+        return 1
+      fi
+
+      local before_parts after_parts new_os_pv_partition
+      before_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+
+      run_cmd "sudo parted -s ${os_disk} -- mkpart primary ${free_start_mib}MiB ${new_part_end_mib}MiB"
+      run_cmd "sudo partprobe ${os_disk}"
+      run_cmd "sudo udevadm settle"
+
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        new_os_pv_partition="${os_disk}<new-partition>"
+      else
+        local _wait_try
+        for _wait_try in {1..20}; do
+          after_parts=$(lsblk -ln -o NAME "${os_disk}" 2>/dev/null | awk 'NR>1 {print "/dev/"$1}' | sort -u)
+          new_os_pv_partition=$(comm -13 <(printf '%s\n' "${before_parts}") <(printf '%s\n' "${after_parts}") | awk 'NF {print $1; exit}')
+          if [[ -n "${new_os_pv_partition}" && -b "${new_os_pv_partition}" ]]; then
+            break
+          fi
+          sleep 0.3
+        done
+
+        if [[ -z "${new_os_pv_partition}" || ! -b "${new_os_pv_partition}" ]]; then
+          log "[ERROR] Failed to detect newly created partition on ${os_disk}. Aborting."
+          return 1
+        fi
+      fi
+
+      log "[STEP 07] New OS-disk partition detected: ${new_os_pv_partition}"
+      run_cmd "sudo pvcreate ${new_os_pv_partition}"
+      run_cmd "sudo vgextend ${UBUNTU_VG} ${new_os_pv_partition}"
+
+      vg_free_mib=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${UBUNTU_VG}" 2>/dev/null \
+        | awk 'NF {print int($1); exit}')
+      [[ -z "${vg_free_mib}" ]] && vg_free_mib=0
+      if [[ "${vg_free_mib}" -lt "${required_lv_mib}" ]]; then
+        log "[ERROR] ${UBUNTU_VG} free space is still insufficient after vgextend (${vg_free_mib}MiB < ${required_lv_mib}MiB)."
+        return 1
+      fi
+
+      log "[STEP 07] ${UBUNTU_VG} successfully expanded (free=${vg_free_mib}MiB)."
+    fi
+  fi
 
   if lvs "${UBUNTU_VG}/${DL_ROOT_LV}" >/dev/null 2>&1; then
     log "LV ${UBUNTU_VG}/${DL_ROOT_LV} already exists → skip create"
@@ -11778,6 +12422,483 @@ EOF
 }
 
 
+# --- STEP 14 helpers (NFS backup export block) ---
+xdr_validate_nfs_ipv4() {
+  local a="${1:-}"
+  [[ -n "$a" ]] || return 1
+  [[ "$a" =~ ^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]
+}
+
+xdr_validate_nfs_cidr() {
+  local c="${1:-}"
+  [[ -n "$c" ]] || return 1
+  [[ "$c" =~ ^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/([0-9]|[12][0-9]|3[0-2])$ ]]
+}
+
+xdr_nfs_backup_detect_installed() {
+  if dpkg -s nfs-kernel-server >/dev/null 2>&1; then
+    if dpkg -s nfs-kernel-server 2>/dev/null | grep -q '^Status: install ok installed'; then
+      return 0
+    fi
+  fi
+  if systemctl status nfs-server --no-pager >/dev/null 2>&1; then
+    return 0
+  fi
+  if systemctl cat nfs-server.service >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+xdr_nfs_backup_write_exports_block() {
+  local export_root="$1"
+  local client="$2"
+  local exports_path="/etc/exports"
+  local tmp
+  tmp=$(mktemp)
+  if [[ -f "${exports_path}" ]] && grep -q 'XDR_NFS_BACKUP_BEGIN' "${exports_path}"; then
+    awk -v r="${export_root}" -v c="${client}" '
+      /# XDR_NFS_BACKUP_BEGIN/ {
+        print "# XDR_NFS_BACKUP_BEGIN"
+        print r " " c "(rw,insecure,no_subtree_check,no_root_squash,sync)"
+        print "# XDR_NFS_BACKUP_END"
+        skip=1
+        next
+      }
+      /# XDR_NFS_BACKUP_END/ { skip=0; next }
+      skip { next }
+      { print }
+    ' "${exports_path}" > "${tmp}"
+  else
+    if [[ -f "${exports_path}" ]]; then
+      cat "${exports_path}" > "${tmp}"
+    else
+      : > "${tmp}"
+    fi
+    {
+      echo ""
+      echo "# XDR_NFS_BACKUP_BEGIN"
+      echo "${export_root} ${client}(rw,insecure,no_subtree_check,no_root_squash,sync)"
+      echo "# XDR_NFS_BACKUP_END"
+    } >> "${tmp}"
+  fi
+  if ! sudo cp "${tmp}" "${exports_path}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  rm -f "${tmp}"
+  return 0
+}
+
+# Lines in /etc/exports outside XDR marker block that still export export_root (legacy/unmanaged)
+xdr_nfs_unmanaged_export_line_count() {
+  local export_root="${1:-/stellarcyber}"
+  local f="/etc/exports"
+  [[ -f "${f}" ]] || { echo 0; return 0; }
+  awk -v root="${export_root}" '
+    BEGIN { c = 0 }
+    /# XDR_NFS_BACKUP_BEGIN/ { skip=1; next }
+    /# XDR_NFS_BACKUP_END/ { skip=0; next }
+    skip == 1 { next }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ { next }
+    {
+      line=$0
+      sub(/#.*/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "") next
+      if (index(line, root) == 1) {
+        rest = substr(line, length(root) + 1)
+        if (rest == "" || rest ~ /^[[:space:]]/ || rest ~ /^\(/)
+          c++
+      }
+    }
+    END { print c + 0 }
+  ' "${f}"
+}
+
+xdr_nfs_verify_managed_block() {
+  local export_root="$1"
+  local client="$2"
+  local f="/etc/exports"
+  local expected="${export_root} ${client}(rw,insecure,no_subtree_check,no_root_squash,sync)"
+  [[ -f "${f}" ]] || return 1
+  awk "/# XDR_NFS_BACKUP_BEGIN/,/# XDR_NFS_BACKUP_END/" "${f}" | grep -Fxq "${expected}"
+}
+
+xdr_nfs_post_apply_verify_ok() {
+  local export_root="$1"
+  local out=""
+  out=$(exportfs -v 2>&1) || return 1
+  echo "${out}" | grep -qF "${export_root}" || return 1
+  [[ -d "${export_root}" ]] || return 1
+  local ug ma
+  ug=$(stat -c '%U:%G' "${export_root}" 2>/dev/null) || return 1
+  ma=$(stat -c '%a' "${export_root}" 2>/dev/null) || return 1
+  [[ "${ug}" == "stellar:stellar" ]] || return 1
+  [[ "${ma}" == "755" ]] || return 1
+  return 0
+}
+
+###############################################################################
+# STEP 14 – Configure NFS backup server (DP configuration backup only)
+###############################################################################
+step_14_configure_nfs_backup() {
+  local STEP_ID="14_configure_nfs_backup"
+  local STEP_NAME="14. Configure NFS backup server (DP configuration backup only)"
+  local _DRY="${DRY_RUN:-0}"
+  _DRY="${_DRY//\"/}"
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP START: ${STEP_ID} - ${STEP_NAME} ====="
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] Configuring NFS backup server (DP configuration backup only)"
+
+  if type load_config >/dev/null 2>&1; then
+    load_config || true
+  fi
+
+  local export_dir_default="${NFS_BACKUP_EXPORT_DIR:-/stellarcyber}"
+
+  local confirm_msg
+  if [[ "${_DRY}" -eq 1 ]]; then
+    confirm_msg="STEP 14: Configure NFS backup server (DP configuration backup only)
+
+This NFS server is intended ONLY for Stellar Cyber DP configuration backup.
+It must NOT be used for data backup.
+
+You will choose how clients may access this export:
+  • Single IP (recommended — only one host, e.g. DL-master), or
+  • CIDR range (multiple hosts on a subnet)
+
+Then the installer would (simulation only):
+  • Install nfs-kernel-server if it is not already installed
+  • Ensure ${export_dir_default} exists with mode 755 and owner stellar:stellar (every run)
+  • Update only the XDR marker block in /etc/exports (other lines are not modified)
+  • Run exportfs -ra and sudo systemctl restart nfs-server
+
+⚠️  DRY RUN MODE: No packages, files, or services will be changed. You will still see the same prompts and a summary.
+
+Do you want to continue?"
+  else
+    confirm_msg="STEP 14: Configure NFS backup server (DP configuration backup only)
+
+This NFS server is intended ONLY for Stellar Cyber DP configuration backup.
+It must NOT be used for data backup.
+
+You will choose how clients may access this export:
+  • Single IP (recommended — only one host, e.g. DL-master), or
+  • CIDR range (multiple hosts on a subnet)
+
+This step will then:
+  • Install nfs-kernel-server if it is not already installed
+  • Ensure ${export_dir_default}: mkdir/chmod 755/chown stellar:stellar every run (requires local user/group stellar)
+  • Update only the XDR marker block in /etc/exports (other exports are left unchanged)
+  • Run exportfs -ra and sudo systemctl restart nfs-server
+
+Do you want to continue?"
+  fi
+
+  local dialog_dims
+  dialog_dims=$(calc_dialog_size 22 90)
+  local dialog_height dialog_width
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  local centered_intro
+  centered_intro=$(center_message "${confirm_msg}")
+
+  set +e
+  whiptail --title "STEP 14 Execution Confirmation" \
+    --yesno "${centered_intro}" "${dialog_height}" "${dialog_width}"
+  local intro_rc=$?
+  set -e
+  if [[ ${intro_rc} -ne 0 ]]; then
+    log "User canceled STEP 14 execution."
+    return 2
+  fi
+  log "[STEP 14] User confirmed execution (DRY_RUN=${_DRY})."
+
+  local nfs_was_installed=0
+  if xdr_nfs_backup_detect_installed; then
+    nfs_was_installed=1
+    log "[STEP 14] nfs-kernel-server / nfs-server already present — skipping apt install on this run."
+    local nfs_status_dims
+    nfs_status_dims=$(calc_dialog_size 16 85)
+    local nfs_status_h nfs_status_w
+    read -r nfs_status_h nfs_status_w <<< "${nfs_status_dims}"
+    local nfs_status_msg
+    nfs_status_msg="NFS server already installed
+
+The nfs-kernel-server package or nfs-server service is already present on this host.
+
+This run will:
+  • Skip apt install
+  • Ask only for allowed client (Single IP or CIDR)
+  • Refresh the XDR block in /etc/exports for ${export_dir_default}
+  • Run exportfs -ra and sudo systemctl restart nfs-server
+
+Press OK to select client access."
+    whiptail_msgbox "STEP 14 - NFS status" "${nfs_status_msg}" "${nfs_status_h}" "${nfs_status_w}"
+  fi
+
+  local menu_dims
+  menu_dims=$(calc_menu_size 2 80 8)
+  local menu_height menu_width menu_list_height
+  read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  local centered_mode
+  centered_mode=$(center_menu_message "Choose who may mount this NFS export:\n\n• Single IP — one host only (more restrictive)\n• CIDR range — any host in that network\n" "${menu_height}")
+
+  local mode_choice
+  set +e
+  mode_choice=$(whiptail --title "STEP 14 - Allowed client mode" \
+    --menu "${centered_mode}" \
+    "${menu_height}" "${menu_width}" "${menu_list_height}" \
+    "1" "Single IP (recommended - more secure)" \
+    "2" "CIDR range" \
+    3>&1 1>&2 2>&3)
+  local mode_rc=$?
+  set -e
+  if [[ ${mode_rc} -ne 0 ]] || [[ -z "${mode_choice}" ]]; then
+    log "User canceled STEP 14 (mode selection)."
+    return 2
+  fi
+
+  local input_val=""
+  local input_default=""
+  local input_title=""
+  local input_msg=""
+
+  if [[ "${mode_choice}" == "1" ]]; then
+    input_title="STEP 14 - Allowed client (IPv4)"
+    input_msg="Enter the IPv4 address that is allowed to mount this export (typically the DL-master VM on the default network).\n\nExample: 192.168.122.2"
+    input_default="${NFS_BACKUP_ALLOWED_CLIENT:-192.168.122.2}"
+    while true; do
+      set +e
+      input_val="$(whiptail_inputbox "${input_title}" "${input_msg}" "${input_default}" 14 80)"
+      local in_rc=$?
+      set -e
+      if [[ ${in_rc} -ne 0 ]]; then
+        log "User canceled STEP 14 (client input)."
+        return 2
+      fi
+      input_val="${input_val//$'\r'/}"
+      input_val="${input_val#"${input_val%%[![:space:]]*}"}"
+      input_val="${input_val%"${input_val##*[![:space:]]}"}"
+      if [[ -z "${input_val}" ]]; then
+        whiptail_msgbox "STEP 14 - Input validation" "The address must not be empty.\n\nEnter a valid IPv4 address (four decimal octets)." 11 72
+        continue
+      fi
+      if xdr_validate_nfs_ipv4 "${input_val}"; then
+        save_config_var "NFS_BACKUP_CLIENT_MODE" "single"
+        save_config_var "NFS_BACKUP_ALLOWED_CLIENT" "${input_val}"
+        break
+      fi
+      whiptail_msgbox "STEP 14 - Input validation" "Invalid IPv4 address.\n\nUse four decimal numbers separated by dots (example: 192.168.122.2)." 13 75
+    done
+  else
+    input_title="STEP 14 - Allowed network (CIDR)"
+    input_msg="Enter an IPv4 network in CIDR notation. Any host in this range may mount the export (less restrictive than a single IP).\n\nExample: 192.168.122.0/24"
+    input_default="${NFS_BACKUP_ALLOWED_CLIENT_CIDR:-192.168.122.2/24}"
+    while true; do
+      set +e
+      input_val="$(whiptail_inputbox "${input_title}" "${input_msg}" "${input_default}" 14 80)"
+      local in_rc2=$?
+      set -e
+      if [[ ${in_rc2} -ne 0 ]]; then
+        log "User canceled STEP 14 (CIDR input)."
+        return 2
+      fi
+      input_val="${input_val//$'\r'/}"
+      input_val="${input_val#"${input_val%%[![:space:]]*}"}"
+      input_val="${input_val%"${input_val##*[![:space:]]}"}"
+      if [[ -z "${input_val}" ]]; then
+        whiptail_msgbox "STEP 14 - Input validation" "The value must not be empty.\n\nEnter IPv4/CIDR (example: 192.168.122.0/24)." 11 75
+        continue
+      fi
+      if xdr_validate_nfs_cidr "${input_val}"; then
+        save_config_var "NFS_BACKUP_CLIENT_MODE" "cidr"
+        save_config_var "NFS_BACKUP_ALLOWED_CLIENT_CIDR" "${input_val}"
+        break
+      fi
+      whiptail_msgbox "STEP 14 - Input validation" "Invalid IPv4/CIDR format.\n\nUse address/prefix (examples: 192.168.122.2/24 or 192.168.122.0/24)." 13 78
+    done
+  fi
+
+  load_config || true
+  local export_dir="${NFS_BACKUP_EXPORT_DIR:-/stellarcyber}"
+  local exp_client=""
+  if [[ "${NFS_BACKUP_CLIENT_MODE:-single}" == "cidr" ]]; then
+    exp_client="${NFS_BACKUP_ALLOWED_CLIENT_CIDR}"
+  else
+    exp_client="${NFS_BACKUP_ALLOWED_CLIENT}"
+  fi
+
+  local mode_label="Single IP"
+  if [[ "${NFS_BACKUP_CLIENT_MODE:-single}" == "cidr" ]]; then
+    mode_label="CIDR"
+  fi
+
+  local nfs_installed_summary="NO"
+  if xdr_nfs_backup_detect_installed; then
+    nfs_installed_summary="YES"
+  fi
+
+  if [[ "${_DRY}" -eq 1 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] [DRY-RUN] Simulating: apt / directory / exports / exportfs / nfs-server restart (no changes applied)"
+    log "[DRY-RUN] Would run: sudo apt update && sudo apt install -y nfs-kernel-server (if NFS not already installed)"
+    log "[DRY-RUN] Would verify local user/group stellar before chown on ${export_dir}"
+    log "[DRY-RUN] Would run: sudo mkdir -p ${export_dir} && sudo chmod 755 ${export_dir} && sudo chown stellar:stellar ${export_dir} (every run)"
+    log "[DRY-RUN] Would verify XDR managed export line in /etc/exports after write"
+    log "[DRY-RUN] Would warn if unmanaged legacy lines for ${export_dir} exist outside marker block"
+    log "[DRY-RUN] Would update /etc/exports XDR marker block: ${export_dir} → client ${exp_client}"
+    log "[DRY-RUN] Would run: sudo exportfs -ra && sudo systemctl restart nfs-server"
+    log "[DRY-RUN] Would verify exportfs -v, mode 755, ownership stellar:stellar after apply"
+    log "[DRY-RUN] STEP 14 completed in simulation — no system changes applied."
+
+    local dry_summary
+    dry_summary="STEP 14: NFS backup configuration (DRY RUN) — simulation complete
+
+✅ Review summary (nothing was changed on disk):
+  • NFS server currently detected: ${nfs_installed_summary}
+  • Export directory (configured): ${export_dir}
+  • Allowed client for export: ${exp_client}
+  • Access mode: ${mode_label}
+
+⚠️ Important:
+  This NFS is ONLY for DP configuration backup.
+  Data backup is NOT supported.
+
+💡 Next step:
+  Set DRY_RUN=0 in Configuration, then run STEP 14 again to apply these settings."
+
+    local dry_dims
+    dry_dims=$(calc_dialog_size 22 90)
+    local dry_dh dry_dw
+    read -r dry_dh dry_dw <<< "${dry_dims}"
+    whiptail_msgbox "STEP 14 – NFS backup (DRY RUN)" "${dry_summary}" "${dry_dh}" "${dry_dw}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 14. Configure NFS backup server (DP configuration backup only) ====="
+    echo
+    return 0
+  fi
+
+  if [[ "${nfs_was_installed}" -eq 0 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] First-time path: installing nfs-kernel-server"
+    log "[STEP 14] Running: sudo apt update && sudo apt install -y nfs-kernel-server"
+    if ! sudo apt update; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: sudo apt update failed" | tee -a "${LOG_FILE}"
+      whiptail_msgbox "STEP 14 - Error" "apt update failed.\nCheck ${LOG_FILE} for details." 12 80
+      return 1
+    fi
+    if ! sudo apt install -y nfs-kernel-server; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: apt install nfs-kernel-server failed" | tee -a "${LOG_FILE}"
+      whiptail_msgbox "STEP 14 - Error" "Failed to install nfs-kernel-server.\nCheck ${LOG_FILE} for details." 12 80
+      return 1
+    fi
+  fi
+
+  if ! getent passwd stellar >/dev/null 2>&1 || ! getent group stellar >/dev/null 2>&1; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: local user or group 'stellar' does not exist (required for export directory ownership)" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "Local user/group 'stellar' was not found on this host.\n\nCannot set ownership on ${export_dir}.\nCreate the stellar user/group (or complete prior steps) and rerun STEP 14." 16 85
+    return 1
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] Ensuring export directory ${export_dir} (mode 755, owner stellar:stellar) every run"
+  log "[STEP 14] sudo mkdir -p ${export_dir} && chmod 755 && chown stellar:stellar"
+  if ! sudo mkdir -p "${export_dir}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: mkdir failed for ${export_dir}" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "Failed to create ${export_dir}." 12 75
+    return 1
+  fi
+  if ! sudo chmod 755 "${export_dir}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: chmod failed for ${export_dir}" | tee -a "${LOG_FILE}"
+    return 1
+  fi
+  if ! sudo chown stellar:stellar "${export_dir}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: chown stellar:stellar failed for ${export_dir}" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "chown stellar:stellar failed on ${export_dir}." 12 75
+    return 1
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] Updating /etc/exports (XDR_NFS_BACKUP_* marker block only; other lines unchanged)"
+  log "[STEP 14] Writing client ${exp_client} for export ${export_dir} into /etc/exports (marker block)"
+  if ! xdr_nfs_backup_write_exports_block "${export_dir}" "${exp_client}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: failed to update /etc/exports" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "Failed to update /etc/exports." 12 75
+    return 1
+  fi
+
+  if ! xdr_nfs_verify_managed_block "${export_dir}" "${exp_client}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: managed XDR export line missing or incorrect in /etc/exports" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "Verification failed: the XDR marker block does not contain the expected export line.\n\nExpected:\n${export_dir} ${exp_client}(rw,insecure,no_subtree_check,no_root_squash,sync)\n\nCheck ${LOG_FILE}." 18 88
+    return 1
+  fi
+  log "[STEP 14] Managed /etc/exports block verified (expected export line present)"
+
+  local unmanaged_n
+  unmanaged_n=$(xdr_nfs_unmanaged_export_line_count "${export_dir}")
+  if [[ "${unmanaged_n}" -gt 0 ]]; then
+    log "[WARN] [STEP 14] Found ${unmanaged_n} unmanaged legacy export line(s) for ${export_dir} outside # XDR_NFS_BACKUP_* markers (may cause exportfs warnings)"
+    local leg_dims
+    leg_dims=$(calc_dialog_size 18 88)
+    local leg_h leg_w
+    read -r leg_h leg_w <<< "${leg_dims}"
+    whiptail_msgbox "STEP 14 - Legacy /etc/exports" "Unmanaged entries for ${export_dir} were found outside the XDR marker block (${unmanaged_n} line(s)).\n\nThese legacy lines are not removed automatically. They may cause exportfs warnings or conflicts.\n\nReview /etc/exports manually if needed. Continuing with exportfs and nfs-server restart." "${leg_h}" "${leg_w}"
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] Applying exports: sudo exportfs -ra"
+  if ! sudo exportfs -ra; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: exportfs -ra failed" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "exportfs -ra failed.\nCheck NFS configuration and logs." 12 80
+    return 1
+  fi
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] Restarting NFS: sudo systemctl restart nfs-server"
+  if ! sudo systemctl restart nfs-server; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: systemctl restart nfs-server failed" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "systemctl restart nfs-server failed." 12 75
+    return 1
+  fi
+
+  if ! xdr_nfs_post_apply_verify_ok "${export_dir}"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 14] ERROR: post-apply verification failed (${export_dir} missing, wrong mode/owner, or not listed in exportfs -v)" | tee -a "${LOG_FILE}"
+    whiptail_msgbox "STEP 14 - Error" "Post-apply verification failed.\n\nExpected after this step:\n  • ${export_dir} exists\n  • mode 755, owner/group stellar:stellar\n  • exportfs -v lists ${export_dir}\n\nCheck ${LOG_FILE} and journalctl -u nfs-server." 18 88
+    return 1
+  fi
+  log "[STEP 14] Post-apply verification passed (exportfs -v, mode 755, stellar:stellar)"
+
+  if xdr_nfs_backup_detect_installed; then
+    nfs_installed_summary="YES"
+  else
+    nfs_installed_summary="NO"
+  fi
+
+  if type mark_step_done >/dev/null 2>&1; then
+    mark_step_done "${STEP_ID}"
+  fi
+
+  local completion_msg
+  completion_msg="STEP 14: NFS Backup Server Configuration Completed
+
+✅ Configuration summary:
+  • NFS server installed / active: ${nfs_installed_summary}
+  • Export directory: ${export_dir} (mode 755, stellar:stellar; re-applied every run)
+  • Allowed client (export): ${exp_client}
+  • Access mode: ${mode_label}
+  • /etc/exports XDR block written and verified; exportfs -ra; nfs-server restarted; post-apply checks passed
+
+⚠️ Important:
+  This NFS is ONLY for DP configuration backup.
+  Data backup is NOT supported.
+
+💡 Note:
+  Use this share only as documented for Stellar Cyber DP configuration backup from the allowed client(s)."
+
+  dialog_dims=$(calc_dialog_size 22 90)
+  read -r dialog_height dialog_width <<< "${dialog_dims}"
+  whiptail_msgbox "STEP 14 - Configuration Complete" "${completion_msg}" "${dialog_height}" "${dialog_width}"
+
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 14. Configure NFS backup server (DP configuration backup only) ====="
+  echo
+  return 0
+}
+
 
 menu_config() {
   while true; do
@@ -11799,14 +12920,19 @@ menu_config() {
     msg+="ACPS_USER    : ${ACPS_USERNAME:-<Not Set>}\n"
     msg+="ACPS_PASSWORD: ${acps_password_display}\n"
     msg+="ACPS_URL     : ${ACPS_BASE_URL:-<Not Set>}\n"
+    msg+="MGT mode     : ${MGT_REDUNDANCY_MODE:-single}\n"
     msg+="MGT_NIC      : ${MGT_NIC:-<Not Set>}\n"
+    if [[ "${MGT_REDUNDANCY_MODE:-single}" == "active-passive" ]]; then
+      msg+="MGT active   : ${MGT_ACTIVE_NIC:-<Not Set>} (PCI ${MGT_ACTIVE_NIC_PCI:-?})\n"
+      msg+="MGT passive  : ${MGT_PASSIVE_NIC:-<Not Set>} (PCI ${MGT_PASSIVE_NIC_PCI:-?})\n"
+    fi
     msg+="CLTR0_NIC    : ${CLTR0_NIC:-<Not Set>}\n"
     msg+="DATA_SSD_LIST: ${DATA_SSD_LIST:-<Not Set>}\n"
     msg+="CLUSTER_NIC_TYPE: ${CLUSTER_NIC_TYPE:-BRIDGE}\n"
 
-    # Calculate menu size dynamically (6 menu items)
+    # Calculate menu size dynamically (7 menu items)
     local menu_dims
-    menu_dims=$(calc_menu_size 6 80 8)
+    menu_dims=$(calc_menu_size 7 80 8)
     local menu_height menu_width menu_list_height
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
 
@@ -11825,7 +12951,8 @@ menu_config() {
       "3" "Set ACPS Account/Password" \
       "4" "Set ACPS URL" \
       "5" "Set Cluster Interface Type (${CLUSTER_NIC_TYPE:-BRIDGE})" \
-      "6" "Go Back" \
+      "6" "Set MGT redundancy (${MGT_REDUNDANCY_MODE:-single})" \
+      "7" "Go Back" \
       3>&1 1>&2 2>&3)
     local menu_rc=$?
     set -e
@@ -12028,6 +13155,31 @@ menu_config() {
         ;;
 
       "6")
+        # Management NIC redundancy (mgt only)
+        local mgt_mode_cur="${MGT_REDUNDANCY_MODE:-single}"
+        local mgt_mode_new=""
+        set +e
+        mgt_mode_new=$(whiptail --title "Management NIC redundancy" \
+          --menu "Select management interface mode.\n\nCurrent: ${mgt_mode_cur}\n\n• single: one physical NIC renamed to mgt\n• active-passive: Linux bonding (active-backup), logical mgt bond + mgtpri/mgtbak\n\nRe-run STEP 01 after changing this." \
+          14 78 2 \
+          "1" "single (one physical mgt NIC)" \
+          "2" "active-passive (bond: mgt + mgtpri + mgtbak)" \
+          3>&1 1>&2 2>&3)
+        local mgtm_rc=$?
+        set -e
+        if [[ ${mgtm_rc} -ne 0 ]] || [[ -z "${mgt_mode_new}" ]]; then
+          continue
+        fi
+        case "${mgt_mode_new}" in
+          "1") MGT_REDUNDANCY_MODE="single" ;;
+          "2") MGT_REDUNDANCY_MODE="active-passive" ;;
+          *) continue ;;
+        esac
+        save_config
+        whiptail_msgbox "Management NIC redundancy" "MGT_REDUNDANCY_MODE is now '${MGT_REDUNDANCY_MODE}'.\n\nRe-run STEP 01 to select NICs for this mode, then STEP 03 to apply." 12 78
+        ;;
+
+      "7")
         break
         ;;
 
@@ -12499,6 +13651,92 @@ build_validation_summary() {
   fi
 
   ###############################
+  # 9. NFS backup for DP configuration (STEP 14)
+  ###############################
+  local nfs_export_dir="${NFS_BACKUP_EXPORT_DIR:-/stellarcyber}"
+  local nfs_pkg_ok=0
+  if dpkg -s nfs-kernel-server >/dev/null 2>&1; then
+    if dpkg -s nfs-kernel-server 2>/dev/null | grep -q '^Status: install ok installed'; then
+      nfs_pkg_ok=1
+    fi
+  fi
+
+  local nfs_sum_err=0 nfs_sum_warn=0
+  if [[ "${nfs_pkg_ok}" -eq 0 ]]; then
+    warn_msgs+=("[WARN] nfs-kernel-server is not installed (NFS backup / STEP 14).")
+    warn_msgs+=("  → ACTION: Run STEP 14 if DP configuration NFS backup is required on this host")
+    nfs_sum_warn=1
+  else
+    ok_msgs+=("[OK] nfs-kernel-server package is installed (NFS backup)")
+    if systemctl is-active --quiet nfs-server 2>/dev/null; then
+      ok_msgs+=("[OK] nfs-server service is active")
+    else
+      err_msgs+=("[ERROR] nfs-server service is not active.")
+      err_msgs+=("  → ACTION: sudo systemctl enable --now nfs-server")
+      nfs_sum_err=1
+    fi
+    if [[ -d "${nfs_export_dir}" ]]; then
+      ok_msgs+=("[OK] ${nfs_export_dir} exists")
+      local nfs_own="" nfs_mode=""
+      nfs_own=$(stat -c '%U:%G' "${nfs_export_dir}" 2>/dev/null || echo "")
+      nfs_mode=$(stat -c '%a' "${nfs_export_dir}" 2>/dev/null || echo "")
+      if [[ "${nfs_own}" == "stellar:stellar" ]]; then
+        ok_msgs+=("[OK] ${nfs_export_dir} ownership is stellar:stellar")
+      else
+        err_msgs+=("[ERROR] ${nfs_export_dir} ownership is ${nfs_own:-unknown} (expected stellar:stellar).")
+        err_msgs+=("  → ACTION: Re-run STEP 14 or sudo chown stellar:stellar ${nfs_export_dir}")
+        nfs_sum_err=1
+      fi
+      if [[ "${nfs_mode}" == "755" ]]; then
+        ok_msgs+=("[OK] ${nfs_export_dir} mode is 755")
+      else
+        warn_msgs+=("[WARN] ${nfs_export_dir} mode is ${nfs_mode:-unknown} (expected 755).")
+        warn_msgs+=("  → ACTION: Re-run STEP 14 or sudo chmod 755 ${nfs_export_dir}")
+        nfs_sum_warn=1
+      fi
+    else
+      err_msgs+=("[ERROR] NFS export directory ${nfs_export_dir} does not exist.")
+      err_msgs+=("  → ACTION: Re-run STEP 14")
+      nfs_sum_err=1
+    fi
+    if [[ -f /etc/exports ]] && grep -q 'XDR_NFS_BACKUP_BEGIN' /etc/exports && grep -q 'XDR_NFS_BACKUP_END' /etc/exports; then
+      ok_msgs+=("[OK] /etc/exports contains XDR NFS backup marker block")
+    else
+      err_msgs+=("[ERROR] /etc/exports does not contain the XDR NFS backup marker block.")
+      err_msgs+=("  → ACTION: Re-run STEP 14")
+      nfs_sum_err=1
+    fi
+    local nfs_unmanaged_b
+    nfs_unmanaged_b=$(xdr_nfs_unmanaged_export_line_count "${nfs_export_dir}")
+    if [[ "${nfs_unmanaged_b}" -eq 0 ]]; then
+      ok_msgs+=("[OK] No unmanaged ${nfs_export_dir} export lines outside XDR marker block")
+    else
+      warn_msgs+=("[WARN] Unmanaged ${nfs_export_dir} export entries exist outside XDR marker block (${nfs_unmanaged_b} line(s)).")
+      warn_msgs+=("  → NOTE: Legacy lines may cause exportfs warnings; edit /etc/exports manually if needed")
+      nfs_sum_warn=1
+    fi
+    set +e
+    local exportfs_out=""
+    exportfs_out=$(exportfs -v 2>&1)
+    local exportfs_rc=$?
+    set -e
+    if [[ ${exportfs_rc} -eq 0 ]] && echo "${exportfs_out}" | grep -qF "${nfs_export_dir}"; then
+      ok_msgs+=("[OK] exportfs -v includes ${nfs_export_dir}")
+    else
+      warn_msgs+=("[WARN] exportfs -v does not list ${nfs_export_dir} or exportfs failed.")
+      warn_msgs+=("  → CHECK: sudo exportfs -ra && sudo systemctl restart nfs-server")
+      nfs_sum_warn=1
+    fi
+  fi
+  if [[ "${nfs_sum_err}" -gt 0 ]]; then
+    ok_msgs+=("[INFO] NFS backup interpreted summary: [ERROR] NFS backup configuration is invalid")
+  elif [[ "${nfs_sum_warn}" -gt 0 ]]; then
+    ok_msgs+=("[INFO] NFS backup interpreted summary: [WARN] NFS backup configuration has non-fatal issues")
+  else
+    ok_msgs+=("[INFO] NFS backup interpreted summary: [OK] NFS backup configuration is valid")
+  fi
+
+  ###############################
   # Build summary message (error → warning → normal)
   ###############################
   local summary=""
@@ -12597,6 +13835,10 @@ menu_full_validation() {
   local tmp_file="/tmp/xdr_full_validation_$(date '+%Y%m%d-%H%M%S').log"
 
   {
+    load_config 2>/dev/null || true
+    local nfs_edir="${NFS_BACKUP_EXPORT_DIR:-/stellarcyber}"
+    local val_mgt_mode="${MGT_REDUNDANCY_MODE:-single}"
+
     echo "========================================"
     echo " XDR Installer Full Configuration Validation"
     echo " Execution time: $(date '+%F %T')"
@@ -12635,6 +13877,19 @@ menu_full_validation() {
     echo "\$ ip addr show mgt"
     ip addr show mgt 2>&1 || echo "[WARN] mgt interface not visible."
     echo
+
+    if [[ "${val_mgt_mode}" == "active-passive" ]]; then
+      echo "[INFO] MGT_REDUNDANCY_MODE=active-passive (management bond — informational; interface may not exist until after reboot)"
+      echo "\$ cat /proc/net/bonding/mgt"
+      cat /proc/net/bonding/mgt 2>&1 || echo "[INFO] /proc/net/bonding/mgt not available (bond not up yet or before reboot)."
+      echo "\$ ip addr show mgtpri"
+      ip addr show mgtpri 2>&1 || echo "[INFO] mgtpri not visible (udev rename may apply after reboot)."
+      echo "\$ ip addr show mgtbak"
+      ip addr show mgtbak 2>&1 || echo "[INFO] mgtbak not visible (udev rename may apply after reboot)."
+      echo "\$ grep -E 'Currently Active Slave|Slave Interface|MII Status' /proc/net/bonding/mgt"
+      grep -E 'Currently Active Slave|Slave Interface|MII Status' /proc/net/bonding/mgt 2>&1 || echo "[INFO] Could not read bonding details from proc."
+      echo
+    fi
 
     echo "\$ ip addr show cltr0"
     ip addr show cltr0 2>&1 || echo "[WARN] cltr0 interface not visible."
@@ -12867,13 +14122,126 @@ menu_full_validation() {
     lspci | grep -E 'Virtual Function|Adaptive Virtual|Ethernet' 2>&1 || echo "[WARN] SR-IOV VF or NIC-related PCI devices not visible."
     echo
 
+    ##################################################
+    # 9. NFS backup (DP configuration) — STEP 14
+    ##################################################
+    echo "## 9. NFS backup (DP configuration) validation"
+    echo
+
+    echo "\$ dpkg -s nfs-kernel-server"
+    dpkg -s nfs-kernel-server 2>&1 || echo "[INFO] nfs-kernel-server not installed."
+    echo
+
+    echo "\$ systemctl status nfs-server --no-pager"
+    systemctl status nfs-server --no-pager 2>&1 || echo "[WARN] nfs-server status check failed"
+    echo
+
+    echo "\$ test -d ${nfs_edir} && stat -c '%n %U:%G %a' ${nfs_edir}"
+    if [[ -d "${nfs_edir}" ]]; then
+      stat -c '%n %U:%G %a' "${nfs_edir}" 2>&1
+    else
+      echo "[INFO] ${nfs_edir} does not exist."
+    fi
+    echo
+
+    echo "\$ grep -n 'XDR_NFS_BACKUP_' /etc/exports"
+    grep -n 'XDR_NFS_BACKUP_' /etc/exports 2>&1 || echo "[INFO] No XDR NFS backup markers in /etc/exports."
+    echo
+
+    echo "\$ exportfs -v"
+    exportfs -v 2>&1 || echo "[WARN] exportfs -v failed"
+    echo
+
+    echo ""
+    echo "--- Interpreted checks (NFS backup) ---"
+    local nfs_i_err=0 nfs_i_warn=0
+    if dpkg -s nfs-kernel-server >/dev/null 2>&1 && dpkg -s nfs-kernel-server 2>/dev/null | grep -q '^Status: install ok installed'; then
+      echo "[OK] nfs-kernel-server package is installed"
+    else
+      echo "[WARN] nfs-kernel-server package is not installed (STEP 14 not applied or package removed)"
+      nfs_i_warn=1
+    fi
+    if systemctl is-active --quiet nfs-server 2>/dev/null; then
+      echo "[OK] nfs-server service is active"
+    else
+      echo "[ERROR] nfs-server service is not active"
+      nfs_i_err=1
+    fi
+    if [[ -d "${nfs_edir}" ]]; then
+      echo "[OK] ${nfs_edir} directory exists"
+      local nfs_stat_u nfs_stat_m
+      nfs_stat_u=$(stat -c '%U:%G' "${nfs_edir}" 2>/dev/null || echo "unknown")
+      nfs_stat_m=$(stat -c '%a' "${nfs_edir}" 2>/dev/null || echo "")
+      if [[ "${nfs_stat_u}" == "stellar:stellar" ]]; then
+        echo "[OK] ${nfs_edir} ownership is stellar:stellar"
+      else
+        echo "[ERROR] ${nfs_edir} ownership is ${nfs_stat_u} (expected stellar:stellar)"
+        nfs_i_err=1
+      fi
+      if [[ "${nfs_stat_m}" == "755" ]]; then
+        echo "[OK] ${nfs_edir} mode is 755"
+      else
+        echo "[WARN] ${nfs_edir} mode is ${nfs_stat_m} (expected 755)"
+        nfs_i_warn=1
+      fi
+    else
+      echo "[ERROR] ${nfs_edir} directory does not exist"
+      nfs_i_err=1
+    fi
+    if [[ -f /etc/exports ]] && grep -q 'XDR_NFS_BACKUP_BEGIN' /etc/exports && grep -q 'XDR_NFS_BACKUP_END' /etc/exports; then
+      echo "[OK] /etc/exports contains XDR NFS backup marker block"
+    else
+      echo "[ERROR] /etc/exports does not contain the XDR NFS backup marker block"
+      nfs_i_err=1
+    fi
+    set +e
+    local nfs_expfs_try=""
+    nfs_expfs_try=$(exportfs -v 2>&1)
+    local nfs_expfs_rc=$?
+    set -e
+    if [[ ${nfs_expfs_rc} -eq 0 ]] && echo "${nfs_expfs_try}" | grep -qF "${nfs_edir}"; then
+      echo "[OK] exportfs -v output includes ${nfs_edir}"
+    else
+      echo "[WARN] exportfs -v does not list ${nfs_edir} or exportfs failed"
+      nfs_i_warn=1
+    fi
+    local nfs_unmanaged_cnt
+    nfs_unmanaged_cnt=$(xdr_nfs_unmanaged_export_line_count "${nfs_edir}")
+    if [[ "${nfs_unmanaged_cnt}" -eq 0 ]]; then
+      echo "[OK] No unmanaged ${nfs_edir} export lines outside XDR marker block"
+    else
+      echo "[WARN] Unmanaged ${nfs_edir} export entries exist outside XDR marker block (${nfs_unmanaged_cnt} line(s))"
+      nfs_i_warn=1
+    fi
+    if [[ "${nfs_i_err}" -gt 0 ]]; then
+      echo "[INFO] NFS backup interpreted summary: [ERROR] NFS backup configuration is invalid"
+    elif [[ "${nfs_i_warn}" -gt 0 ]]; then
+      echo "[INFO] NFS backup interpreted summary: [WARN] NFS backup configuration has non-fatal issues"
+    else
+      echo "[INFO] NFS backup interpreted summary: [OK] NFS backup configuration is valid"
+    fi
+    echo ""
+
     echo
     echo "========================================"
     echo " Full configuration validation completed"
     echo "========================================"
+    echo "[INFO] Validation completed. Exiting the viewer returns you to the shell/menu; it does not indicate a script crash."
     echo
 
   } > "${tmp_file}"
+
+  mkdir -p "${STATE_DIR}"
+  {
+    echo ""
+    echo "=================================================="
+    echo "[VALIDATION RUN] $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "=================================================="
+    cat "${tmp_file}"
+    echo ""
+  } >> "${STATE_DIR}/xdr_validation.log"
+
+  echo "[DEBUG] Validation log saved to ${STATE_DIR}/xdr_validation.log" >&2
 
   # Re-enable set -e
   set -e
@@ -12906,6 +14274,21 @@ menu_full_validation() {
 
   # Clean up temporary summary file
   rm -f "${summary_file}"
+
+  # Post-viewer UX: explicit confirmation before returning to main menu (not a script exit)
+  local post_validation_msg
+  post_validation_msg=$'Full configuration validation has completed successfully.\n\nYou are now returning to the main menu.\n\n(This is not a script exit.)'
+  if command -v whiptail >/dev/null 2>&1; then
+    whiptail_msgbox "Validation Completed" "${post_validation_msg}" 14 75
+  else
+    echo ""
+    echo "[INFO] Validation complete. Press ENTER to return to main menu."
+    read -r
+  fi
+
+  set -e
+  echo "[DEBUG] menu_full_validation completed, returning to main menu" >&2
+  return 0
 }
 
 
@@ -12967,7 +14350,7 @@ show_usage_help() {
 ┌─────────────────────────────────────────────────────────────┐
 │ 4. Full Configuration Validation                            │
 │    → Comprehensive system validation                         │
-│    → Checks: KVM, VMs, network, SR-IOV, storage            │
+│    → Checks: KVM, VMs, network, SR-IOV, storage, NFS backup  │
 │    → Displays errors and warnings with detailed logs         │
 └─────────────────────────────────────────────────────────────┘
 
@@ -13020,9 +14403,37 @@ Step-by-Step Process:
    STEP 11 → DA-master VM deployment
    STEP 12 → SR-IOV VF passthrough + CPU affinity
    STEP 13 → DP Appliance CLI installation
+   STEP 14 → NFS backup server (DP configuration backup only)
 
 7. Verification:
    • Select menu 4 to validate complete installation
+
+
+═══════════════════════════════════════════════════════════════
+📁 **STEP 14: Configure NFS Backup Server**
+═══════════════════════════════════════════════════════════════
+
+STEP 14 configures an NFS server on the KVM host for Stellar Cyber DP *configuration* backup only (not for general data backup).
+
+What this step performs:
+────────────────────────────────────────────────────────────
+• NFS installation
+  → Installs nfs-kernel-server (apt) when the package is not already present; if NFS is already installed, the step skips package installation and only updates client access and exports.
+
+• Export directory creation
+  → On first-time install, creates the export directory (default: /stellarcyber, configurable via NFS_BACKUP_EXPORT_DIR) with mkdir and chmod 755.
+
+• stellar:stellar ownership
+  → On first-time install, sets directory owner and group to stellar:stellar (requires the stellar user and group to exist on the host).
+
+• Single IP / CIDR access control
+  → You choose whether only one IPv4 (e.g. DL-master) or an entire IPv4 CIDR range may mount the export; this value is stored and applied in the export line.
+
+• Managed /etc/exports block
+  → Only the lines between # XDR_NFS_BACKUP_BEGIN and # XDR_NFS_BACKUP_END are written or replaced; other entries in /etc/exports are not modified.
+
+• exportfs apply and service restart
+  → Runs sudo exportfs -ra to apply export changes, then sudo systemctl restart nfs-server so the NFS service loads the new configuration.
 
 
 ═══════════════════════════════════════════════════════════════
@@ -13071,6 +14482,10 @@ Common Use Cases:
   → Menu 2 → STEP 07 (LVM storage)
   → Note: Existing data may be affected
 
+• NFS backup server (DP configuration backup only):
+  → Menu 2 → STEP 14
+  → Adjust allowed client IP or CIDR; export is marked in /etc/exports only
+
 
 ═══════════════════════════════════════════════════════════════
 🔍 **Scenario 4: Validation and Troubleshooting**
@@ -13088,6 +14503,7 @@ Validation Checks:
 ✓ SR-IOV configuration (PF/VF status, passthrough)
 ✓ Storage configuration (LVM volumes, mount points)
 ✓ Service status (libvirtd, ntpsec)
+✓ NFS backup export (STEP 14): package, nfs-server, /etc/exports markers, exportfs
 
 Understanding Results:
 ────────────────────────────────────────────────────────────
@@ -13390,7 +14806,8 @@ main_menu() {
             menu_config
             ;;
           "4")
-            menu_full_validation
+            menu_full_validation || true
+            continue
             ;;
           "5")
             show_usage_help

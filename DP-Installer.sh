@@ -3082,20 +3082,20 @@ step_03_nic_ifupdown() {
     if [[ -z "${ip}" && -f "${f}" ]]; then
       # if mgt stanza exists in /etc/network/interfaces
       ip="$(awk '
-        $1=="iface" && $2=="mgt" {in=1}
-        in && $1=="address" {print $2; exit}
+        $1=="iface" && $2=="mgt" {inside=1}
+        inside && $1=="address" {print $2; exit}
       ' "${f}" 2>/dev/null || true)"
       netmask="$(awk '
-        $1=="iface" && $2=="mgt" {in=1}
-        in && $1=="netmask" {print $2; exit}
+        $1=="iface" && $2=="mgt" {inside=1}
+        inside && $1=="netmask" {print $2; exit}
       ' "${f}" 2>/dev/null || true)"
       gw="$(awk '
-        $1=="iface" && $2=="mgt" {in=1}
-        in && $1=="gateway" {print $2; exit}
+        $1=="iface" && $2=="mgt" {inside=1}
+        inside && $1=="gateway" {print $2; exit}
       ' "${f}" 2>/dev/null || true)"
       dns="$(awk '
-        $1=="iface" && $2=="mgt" {in=1}
-        in && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}
+        $1=="iface" && $2=="mgt" {inside=1}
+        inside && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}
       ' "${f}" 2>/dev/null || true)"
     fi
 
@@ -3487,9 +3487,9 @@ EOF
     extract_iface_value() {
       local file="$1" iface="$2" key="$3"
       awk -v iface="${iface}" -v key="${key}" '
-        $1=="iface" && $2==iface {in=1; next}
-        in && $1=="iface" {in=0}
-        in && $1==key {print $2; exit}
+        $1=="iface" && $2==iface {inside=1; next}
+        inside && $1=="iface" {inside=0}
+        inside && $1==key {print $2; exit}
       ' "${file}" 2>/dev/null || true
     }
 
@@ -3497,9 +3497,9 @@ EOF
     extract_dns_list() {
       local file="$1" iface="$2"
       awk -v iface="${iface}" '
-        $1=="iface" && $2==iface {in=1; next}
-        in && $1=="iface" {in=0}
-        in && $1=="dns-nameservers" {$1=""; sub(/^[[:space:]]+/,""); print; exit}
+        $1=="iface" && $2==iface {inside=1; next}
+        inside && $1=="iface" {inside=0}
+        inside && $1=="dns-nameservers" {$1=""; sub(/^[[:space:]]+/,""); print; exit}
       ' "${file}" 2>/dev/null || true
     }
 
@@ -3585,16 +3585,16 @@ EOF
     mgt_gw="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "gateway")"
     mgt_dns="$(extract_dns_list "${mgt_cfg}" "${mgt_verify_iface}")"
     if [[ -z "${mgt_addr}" ]]; then
-      mgt_addr="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*address/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_addr="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*address/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_netmask}" ]]; then
-      mgt_netmask="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*netmask/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_netmask="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*netmask/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_gw}" ]]; then
-      mgt_gw="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*gateway/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_gw="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*gateway/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     if [[ -z "${mgt_dns}" ]]; then
-      mgt_dns="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{in=1;next} in&&/^[[:space:]]*dns-nameservers/{sub(/^[^ ]+ /,"");print;exit}' "${mgt_cfg}" 2>/dev/null || true)"
+      mgt_dns="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*dns-nameservers/{sub(/^[^ ]+ /,"");print;exit}' "${mgt_cfg}" 2>/dev/null || true)"
     fi
     mgt_addr="$(normalize_value "${mgt_addr}")"
     mgt_netmask="$(normalize_value "${mgt_netmask}")"

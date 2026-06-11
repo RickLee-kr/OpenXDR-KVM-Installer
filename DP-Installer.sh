@@ -2958,6 +2958,37 @@ detect_existing_mgt_render_mode() {
   return 0
 }
 
+# Read an ifupdown option from a fragment file (indentation-tolerant; safe on mawk).
+step03_read_ifupdown_field() {
+  local file="$1" key="$2"
+  [[ -f "${file}" ]] || return 0
+  case "${key}" in
+    address|netmask|gateway)
+      awk -v k="${key}" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]+" { print $2; exit }
+      ' "${file}" 2>/dev/null || true
+      ;;
+    dns-nameservers)
+      awk '
+        /^[[:space:]]*dns-nameservers[[:space:]]+/ {
+          sub(/^[[:space:]]*dns-nameservers[[:space:]]+/, "")
+          print
+          exit
+        }
+      ' "${file}" 2>/dev/null || true
+      ;;
+    bridge_ports)
+      awk '
+        /^[[:space:]]*bridge_ports[[:space:]]+/ {
+          sub(/^[[:space:]]*bridge_ports[[:space:]]+/, "")
+          print
+          exit
+        }
+      ' "${file}" 2>/dev/null || true
+      ;;
+  esac
+}
+
 # Validate 01-mgt.cfg content matches target redundancy mode (after write).
 step03_validate_mgt_cfg_written() {
   local mgt_cfg="$1"
@@ -3073,30 +3104,17 @@ step_03_nic_ifupdown() {
     local ip="" netmask="" gw="" dns=""
 
     if [[ -f "${fd}/01-mgt.cfg" ]]; then
-      ip="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "address")"
+      netmask="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "netmask")"
+      gw="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "gateway")"
+      dns="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "dns-nameservers")"
     fi
 
     if [[ -z "${ip}" && -f "${f}" ]]; then
-      # if mgt stanza exists in /etc/network/interfaces
-      ip="$(awk '
-        $1=="iface" && $2=="mgt" {inside=1}
-        inside && $1=="address" {print $2; exit}
-      ' "${f}" 2>/dev/null || true)"
-      netmask="$(awk '
-        $1=="iface" && $2=="mgt" {inside=1}
-        inside && $1=="netmask" {print $2; exit}
-      ' "${f}" 2>/dev/null || true)"
-      gw="$(awk '
-        $1=="iface" && $2=="mgt" {inside=1}
-        inside && $1=="gateway" {print $2; exit}
-      ' "${f}" 2>/dev/null || true)"
-      dns="$(awk '
-        $1=="iface" && $2=="mgt" {inside=1}
-        inside && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}
-      ' "${f}" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${f}" "address")"
+      netmask="$(step03_read_ifupdown_field "${f}" "netmask")"
+      gw="$(step03_read_ifupdown_field "${f}" "gateway")"
+      dns="$(step03_read_ifupdown_field "${f}" "dns-nameservers")"
     fi
 
     echo "${ip}|${netmask}|${gw}|${dns}"
@@ -3483,26 +3501,6 @@ EOF
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[STEP 03] DRY-RUN: Skipping file-based verification"
   else
-    # Helper: extract value for a key within an iface stanza
-    extract_iface_value() {
-      local file="$1" iface="$2" key="$3"
-      awk -v iface="${iface}" -v key="${key}" '
-        $1=="iface" && $2==iface {inside=1; next}
-        inside && $1=="iface" {inside=0}
-        inside && $1==key {print $2; exit}
-      ' "${file}" 2>/dev/null || true
-    }
-
-    # Helper: extract full dns-nameservers line (can have multiple values)
-    extract_dns_list() {
-      local file="$1" iface="$2"
-      awk -v iface="${iface}" '
-        $1=="iface" && $2==iface {inside=1; next}
-        inside && $1=="iface" {inside=0}
-        inside && $1=="dns-nameservers" {$1=""; sub(/^[[:space:]]+/,""); print; exit}
-      ' "${file}" 2>/dev/null || true
-    }
-
     normalize_value() {
       echo "$1" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
     }
@@ -3578,24 +3576,10 @@ EOF
     fi
 
     local mgt_addr mgt_netmask mgt_gw mgt_dns
-    local mgt_verify_iface="mgt"
-    [[ "${mgt_mode}" == "active-passive" ]] && mgt_verify_iface="${bn_mgt}"
-    mgt_addr="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "address")"
-    mgt_netmask="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "netmask")"
-    mgt_gw="$(extract_iface_value "${mgt_cfg}" "${mgt_verify_iface}" "gateway")"
-    mgt_dns="$(extract_dns_list "${mgt_cfg}" "${mgt_verify_iface}")"
-    if [[ -z "${mgt_addr}" ]]; then
-      mgt_addr="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*address/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
-    fi
-    if [[ -z "${mgt_netmask}" ]]; then
-      mgt_netmask="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*netmask/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
-    fi
-    if [[ -z "${mgt_gw}" ]]; then
-      mgt_gw="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*gateway/{print $2;exit}' "${mgt_cfg}" 2>/dev/null || true)"
-    fi
-    if [[ -z "${mgt_dns}" ]]; then
-      mgt_dns="$(awk -v iface="${mgt_verify_iface}" '$1=="iface"&&$2==iface{inside=1;next} inside&&/^[[:space:]]*dns-nameservers/{sub(/^[^ ]+ /,"");print;exit}' "${mgt_cfg}" 2>/dev/null || true)"
-    fi
+    mgt_addr="$(step03_read_ifupdown_field "${mgt_cfg}" "address")"
+    mgt_netmask="$(step03_read_ifupdown_field "${mgt_cfg}" "netmask")"
+    mgt_gw="$(step03_read_ifupdown_field "${mgt_cfg}" "gateway")"
+    mgt_dns="$(step03_read_ifupdown_field "${mgt_cfg}" "dns-nameservers")"
     mgt_addr="$(normalize_value "${mgt_addr}")"
     mgt_netmask="$(normalize_value "${mgt_netmask}")"
     mgt_gw="$(normalize_value "${mgt_gw}")"
@@ -3637,14 +3621,8 @@ EOF
     fi
 
     local host_addr host_netmask
-    host_addr="$(extract_iface_value "${host_cfg}" "hostmgmt" "address")"
-    host_netmask="$(extract_iface_value "${host_cfg}" "hostmgmt" "netmask")"
-    if [[ -z "${host_addr}" ]]; then
-      host_addr="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${host_cfg}" 2>/dev/null || true)"
-    fi
-    if [[ -z "${host_netmask}" ]]; then
-      host_netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${host_cfg}" 2>/dev/null || true)"
-    fi
+    host_addr="$(step03_read_ifupdown_field "${host_cfg}" "address")"
+    host_netmask="$(step03_read_ifupdown_field "${host_cfg}" "netmask")"
     host_addr="$(normalize_value "${host_addr}")"
     host_netmask="$(normalize_value "${host_netmask}")"
     if [[ ! -f "${host_cfg}" ]] || \
@@ -3666,10 +3644,7 @@ EOF
 
     if [[ "${cluster_nic_type}" == "BRIDGE" ]]; then
       local br_ports
-      br_ports="$(extract_iface_value "${br_cfg}" "${CLUSTER_BRIDGE_NAME}" "bridge_ports")"
-      if [[ -z "${br_ports}" ]]; then
-        br_ports="$(awk '/^[[:space:]]*bridge_ports[[:space:]]+/{sub(/^[[:space:]]*bridge_ports[[:space:]]+/,""); print; exit}' "${br_cfg}" 2>/dev/null || true)"
-      fi
+      br_ports="$(step03_read_ifupdown_field "${br_cfg}" "bridge_ports")"
       br_ports="$(normalize_list "${br_ports}")"
       if [[ ! -f "${br_cfg}" ]] || \
          ! grep -qE "^[[:space:]]*iface[[:space:]]+${CLUSTER_BRIDGE_NAME}[[:space:]]+inet[[:space:]]+manual([[:space:]]|$)" "${br_cfg}" 2>/dev/null || \

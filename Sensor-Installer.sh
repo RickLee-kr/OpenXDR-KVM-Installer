@@ -584,6 +584,16 @@ load_config() {
   : "${SENSOR_NET_MODE:=nat}"
   : "${LV_LOCATION:=}"
   : "${LV_SIZE_GB:=}"
+
+  # Network (STEP 03)
+  : "${MGT_IP_ADDR:=}"
+  : "${MGT_IP_PREFIX:=}"
+  : "${MGT_GW:=}"
+  : "${MGT_DNS:=}"
+  : "${HOST_IP_ADDR:=}"
+  : "${HOST_IP_PREFIX:=}"
+  : "${HOST_GW:=}"
+  : "${HOST_DNS:=}"
 }
 
 
@@ -614,6 +624,14 @@ save_config() {
   esc_sensor_net_mode=${SENSOR_NET_MODE//\"/\\\"}
   esc_lv_location=${LV_LOCATION//\"/\\\"}
   esc_lv_size_gb=${LV_SIZE_GB//\"/\\\"}
+  : "${MGT_IP_ADDR:=}"
+  : "${MGT_IP_PREFIX:=}"
+  : "${MGT_GW:=}"
+  : "${MGT_DNS:=}"
+  : "${HOST_IP_ADDR:=}"
+  : "${HOST_IP_PREFIX:=}"
+  : "${HOST_GW:=}"
+  : "${HOST_DNS:=}"
 
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer environment configuration (auto-generated)
@@ -649,6 +667,16 @@ SPAN_BRIDGE_LIST="${esc_span_bridge_list}"
 SENSOR_NET_MODE="${esc_sensor_net_mode}"
 LV_LOCATION="${esc_lv_location}"
 LV_SIZE_GB="${esc_lv_size_gb}"
+
+# Network (STEP 03)
+MGT_IP_ADDR="${MGT_IP_ADDR//\"/\\\"}"
+MGT_IP_PREFIX="${MGT_IP_PREFIX//\"/\\\"}"
+MGT_GW="${MGT_GW//\"/\\\"}"
+MGT_DNS="${MGT_DNS//\"/\\\"}"
+HOST_IP_ADDR="${HOST_IP_ADDR//\"/\\\"}"
+HOST_IP_PREFIX="${HOST_IP_PREFIX//\"/\\\"}"
+HOST_GW="${HOST_GW//\"/\\\"}"
+HOST_DNS="${HOST_DNS//\"/\\\"}"
 EOF
 }
 
@@ -694,6 +722,14 @@ save_config_var() {
     SENSOR_NET_MODE) SENSOR_NET_MODE="${value}" ;;
     LV_LOCATION) LV_LOCATION="${value}" ;;
     LV_SIZE_GB) LV_SIZE_GB="${value}" ;;
+    MGT_IP_ADDR) MGT_IP_ADDR="${value}" ;;
+    MGT_IP_PREFIX) MGT_IP_PREFIX="${value}" ;;
+    MGT_GW) MGT_GW="${value}" ;;
+    MGT_DNS) MGT_DNS="${value}" ;;
+    HOST_IP_ADDR) HOST_IP_ADDR="${value}" ;;
+    HOST_IP_PREFIX) HOST_IP_PREFIX="${value}" ;;
+    HOST_GW) HOST_GW="${value}" ;;
+    HOST_DNS) HOST_DNS="${value}" ;;
     *)
       # Unknown keys are ignored for now (can be extended here if needed)
       ;;
@@ -2262,6 +2298,69 @@ step_02_hwe_kernel() {
   return 0
 }
 
+# Normalize CIDR prefix input (accepts "27" or "/27").
+step03_normalize_prefix_input() {
+  local p="$1"
+  p="${p//$'\r'/}"
+  p="${p#"${p%%[![:space:]]*}"}"
+  p="${p%"${p##*[![:space:]]}"}"
+  p="${p#/}"
+  [[ "${p}" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 32 )) || return 1
+  echo "${p}"
+  return 0
+}
+
+step03_cidr_to_netmask() {
+  local pfx
+  pfx="$(step03_normalize_prefix_input "$1")" || return 1
+  local mask=$(( 0xffffffff << (32 - pfx) & 0xffffffff ))
+  printf "%d.%d.%d.%d\n" \
+    $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
+}
+
+step03_netmask_to_prefix() {
+  local nm="$1"
+  local o1 o2 o3 o4 val cnt expected
+  nm="${nm//$'\r'/}"
+  nm="${nm#"${nm%%[![:space:]]*}"}"
+  nm="${nm%"${nm##*[![:space:]]}"}"
+  [[ -n "${nm}" ]] || return 1
+  IFS=. read -r o1 o2 o3 o4 <<< "${nm}" || return 1
+  [[ "${o1}" =~ ^[0-9]+$ && "${o2}" =~ ^[0-9]+$ && "${o3}" =~ ^[0-9]+$ && "${o4}" =~ ^[0-9]+$ ]] || return 1
+  val=$(( (o1<<24) | (o2<<16) | (o3<<8) | o4 ))
+  cnt=0
+  while (( val > 0 )); do
+    cnt=$((cnt + (val & 1)))
+    val=$((val >> 1))
+  done
+  expected=$(( (0xffffffff << (32 - cnt)) & 0xffffffff ))
+  (( expected == ( (o1<<24) | (o2<<16) | (o3<<8) | o4 ) )) || return 1
+  echo "${cnt}"
+  return 0
+}
+
+step03_read_ifupdown_field() {
+  local file="$1" key="$2"
+  [[ -f "${file}" ]] || return 0
+  case "${key}" in
+    address|netmask|gateway)
+      awk -v k="${key}" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]+" { print $2; exit }
+      ' "${file}" 2>/dev/null || true
+      ;;
+    dns-nameservers)
+      awk '
+        /^[[:space:]]*dns-nameservers[[:space:]]+/ {
+          sub(/^[[:space:]]*dns-nameservers[[:space:]]+/, "")
+          print
+          exit
+        }
+      ' "${file}" 2>/dev/null || true
+      ;;
+  esac
+}
+
 
 step_03_nic_ifupdown() {
   log "[STEP 03] NIC naming/ifupdown transition and Network Configuration"
@@ -2300,30 +2399,23 @@ step_03_bridge_mode_declarative() {
     return 1
   fi
 
-  cidr_to_netmask() {
-    local pfx="$1"
-    local mask=$(( 0xffffffff << (32-pfx) & 0xffffffff ))
-    printf "%d.%d.%d.%d\n" \
-      $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
-  }
-
   parse_host_from_interfaces() {
     local f="/etc/network/interfaces"
     local fd="/etc/network/interfaces.d"
     local ip="" netmask="" gw="" dns=""
 
     if [[ -f "${fd}/01-host.cfg" ]]; then
-      ip="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${fd}/01-host.cfg" 2>/dev/null || true)"
-      netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${fd}/01-host.cfg" 2>/dev/null || true)"
-      gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${fd}/01-host.cfg" 2>/dev/null || true)"
-      dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${fd}/01-host.cfg" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${fd}/01-host.cfg" "address")"
+      netmask="$(step03_read_ifupdown_field "${fd}/01-host.cfg" "netmask")"
+      gw="$(step03_read_ifupdown_field "${fd}/01-host.cfg" "gateway")"
+      dns="$(step03_read_ifupdown_field "${fd}/01-host.cfg" "dns-nameservers")"
     fi
 
     if [[ -z "${ip}" && -f "${f}" ]]; then
-      ip="$(awk '$1=="iface" && $2=="host" {in=1} in && $1=="address" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      netmask="$(awk '$1=="iface" && $2=="host" {in=1} in && $1=="netmask" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      gw="$(awk '$1=="iface" && $2=="host" {in=1} in && $1=="gateway" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      dns="$(awk '$1=="iface" && $2=="host" {in=1} in && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}' "${f}" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${f}" "address")"
+      netmask="$(step03_read_ifupdown_field "${f}" "netmask")"
+      gw="$(step03_read_ifupdown_field "${f}" "gateway")"
+      dns="$(step03_read_ifupdown_field "${f}" "dns-nameservers")"
     fi
 
     echo "${ip}|${netmask}|${gw}|${dns}"
@@ -2412,23 +2504,38 @@ EOF
   dns0="${parsed}"
 
   local def_ip="${HOST_IP_ADDR:-$ip0}"
-  local def_prefix="${HOST_IP_PREFIX:-24}"
+  local def_prefix="${HOST_IP_PREFIX:-}"
   local def_gw="${HOST_GW:-$gw0}"
   local def_dns="${HOST_DNS:-$dns0}"
+  if [[ -z "${def_prefix}" && -n "${nm0}" ]]; then
+    def_prefix="$(step03_netmask_to_prefix "${nm0}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${def_prefix}" ]]; then
+    def_prefix="24"
+  fi
   [[ -z "${def_dns}" ]] && def_dns="8.8.8.8 8.8.4.4"
 
   local new_ip new_prefix new_gw new_dns
   new_ip="$(whiptail_inputbox "STEP 03 - HOST IP Configuration" "Enter HOST interface IP address:\nExample: 10.4.0.210" "${def_ip}" 10 60)" || return 1
   [[ -z "${new_ip}" ]] && return 1
-  new_prefix="$(whiptail_inputbox "STEP 03 - HOST Prefix" "Enter prefix (CIDR notation):\nExample: 24" "${def_prefix}" 10 60)" || return 1
-  [[ -z "${new_prefix}" ]] && return 1
+  while true; do
+    new_prefix="$(whiptail_inputbox "STEP 03 - HOST Prefix" "Enter prefix (CIDR notation):\nExamples: 24, 27, /27" "${def_prefix}" 10 60)" || return 1
+    [[ -z "${new_prefix}" ]] && return 1
+    if new_prefix="$(step03_normalize_prefix_input "${new_prefix}")"; then
+      break
+    fi
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Invalid subnet prefix.\n\nEnter a number from 1 to 32.\nExamples: 24, 27, /27" 12 75
+  done
   new_gw="$(whiptail_inputbox "STEP 03 - Gateway" "Enter default gateway IP:\nExample: 10.4.0.254" "${def_gw}" 10 60)" || return 1
   [[ -z "${new_gw}" ]] && return 1
   new_dns="$(whiptail_inputbox "STEP 03 - DNS" "Enter DNS server IPs (space-separated):\nExample: 8.8.8.8 8.8.4.4" "${def_dns}" 10 70)" || return 1
   [[ -z "${new_dns}" ]] && return 1
 
   local netmask
-  netmask="$(cidr_to_netmask "${new_prefix}")"
+  netmask="$(step03_cidr_to_netmask "${new_prefix}")" || {
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Could not convert prefix /${new_prefix} to netmask." 10 70
+    return 1
+  }
 
   save_config_var "HOST_IP_ADDR" "${new_ip}"
   save_config_var "HOST_IP_PREFIX" "${new_prefix}"
@@ -2624,30 +2731,23 @@ step_03_nat_mode_declarative() {
     return 1
   fi
 
-  cidr_to_netmask() {
-    local pfx="$1"
-    local mask=$(( 0xffffffff << (32-pfx) & 0xffffffff ))
-    printf "%d.%d.%d.%d\n" \
-      $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
-  }
-
   parse_mgt_from_interfaces() {
     local f="/etc/network/interfaces"
     local fd="/etc/network/interfaces.d"
     local ip="" netmask="" gw="" dns=""
 
     if [[ -f "${fd}/01-mgt.cfg" ]]; then
-      ip="$(awk '/^[[:space:]]*address[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      netmask="$(awk '/^[[:space:]]*netmask[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      gw="$(awk '/^[[:space:]]*gateway[[:space:]]+/{print $2; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
-      dns="$(awk '/^[[:space:]]*dns-nameservers[[:space:]]+/{sub(/^[[:space:]]*dns-nameservers[[:space:]]+/,""); print; exit}' "${fd}/01-mgt.cfg" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "address")"
+      netmask="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "netmask")"
+      gw="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "gateway")"
+      dns="$(step03_read_ifupdown_field "${fd}/01-mgt.cfg" "dns-nameservers")"
     fi
 
     if [[ -z "${ip}" && -f "${f}" ]]; then
-      ip="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="address" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      netmask="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="netmask" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      gw="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="gateway" {print $2; exit}' "${f}" 2>/dev/null || true)"
-      dns="$(awk '$1=="iface" && $2=="mgt" {in=1} in && $1=="dns-nameservers" {sub(/^dns-nameservers[[:space:]]+/,""); print; exit}' "${f}" 2>/dev/null || true)"
+      ip="$(step03_read_ifupdown_field "${f}" "address")"
+      netmask="$(step03_read_ifupdown_field "${f}" "netmask")"
+      gw="$(step03_read_ifupdown_field "${f}" "gateway")"
+      dns="$(step03_read_ifupdown_field "${f}" "dns-nameservers")"
     fi
 
     echo "${ip}|${netmask}|${gw}|${dns}"
@@ -2749,23 +2849,38 @@ ACTION==\"add\", SUBSYSTEM==\"net\", KERNELS==\"${span_pci}\", NAME:=\"${span_ni
   dns0="${parsed}"
 
   local def_ip="${MGT_IP_ADDR:-$ip0}"
-  local def_prefix="${MGT_IP_PREFIX:-24}"
+  local def_prefix="${MGT_IP_PREFIX:-}"
   local def_gw="${MGT_GW:-$gw0}"
   local def_dns="${MGT_DNS:-$dns0}"
+  if [[ -z "${def_prefix}" && -n "${nm0}" ]]; then
+    def_prefix="$(step03_netmask_to_prefix "${nm0}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${def_prefix}" ]]; then
+    def_prefix="24"
+  fi
   [[ -z "${def_dns}" ]] && def_dns="8.8.8.8 8.8.4.4"
 
   local new_ip new_prefix new_gw new_dns
   new_ip=$(whiptail_inputbox "STEP 03 - mgt NIC IP Configuration" "Enter NAT uplink NIC (mgt) IP address:" "${def_ip}" 8 60) || return 1
   [[ -z "${new_ip}" ]] && return 1
-  new_prefix=$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${def_prefix}" 8 60) || return 1
-  [[ -z "${new_prefix}" ]] && return 1
+  while true; do
+    new_prefix=$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExamples: 24, 27, /27" "${def_prefix}" 8 60) || return 1
+    [[ -z "${new_prefix}" ]] && return 1
+    if new_prefix="$(step03_normalize_prefix_input "${new_prefix}")"; then
+      break
+    fi
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Invalid subnet prefix.\n\nEnter a number from 1 to 32.\nExamples: 24, 27, /27" 12 75
+  done
   new_gw=$(whiptail_inputbox "STEP 03 - Gateway Configuration" "Enter gateway IP:" "${def_gw}" 8 60) || return 1
   [[ -z "${new_gw}" ]] && return 1
   new_dns=$(whiptail_inputbox "STEP 03 - DNS Configuration" "Enter DNS server IPs:" "${def_dns}" 8 60) || return 1
   [[ -z "${new_dns}" ]] && return 1
 
   local netmask
-  netmask="$(cidr_to_netmask "${new_prefix}")"
+  netmask="$(step03_cidr_to_netmask "${new_prefix}")" || {
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Could not convert prefix /${new_prefix} to netmask." 10 70
+    return 1
+  }
 
   save_config_var "MGT_IP_ADDR" "${new_ip}"
   save_config_var "MGT_IP_PREFIX" "${new_prefix}"

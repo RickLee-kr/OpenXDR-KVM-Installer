@@ -680,6 +680,12 @@ load_config() {
   : "${NFS_BACKUP_ALLOWED_CLIENT:=192.168.122.2}"
   : "${NFS_BACKUP_ALLOWED_CLIENT_CIDR:=192.168.122.2/24}"
   : "${NFS_BACKUP_CLIENT_MODE:=single}"
+
+  # MGT network (STEP 03)
+  : "${MGT_IP_ADDR:=}"
+  : "${MGT_IP_PREFIX:=}"
+  : "${MGT_GW:=}"
+  : "${MGT_DNS:=}"
 }
 
 
@@ -729,6 +735,10 @@ save_config() {
   : "${MGT_BOND_NAME:=mgt}"
   : "${MGT_BOND_PRIMARY_NAME:=mgtpri}"
   : "${MGT_BOND_BACKUP_NAME:=mgtbak}"
+  : "${MGT_IP_ADDR:=}"
+  : "${MGT_IP_PREFIX:=}"
+  : "${MGT_GW:=}"
+  : "${MGT_DNS:=}"
 
   cat > "${CONFIG_FILE}" <<EOF
 # xdr-installer configuration (auto-generated)
@@ -801,6 +811,12 @@ RENAMED_CONFLICT_IFACES="${RENAMED_CONFLICT_IFACES//\"/\\\"}"
 # Cluster Interface Type (SRIOV or BRIDGE)
 CLUSTER_NIC_TYPE="${esc_cluster_nic_type}"
 CLUSTER_BRIDGE_NAME="${esc_cluster_bridge_name}"
+
+# MGT network (STEP 03)
+MGT_IP_ADDR="${MGT_IP_ADDR//\"/\\\"}"
+MGT_IP_PREFIX="${MGT_IP_PREFIX//\"/\\\"}"
+MGT_GW="${MGT_GW//\"/\\\"}"
+MGT_DNS="${MGT_DNS//\"/\\\"}"
 
 # VM configuration (set in STEP 10/11)
 DL_VCPUS=${DL_VCPUS}
@@ -917,6 +933,10 @@ save_config_var() {
     NFS_BACKUP_ALLOWED_CLIENT) NFS_BACKUP_ALLOWED_CLIENT="${value}" ;;
     NFS_BACKUP_ALLOWED_CLIENT_CIDR) NFS_BACKUP_ALLOWED_CLIENT_CIDR="${value}" ;;
     NFS_BACKUP_CLIENT_MODE) NFS_BACKUP_CLIENT_MODE="${value}" ;;
+    MGT_IP_ADDR) MGT_IP_ADDR="${value}" ;;
+    MGT_IP_PREFIX) MGT_IP_PREFIX="${value}" ;;
+    MGT_GW) MGT_GW="${value}" ;;
+    MGT_DNS) MGT_DNS="${value}" ;;
     *)
       # Ignore unknown keys for now (extend here if needed)
       ;;
@@ -2958,6 +2978,50 @@ detect_existing_mgt_render_mode() {
   return 0
 }
 
+# Normalize CIDR prefix input (accepts "27" or "/27").
+step03_normalize_prefix_input() {
+  local p="$1"
+  p="${p//$'\r'/}"
+  p="${p#"${p%%[![:space:]]*}"}"
+  p="${p%"${p##*[![:space:]]}"}"
+  p="${p#/}"
+  [[ "${p}" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 32 )) || return 1
+  echo "${p}"
+  return 0
+}
+
+# Convert prefix length to dotted-decimal netmask.
+step03_cidr_to_netmask() {
+  local pfx
+  pfx="$(step03_normalize_prefix_input "$1")" || return 1
+  local mask=$(( 0xffffffff << (32 - pfx) & 0xffffffff ))
+  printf "%d.%d.%d.%d\n" \
+    $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
+}
+
+# Convert dotted-decimal netmask back to prefix length (for defaults on re-run).
+step03_netmask_to_prefix() {
+  local nm="$1"
+  local o1 o2 o3 o4 val cnt expected
+  nm="${nm//$'\r'/}"
+  nm="${nm#"${nm%%[![:space:]]*}"}"
+  nm="${nm%"${nm##*[![:space:]]}"}"
+  [[ -n "${nm}" ]] || return 1
+  IFS=. read -r o1 o2 o3 o4 <<< "${nm}" || return 1
+  [[ "${o1}" =~ ^[0-9]+$ && "${o2}" =~ ^[0-9]+$ && "${o3}" =~ ^[0-9]+$ && "${o4}" =~ ^[0-9]+$ ]] || return 1
+  val=$(( (o1<<24) | (o2<<16) | (o3<<8) | o4 ))
+  cnt=0
+  while (( val > 0 )); do
+    cnt=$((cnt + (val & 1)))
+    val=$((val >> 1))
+  done
+  expected=$(( (0xffffffff << (32 - cnt)) & 0xffffffff ))
+  (( expected == ( (o1<<24) | (o2<<16) | (o3<<8) | o4 ) )) || return 1
+  echo "${cnt}"
+  return 0
+}
+
 # Read an ifupdown option from a fragment file (indentation-tolerant; safe on mawk).
 step03_read_ifupdown_field() {
   local file="$1" key="$2"
@@ -3087,16 +3151,6 @@ step_03_nic_ifupdown() {
     fi
   fi
 
-  #######################################
-  # Helpers (NO ip command usage)
-  #######################################
-  cidr_to_netmask() {
-    local pfx="$1"
-    local mask=$(( 0xffffffff << (32-pfx) & 0xffffffff ))
-    printf "%d.%d.%d.%d\n" \
-      $(( (mask>>24) & 255 )) $(( (mask>>16) & 255 )) $(( (mask>>8) & 255 )) $(( mask & 255 ))
-  }
-
   # Parse existing mgt config from files (best-effort)
   parse_mgt_from_interfaces() {
     local f="/etc/network/interfaces"
@@ -3185,7 +3239,9 @@ step_03_nic_ifupdown() {
   local def_gw="${MGT_GW:-$gw0}"
   local def_dns="${MGT_DNS:-$dns0}"
 
-  # If netmask exists but prefix not, infer common /24 else ask
+  if [[ -z "${def_prefix}" && -n "${nm0}" ]]; then
+    def_prefix="$(step03_netmask_to_prefix "${nm0}" 2>/dev/null || true)"
+  fi
   if [[ -z "${def_prefix}" ]]; then
     def_prefix="24"
   fi
@@ -3197,8 +3253,14 @@ step_03_nic_ifupdown() {
   new_ip="$(whiptail_inputbox "STEP 03 - mgt IP setup" "Enter IP address for mgt interface.\nExample: 10.4.0.210" "${def_ip}" 10 70)" || return 1
   [[ -z "${new_ip}" ]] && return 1
 
-  new_prefix="$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExample: 24" "${def_prefix}" 10 70)" || return 1
-  [[ -z "${new_prefix}" ]] && return 1
+  while true; do
+    new_prefix="$(whiptail_inputbox "STEP 03 - mgt Prefix" "Enter subnet prefix length (/ value).\nExamples: 24, 27, /27" "${def_prefix}" 10 70)" || return 1
+    [[ -z "${new_prefix}" ]] && return 1
+    if new_prefix="$(step03_normalize_prefix_input "${new_prefix}")"; then
+      break
+    fi
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Invalid subnet prefix.\n\nEnter a number from 1 to 32.\nExamples: 24, 27, /27" 12 75
+  done
 
   new_gw="$(whiptail_inputbox "STEP 03 - gateway" "Enter default gateway IP.\nExample: 10.4.0.254" "${def_gw}" 10 70)" || return 1
   [[ -z "${new_gw}" ]] && return 1
@@ -3207,7 +3269,10 @@ step_03_nic_ifupdown() {
   [[ -z "${new_dns}" ]] && return 1
 
   local netmask
-  netmask="$(cidr_to_netmask "${new_prefix}")"
+  netmask="$(step03_cidr_to_netmask "${new_prefix}")" || {
+    whiptail_msgbox "STEP 03 - Invalid prefix" "Could not convert prefix /${new_prefix} to netmask." 10 70
+    return 1
+  }
 
   # Save user-entered values into config/state (for re-run consistency)
   save_config_var "MGT_IP_ADDR" "${new_ip}"

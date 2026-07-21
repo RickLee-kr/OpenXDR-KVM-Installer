@@ -4815,7 +4815,10 @@ step_07_lvm_storage() {
   #######################################
   log "[STEP 07] Removing existing LVM metadata (LV/VG/PV) from selected disks."
 
-  local disk pv vg_name pv_list_for_disk
+  local disk pv vg_name pv_list_for_disk part
+  # LVM allows: a-z A-Z 0-9 . _ - +
+  # Orphaned PVs may report invalid names like "[unknown]" when metadata is missing.
+  local vg_name_re='^[A-Za-z0-9._+-]+$'
 
   for disk in ${DATA_SSD_LIST}; do
     log "[STEP 07] Cleaning existing LVM structures on /dev/${disk}"
@@ -4828,23 +4831,46 @@ step_07_lvm_storage() {
       vg_name=$(sudo pvs --noheadings -o vg_name "${pv}" 2>/dev/null | awk '{print $1}')
 
       if [[ -n "${vg_name}" && "${vg_name}" != "-" ]]; then
-        log "[STEP 07] PV ${pv} belongs to VG ${vg_name} → removing LV/VG"
+        if [[ "${vg_name}" =~ ${vg_name_re} ]]; then
+          log "[STEP 07] PV ${pv} belongs to VG ${vg_name} → removing LV/VG"
 
-        # Remove all LVs in VG (ignore errors if repeated)
-        run_cmd "sudo lvremove -y ${vg_name} || true"
+          # Remove all LVs in VG (ignore errors if repeated)
+          run_cmd "sudo lvremove -y ${vg_name} || true"
 
-        # Remove VG (ignore if already removed)
-        run_cmd "sudo vgremove -y ${vg_name} || true"
+          # Remove VG (ignore if already removed)
+          run_cmd "sudo vgremove -y ${vg_name} || true"
+        else
+          log "[STEP 07] PV ${pv} reports invalid/orphaned VG name '${vg_name}' → skip lv/vgremove, force-clear PV"
+        fi
       fi
 
-      # Remove PV metadata
-      run_cmd "sudo pvremove -y ${pv} || true"
+      # Remove PV metadata (force twice for orphaned PVs with missing VG metadata)
+      if ! sudo pvremove -y "${pv}" >/dev/null 2>&1; then
+        log "[STEP 07] Normal pvremove failed on ${pv} → retry with --force --force"
+        run_cmd "sudo pvremove --force --force -y ${pv} || true"
+      else
+        log "[STEP 07] Removed PV label on ${pv}"
+      fi
+    done
+
+    # Wipe signatures on existing partitions first (LVM labels live on the partition,
+    # typically near the 1MiB start; wiping only the whole-disk GPT is not enough)
+    for part in "/dev/${disk}"[0-9]*; do
+      [[ -b "${part}" ]] || continue
+      log "[STEP 07] Running wipefs on ${part}"
+      run_cmd "sudo wipefs -a ${part} || true"
+      # Clear residual LVM header area so a recreated partition at 1MiB does not reuse it
+      run_cmd "sudo dd if=/dev/zero of=${part} bs=1M count=4 status=none conv=fsync || true"
     done
 
     # Wipe remaining filesystem/partition signatures on disk
     log "[STEP 07] Running wipefs on /dev/${disk}"
     run_cmd "sudo wipefs -a /dev/${disk} || true"
   done
+
+  # Refresh LVM device cache after forced cleanup
+  run_cmd "sudo vgscan --cache || true"
+  run_cmd "sudo pvscan --cache || true"
 
   #######################################
   # 1) Create GPT label + single partition on each disk
@@ -4871,6 +4897,18 @@ step_07_lvm_storage() {
     done
   done
 
+  # New partitions may still expose stale LVM labels at the same 1MiB offset.
+  # Clear signatures before pvcreate so orphaned metadata cannot block initialization.
+  log "[STEP 07] Clear residual signatures on new partitions before pvcreate"
+  for d in ${DATA_SSD_LIST}; do
+    if [[ -b "/dev/${d}1" ]]; then
+      run_cmd "sudo wipefs -a /dev/${d}1 || true"
+      run_cmd "sudo dd if=/dev/zero of=/dev/${d}1 bs=1M count=4 status=none conv=fsync || true"
+    fi
+  done
+  run_cmd "sudo vgscan --cache || true"
+  run_cmd "sudo pvscan --cache || true"
+
   #######################################
   # 2) Create PV / VG / LV (for ES data)
   #######################################
@@ -4883,8 +4921,11 @@ step_07_lvm_storage() {
     ((stripe_count++))
   done
 
-  # pvcreate
-  run_cmd "sudo pvcreate${pv_list}"
+  # pvcreate (-ff covers any remaining orphaned PV labels)
+  if ! run_cmd "sudo pvcreate${pv_list}"; then
+    log "[STEP 07] pvcreate failed → retry with --force --force"
+    run_cmd "sudo pvcreate --force --force${pv_list}"
+  fi
 
   # vgcreate vg_aio
   run_cmd "sudo vgcreate ${ES_VG}${pv_list}"

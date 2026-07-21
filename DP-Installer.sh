@@ -592,7 +592,7 @@ load_config() {
   # Defaults (set only if missing)
   : "${DRY_RUN:=1}"  # Default DRY_RUN=1 (safe mode)
   : "${STEP01_LINK_SCAN_REAL:=1}"
-  : "${DP_VERSION:=6.2.0}"
+  : "${DP_VERSION:=6.5.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
   : "${ACPS_PASSWORD:=}"
@@ -13057,7 +13057,7 @@ menu_config() {
         local new_ver
         # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_ver=$(whiptail_inputbox "DP_VERSION Configuration" "Enter DP version (e.g., 6.2.0)." "${DP_VERSION}" 10 60)
+        new_ver=$(whiptail_inputbox "DP_VERSION Configuration" "Enter DP version (e.g., 6.5.0)." "${DP_VERSION}" 10 60)
         local ver_rc=$?
         set -e
         

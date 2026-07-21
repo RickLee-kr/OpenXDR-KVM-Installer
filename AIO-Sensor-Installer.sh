@@ -720,9 +720,9 @@ load_config() {
 
   # default value (Set only when not present)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
-  : "${DP_VERSION:=6.2.0}"  # Legacy alias (kept for backward compatibility)
+  : "${DP_VERSION:=6.5.0}"  # Legacy alias (kept for backward compatibility)
   : "${AIO_VERSION:=}"      # AIO version for AIO deployment
-  : "${SENSOR_VERSION:=6.2.0}"
+  : "${SENSOR_VERSION:=6.5.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
   : "${ACPS_PASSWORD:=}"
@@ -5142,7 +5142,7 @@ step_08_dp_download() {
   #######################################
   # 0) Check configuration values
   #######################################
-  local ver="${AIO_VERSION:-6.2.0}"  # Default to 6.2.0 if not set
+  local ver="${AIO_VERSION:-6.5.0}"  # Default to 6.5.0 if not set
   local acps_user="${ACPS_USERNAME:-}"
   local acps_pass="${ACPS_PASSWORD:-}"
   local acps_url="${ACPS_BASE_URL:-https://acps.stellarcyber.ai}"
@@ -5571,8 +5571,8 @@ step_09_aio_deploy() {
     local AIO_GW="${AIO_GW:-192.168.122.1}"
     local AIO_DNS="${AIO_DNS:-8.8.8.8}"
 
-    # AIO_VERSION is managed in config (default to 6.2.0 if not set)
-    local _AIO_VERSION="${AIO_VERSION:-6.2.0}"
+    # AIO_VERSION is managed in config (default to 6.5.0 if not set)
+    local _AIO_VERSION="${AIO_VERSION:-6.5.0}"
 
     # AIO image directory (same as STEP 08)
     local AIO_IMAGE_DIR="${AIO_INSTALL_DIR}/images"
@@ -6087,7 +6087,7 @@ step_10_sensor_lv_download() {
 
     echo "  4) Download sensor image and deployment script"
     echo "     - virt_deploy_modular_ds.sh"
-    echo "     - aella-modular-ds-${SENSOR_VERSION:-6.2.0}.qcow2"
+    echo "     - aella-modular-ds-${SENSOR_VERSION:-6.5.0}.qcow2"
     echo "  5) Configure stellar:stellar ownership"
   } > "${tmp_status}"
 
@@ -8687,7 +8687,7 @@ menu_config() {
         local new_aio_version
         # Temporarily disable set -e to handle cancel gracefully
         set +e
-        new_aio_version=$(whiptail_inputbox "AIO Version Configuration" "Enter AIO version (e.g., 6.2.0):" "${AIO_VERSION:-}")
+        new_aio_version=$(whiptail_inputbox "AIO Version Configuration" "Enter AIO version (e.g., 6.5.0):" "${AIO_VERSION:-}")
         local ver_rc=$?
         set -e
         if [[ ${ver_rc} -ne 0 ]] || [[ -z "${new_aio_version}" ]]; then

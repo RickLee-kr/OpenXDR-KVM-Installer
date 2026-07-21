@@ -551,7 +551,7 @@ load_config() {
   # Default values (set only if not already set)
   : "${DRY_RUN:=1}"  # Default is DRY_RUN=1 (safe mode)
   : "${STEP01_LINK_SCAN_REAL:=1}"
-  : "${SENSOR_VERSION:=6.2.0}"
+  : "${SENSOR_VERSION:=6.5.0}"
   : "${ACPS_USERNAME:=}"
   : "${ACPS_BASE_URL:=https://acps.stellarcyber.ai}"
   : "${ACPS_PASSWORD:=}"
@@ -4705,7 +4705,7 @@ step_07_sensor_download() {
     echo "  3) /etc/fstab Auto mount "
     echo "  4) Sensor image and deployment script download"
     echo "     - virt_deploy_modular_ds.sh"
-    echo "     - aella-modular-ds-${SENSOR_VERSION:-6.2.0}.qcow2"
+    echo "     - aella-modular-ds-${SENSOR_VERSION:-6.5.0}.qcow2"
     echo "  5) Ownership configuration for libvirt/qemu"
   } > "${tmp_status}"
 

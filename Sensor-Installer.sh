@@ -537,6 +537,549 @@ restart_vm_safely() {
 }
 
 #######################################
+# Sensor Management NIC Guard Package Generator
+#
+# Generates one self-installing Ubuntu 22.04 script for manual execution
+# inside the Sensor VM. The generated installer registers an early boot
+# systemd service that identifies the management NIC by MAC address and
+# guarantees that it is named eth0 before guest networking starts.
+#
+# This is a non-interactive helper artifact. Generation failure must not
+# change the success/failure result of Sensor deployment or passthrough.
+#######################################
+get_sensor_management_mac() {
+  local vm_name="${1:-mds}"
+  local source_spec="${2:-}"
+  local source=""
+  local mac=""
+
+  command -v virsh >/dev/null 2>&1 || return 1
+  virsh dominfo "${vm_name}" >/dev/null 2>&1 || return 1
+
+  # Select the management source from the current installer network mode.
+  # NAT XML may expose the source as either the libvirt network name "default"
+  # or the bridge name "virbr0". Bridge mode uses "br-data".
+  if [[ -z "${source_spec}" ]]; then
+    case "${SENSOR_NET_MODE:-nat}" in
+      bridge) source_spec="br-data" ;;
+      nat|*)  source_spec="virbr0 default" ;;
+    esac
+  fi
+
+  # hostdev PCI NICs do not appear in domiflist. Prefer a virtio interface
+  # connected to the expected management source.
+  for source in ${source_spec}; do
+    mac="$(virsh domiflist "${vm_name}" 2>/dev/null \
+      | awk -v source="${source}" '
+          NR > 2 && $3 == source && tolower($4) == "virtio" {
+            print tolower($5)
+            exit
+          }
+        ')"
+    if [[ "${mac}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]]; then
+      printf '%s\n' "${mac}"
+      return 0
+    fi
+  done
+
+  # Fallback for older libvirt output or XML variants: choose the first
+  # virtio interface that is not connected to a known SPAN bridge.
+  mac="$(virsh domiflist "${vm_name}" 2>/dev/null \
+    | awk '
+        NR > 2 && tolower($4) == "virtio" && $3 !~ /^br-span[0-9]+$/ {
+          print tolower($5)
+          exit
+        }
+      ')"
+
+  [[ "${mac}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
+  printf '%s\n' "${mac}"
+}
+generate_sensor_mgmt_nic_guard_installer() {
+  local vm_name="${1:-mds}"
+  local source_spec="${2:-}"
+  local output_dir="${BASE_DIR}/output"
+  local output_file="${output_dir}/sensor-mgmt-nic-guard-installer.sh"
+  local checksum_file="${output_file}.sha256"
+  local mgmt_mac=""
+  local tmp_file=""
+
+  SENSOR_MGMT_GUARD_OUTPUT_PATH="${output_file}"
+
+  if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+    log "[DRY-RUN] Would automatically generate Sensor NIC guard: ${output_file}"
+    return 0
+  fi
+
+  if ! mgmt_mac="$(get_sensor_management_mac "${vm_name}" "${source_spec}")"; then
+    log "[WARN] Unable to determine ${vm_name} management MAC from the configured management interface; Sensor NIC guard was not generated."
+    return 1
+  fi
+
+  mkdir -p "${output_dir}"
+
+  # STEP 08, STEP 09 and installer startup can request generation close
+  # together. Serialize them so the final file and checksum remain consistent.
+  exec 8>"${output_dir}/.sensor-mgmt-nic-guard.lock"
+  if command -v flock >/dev/null 2>&1; then
+    if ! flock -w 30 8; then
+      log "[WARN] Timed out waiting for the Sensor NIC guard generation lock."
+      return 1
+    fi
+  fi
+
+  tmp_file="$(mktemp "${output_dir}/.sensor-mgmt-nic-guard.XXXXXX")"
+
+  cat > "${tmp_file}" <<'SENSOR_GUARD_INSTALLER'
+#!/usr/bin/env bash
+#
+# Sensor Management NIC Guard - Ubuntu 22.04 self-installer
+#
+# Copy this one file into the Sensor VM and run once as root:
+#   bash sensor-mgmt-nic-guard-installer.sh
+#
+# It installs an early-boot systemd service. On every reboot the service finds
+# the management NIC by the embedded MAC address and ensures it is named eth0
+# before networking starts. SPAN interface names and order are not preserved.
+
+set -Eeuo pipefail
+
+EXPECTED_MGMT_MAC="__MANAGEMENT_MAC__"
+TARGET_IF="eth0"
+CONFIG_FILE="/etc/sensor-mgmt-nic-guard.conf"
+GUARD_BIN="/usr/local/sbin/sensor-mgmt-nic-guard"
+SERVICE_FILE="/etc/systemd/system/sensor-mgmt-nic-guard.service"
+SERVICE_NAME="sensor-mgmt-nic-guard.service"
+DROPIN_NAME="10-sensor-mgmt-nic-guard.conf"
+NETWORK_UNITS=(networking.service systemd-networkd.service NetworkManager.service)
+
+say() {
+  printf '[sensor-mgmt-nic-guard-installer] %s\n' "$*"
+}
+
+fail() {
+  printf '[sensor-mgmt-nic-guard-installer] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+normalize_mac() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr '-' ':'
+}
+
+find_if_by_mac() {
+  local wanted="$1"
+  local path name mac
+  for path in /sys/class/net/*; do
+    [[ -r "${path}/address" ]] || continue
+    name="${path##*/}"
+    [[ "${name}" == "lo" ]] && continue
+    mac="$(normalize_mac "$(cat "${path}/address" 2>/dev/null || true)")"
+    if [[ "${mac}" == "${wanted}" ]]; then
+      printf '%s\n' "${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+uninstall_guard() {
+  local unit dropin_dir
+  [[ "${EUID}" -eq 0 ]] || fail "Run --uninstall as root."
+  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  rm -f "${SERVICE_FILE}" "${GUARD_BIN}" "${CONFIG_FILE}"
+  for unit in "${NETWORK_UNITS[@]}"; do
+    dropin_dir="/etc/systemd/system/${unit}.d"
+    rm -f "${dropin_dir}/${DROPIN_NAME}"
+    rmdir "${dropin_dir}" >/dev/null 2>&1 || true
+  done
+  systemctl daemon-reload
+  systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  say "Uninstalled Sensor Management NIC Guard."
+}
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+  uninstall_guard
+  exit 0
+fi
+
+[[ "${EUID}" -eq 0 ]] || fail "Run this installer as root."
+command -v systemctl >/dev/null 2>&1 || fail "systemd/systemctl is required."
+command -v ip >/dev/null 2>&1 || fail "The ip command is required."
+
+[[ -r /etc/os-release ]] || fail "/etc/os-release is missing."
+# shellcheck disable=SC1091
+. /etc/os-release
+if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
+  fail "This package is designed for Ubuntu 22.04; detected ${ID:-unknown} ${VERSION_ID:-unknown}."
+fi
+
+EXPECTED_MGMT_MAC="$(normalize_mac "${EXPECTED_MGMT_MAC}")"
+[[ "${EXPECTED_MGMT_MAC}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] \
+  || fail "Embedded management MAC is invalid: ${EXPECTED_MGMT_MAC}"
+
+say "Installing boot guard for ${EXPECTED_MGMT_MAC} -> ${TARGET_IF}"
+
+install -d -m 0755 /usr/local/sbin /etc/systemd/system
+cat > "${CONFIG_FILE}" <<EOF_CONFIG
+# Managed by sensor-mgmt-nic-guard-installer.sh
+MANAGEMENT_MAC="${EXPECTED_MGMT_MAC}"
+TARGET_INTERFACE="${TARGET_IF}"
+EOF_CONFIG
+chmod 0600 "${CONFIG_FILE}"
+
+cat > "${GUARD_BIN}" <<'EOF_GUARD'
+#!/usr/bin/env bash
+# Enforce the Sensor management NIC as eth0 before guest networking starts.
+
+set -Eeuo pipefail
+
+CONFIG_FILE="/etc/sensor-mgmt-nic-guard.conf"
+LOG_TAG="sensor-mgmt-nic-guard"
+LOCK_FILE="/run/sensor-mgmt-nic-guard.lock"
+
+log_msg() {
+  local msg="$*"
+  printf '[%s] %s\n' "${LOG_TAG}" "${msg}"
+  command -v logger >/dev/null 2>&1 && logger -t "${LOG_TAG}" -- "${msg}" || true
+}
+
+normalize_mac() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | tr '-' ':'
+}
+
+find_if_by_mac() {
+  local wanted="$1"
+  local path name mac
+  for path in /sys/class/net/*; do
+    [[ -r "${path}/address" ]] || continue
+    name="${path##*/}"
+    [[ "${name}" == "lo" ]] && continue
+    mac="$(normalize_mac "$(cat "${path}/address" 2>/dev/null || true)")"
+    if [[ "${mac}" == "${wanted}" ]]; then
+      printf '%s\n' "${name}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+choose_temp_name() {
+  local n candidate
+  for n in $(seq 0 99); do
+    candidate="sgtmp${n}"
+    if ! ip link show dev "${candidate}" >/dev/null 2>&1; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+[[ -r "${CONFIG_FILE}" ]] || {
+  log_msg "ERROR: missing ${CONFIG_FILE}"
+  exit 1
+}
+
+# shellcheck disable=SC1090
+. "${CONFIG_FILE}"
+MANAGEMENT_MAC="$(normalize_mac "${MANAGEMENT_MAC:-}")"
+TARGET_INTERFACE="${TARGET_INTERFACE:-eth0}"
+
+[[ "${MANAGEMENT_MAC}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || {
+  log_msg "ERROR: invalid management MAC: ${MANAGEMENT_MAC:-empty}"
+  exit 1
+}
+[[ "${TARGET_INTERFACE}" == "eth0" ]] || {
+  log_msg "ERROR: unsupported target interface: ${TARGET_INTERFACE}"
+  exit 1
+}
+
+# Prevent concurrent manual/systemd executions.
+exec 9>"${LOCK_FILE}"
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || {
+    log_msg "Another guard instance is already running; exiting"
+    exit 0
+  }
+fi
+
+# Wait until udev has processed current device events, then allow additional
+# time for passthrough NIC drivers that appear late during a cold boot.
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=60 >/dev/null 2>&1 || true
+
+mgmt_if=""
+for _attempt in $(seq 1 120); do
+  mgmt_if="$(find_if_by_mac "${MANAGEMENT_MAC}" 2>/dev/null || true)"
+  [[ -n "${mgmt_if}" ]] && break
+  sleep 0.25
+done
+
+if [[ -z "${mgmt_if}" ]]; then
+  log_msg "ERROR: management NIC ${MANAGEMENT_MAC} was not found; networking remains blocked"
+  exit 1
+fi
+
+if [[ "${mgmt_if}" == "${TARGET_INTERFACE}" ]]; then
+  log_msg "OK: management NIC ${MANAGEMENT_MAC} is already ${TARGET_INTERFACE}"
+  exit 0
+fi
+
+old_mgmt_name="${mgmt_if}"
+log_msg "FIX REQUIRED: management NIC ${MANAGEMENT_MAC} is ${old_mgmt_name}, not ${TARGET_INTERFACE}"
+
+ip link set dev "${old_mgmt_name}" down >/dev/null 2>&1 || true
+
+if ! ip link show dev "${TARGET_INTERFACE}" >/dev/null 2>&1; then
+  if ! ip link set dev "${old_mgmt_name}" name "${TARGET_INTERFACE}"; then
+    log_msg "ERROR: failed to rename ${old_mgmt_name} to ${TARGET_INTERFACE}"
+    exit 1
+  fi
+else
+  displaced_mac="$(normalize_mac "$(cat "/sys/class/net/${TARGET_INTERFACE}/address" 2>/dev/null || true)")"
+  if [[ "${displaced_mac}" == "${MANAGEMENT_MAC}" ]]; then
+    log_msg "OK: ${TARGET_INTERFACE} acquired the management MAC while waiting"
+    exit 0
+  fi
+
+  temp_name="$(choose_temp_name || true)"
+  [[ -n "${temp_name}" ]] || {
+    log_msg "ERROR: no temporary interface name is available"
+    exit 1
+  }
+
+  ip link set dev "${TARGET_INTERFACE}" down >/dev/null 2>&1 || true
+  if ! ip link set dev "${TARGET_INTERFACE}" name "${temp_name}"; then
+    log_msg "ERROR: failed to move displaced ${TARGET_INTERFACE} to ${temp_name}"
+    exit 1
+  fi
+
+  if ! ip link set dev "${old_mgmt_name}" name "${TARGET_INTERFACE}"; then
+    log_msg "ERROR: failed to rename ${old_mgmt_name} to ${TARGET_INTERFACE}; rolling back"
+    ip link set dev "${temp_name}" name "${TARGET_INTERFACE}" >/dev/null 2>&1 || true
+    exit 1
+  fi
+
+  # SPAN order is not relevant. Reuse the management NIC's previous name when
+  # possible. If that cosmetic rename fails, retain the temporary non-eth0 name.
+  if ! ip link set dev "${temp_name}" name "${old_mgmt_name}"; then
+    log_msg "WARN: management mapping fixed; displaced SPAN remains ${temp_name}"
+  fi
+fi
+
+final_mac="$(normalize_mac "$(cat "/sys/class/net/${TARGET_INTERFACE}/address" 2>/dev/null || true)")"
+if [[ "${final_mac}" != "${MANAGEMENT_MAC}" ]]; then
+  log_msg "ERROR: verification failed: ${TARGET_INTERFACE}=${final_mac:-unknown}, expected=${MANAGEMENT_MAC}"
+  exit 1
+fi
+
+log_msg "FIXED: management NIC ${MANAGEMENT_MAC} is now ${TARGET_INTERFACE}"
+exit 0
+EOF_GUARD
+chmod 0755 "${GUARD_BIN}"
+
+cat > "${SERVICE_FILE}" <<EOF_SERVICE
+[Unit]
+Description=Ensure Sensor management NIC is eth0 before networking
+DefaultDependencies=no
+Wants=systemd-udev-settle.service
+After=local-fs.target systemd-udev-settle.service
+Before=sysinit.target network-pre.target network.target networking.service systemd-networkd.service NetworkManager.service
+ConditionPathExists=${CONFIG_FILE}
+
+[Service]
+Type=oneshot
+ExecStart=${GUARD_BIN}
+TimeoutStartSec=120
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF_SERVICE
+chmod 0644 "${SERVICE_FILE}"
+
+# Add explicit ordering to whichever network manager the Sensor image uses.
+for unit in "${NETWORK_UNITS[@]}"; do
+  dropin_dir="/etc/systemd/system/${unit}.d"
+  install -d -m 0755 "${dropin_dir}"
+  cat > "${dropin_dir}/${DROPIN_NAME}" <<EOF_DROPIN
+[Unit]
+Requires=${SERVICE_NAME}
+After=${SERVICE_NAME}
+EOF_DROPIN
+  chmod 0644 "${dropin_dir}/${DROPIN_NAME}"
+done
+
+systemctl daemon-reload
+if command -v systemd-analyze >/dev/null 2>&1; then
+  systemd-analyze verify "${SERVICE_FILE}" >/dev/null 2>&1 \
+    || fail "systemd unit verification failed."
+fi
+systemctl enable "${SERVICE_NAME}" >/dev/null
+systemctl is-enabled "${SERVICE_NAME}" >/dev/null 2>&1 \
+  || fail "Failed to enable ${SERVICE_NAME}."
+
+current_if="$(find_if_by_mac "${EXPECTED_MGMT_MAC}" 2>/dev/null || true)"
+say "Installation complete."
+say "Ubuntu: ${PRETTY_NAME:-Ubuntu 22.04}"
+say "Service: ${SERVICE_NAME} (enabled for every boot)"
+say "Management MAC: ${EXPECTED_MGMT_MAC}"
+say "Current interface: ${current_if:-not detected}"
+if [[ "${current_if:-}" == "${TARGET_IF}" ]]; then
+  say "The mapping is currently correct; every reboot will verify it again."
+else
+  say "The mapping is currently incorrect. Reboot the Sensor VM to correct it before networking starts."
+fi
+say "Status: systemctl status ${SERVICE_NAME} --no-pager"
+say "Boot log: journalctl -u ${SERVICE_NAME} -b --no-pager"
+say "Uninstall: bash $0 --uninstall"
+SENSOR_GUARD_INSTALLER
+
+  sed -i "s/__MANAGEMENT_MAC__/${mgmt_mac}/g" "${tmp_file}"
+  chmod 0700 "${tmp_file}"
+
+  if ! bash -n "${tmp_file}"; then
+    rm -f "${tmp_file}"
+    log "[ERROR] Generated Sensor NIC guard failed bash syntax validation."
+    return 1
+  fi
+
+  mv -f "${tmp_file}" "${output_file}"
+  chmod 0700 "${output_file}"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    (
+      cd "${output_dir}"
+      sha256sum "$(basename "${output_file}")" > "$(basename "${checksum_file}")"
+    )
+    chmod 0600 "${checksum_file}"
+  fi
+
+  log "[SUCCESS] Sensor NIC guard automatically generated: ${output_file}"
+  log "[INFO] Embedded management MAC: ${mgmt_mac}"
+  return 0
+}
+
+
+#######################################
+# Queue Sensor NIC guard generation without blocking the installer UI.
+# The worker logs success/failure but never changes STEP success status.
+#######################################
+queue_sensor_mgmt_nic_guard_generation() {
+  local vm_name="${1:-mds}"
+  local source_spec="${2:-}"
+  local output_file="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
+
+  if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+    log "[DRY-RUN] Would queue background Sensor NIC guard generation: ${output_file}"
+    return 0
+  fi
+
+  (
+    set +e
+    if generate_sensor_mgmt_nic_guard_installer "${vm_name}" "${source_spec}"; then
+      log "[INFO] Background Sensor NIC guard generation completed: ${output_file}"
+    else
+      log "[WARN] Background Sensor NIC guard generation failed; Sensor installation remains unaffected."
+    fi
+  ) >/dev/null 2>&1 &
+
+  log "[INFO] Sensor NIC guard generation queued in background (pid=$!, output=${output_file})"
+  return 0
+}
+
+#######################################
+# VM Destroy Confirmation Helper
+#######################################
+confirm_destroy_vm() {
+  local vm_name="$1"
+  local step_name="$2"
+
+  if ! virsh dominfo "${vm_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local state
+  state=$(virsh domstate "${vm_name}" 2>/dev/null | tr -d '\r')
+
+  local msg="CRITICAL WARNING: PERMANENT VM DELETION\n\
+\n\
+The existing VM '${vm_name}' is defined. (State: ${state})\n\
+\n\
+Continuing this redeployment will:\n\
+  - Force-stop '${vm_name}' if it is running\n\
+  - Undefine '${vm_name}' from libvirt\n\
+  - Permanently delete its installer-managed disk images, logs, and VM directory\n\
+  - Interrupt services and destroy data stored only inside this VM\n\
+\n\
+THIS ACTION CANNOT BE UNDONE. Verify that required backups exist.\n\
+\n\
+Do you want to continue to the typed confirmation step?"
+
+  local typed_name=""
+
+  if command -v whiptail >/dev/null 2>&1; then
+    local dialog_dims dialog_height dialog_width centered_msg confirm_rc
+    dialog_dims=$(calc_dialog_size 22 88)
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    centered_msg=$(center_message "${msg}")
+
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    whiptail --title "${step_name} - ${vm_name} DELETION WARNING" \
+             --defaultno \
+             --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+    confirm_rc=$?
+    if [[ ${had_errexit} -eq 1 ]]; then set -e; else set +e; fi
+
+    if [[ ${confirm_rc} -ne 0 ]]; then
+      log "[${step_name}] ${vm_name} redeployment canceled at warning prompt."
+      return 1
+    fi
+
+    if ! typed_name=$(whiptail_inputbox \
+      "${step_name} - Type VM Name" \
+      "To permanently delete and redeploy this VM, type its exact name below.\n\nVM name: ${vm_name}\n\nThe comparison is case-sensitive. Leaving this blank or pressing Cancel aborts the operation." \
+      "" 16 88); then
+      log "[${step_name}] ${vm_name} redeployment canceled at VM-name confirmation."
+      return 1
+    fi
+  else
+    echo
+    echo "=============================================================="
+    echo " ${step_name}: PERMANENT VM DELETION WARNING"
+    echo "=============================================================="
+    echo -e "${msg}"
+    echo
+    read -r -p "Continue to typed confirmation? (type 'yes') [default: no]: " answer
+    if [[ "${answer}" != "yes" ]]; then
+      log "[${step_name}] ${vm_name} redeployment canceled at warning prompt."
+      return 1
+    fi
+    read -r -p "Type the exact VM name '${vm_name}' to continue: " typed_name
+  fi
+
+  # Ignore accidental surrounding whitespace only; keep exact, case-sensitive matching.
+  typed_name="${typed_name#"${typed_name%%[![:space:]]*}"}"
+  typed_name="${typed_name%"${typed_name##*[![:space:]]}"}"
+
+  if [[ "${typed_name}" != "${vm_name}" ]]; then
+    log "[${step_name}] VM-name confirmation mismatch for ${vm_name}; deletion blocked."
+    if command -v whiptail >/dev/null 2>&1; then
+      whiptail_msgbox "Deletion Blocked" \
+        "The entered name did not exactly match '${vm_name}'.\n\nNo VM deletion was authorized. Redeployment has been canceled." \
+        12 78
+    else
+      echo "Deletion blocked: entered VM name did not exactly match '${vm_name}'." >&2
+    fi
+    return 1
+  fi
+
+  log "[${step_name}] Exact VM-name confirmation accepted for ${vm_name}."
+  return 0
+}
+
+#######################################
 # Configuration Management (CONFIG_FILE)
 #######################################
 
@@ -4600,9 +5143,14 @@ step_07_sensor_download() {
   local SENSOR_IMAGE_DIR="${SENSOR_INSTALL_DIR}/images"
   local SENSOR_VM_DIR="${SENSOR_IMAGE_DIR}/${SENSOR_VM}"
 
-  # If an existing Sensor VM is present, stop and remove it before LVM configuration
+  # If an existing Sensor VM is present, require explicit typed confirmation before removal.
   if virsh dominfo "${SENSOR_VM}" >/dev/null 2>&1; then
-    log "[STEP 07] Existing VM detected (${SENSOR_VM}). Destroying and undefining before LVM configuration."
+    if ! confirm_destroy_vm "${SENSOR_VM}" "STEP 07 - Sensor Image/LV Preparation"; then
+      log "[STEP 07] Existing ${SENSOR_VM} VM was kept; destructive preparation canceled."
+      return 0
+    fi
+
+    log "[STEP 07] Exact confirmation received. Destroying and undefining ${SENSOR_VM} before LVM configuration."
     run_cmd "virsh destroy ${SENSOR_VM} || true"
     run_cmd "virsh undefine ${SENSOR_VM} --remove-all-storage || virsh undefine ${SENSOR_VM} || true"
     if [[ -d "${SENSOR_VM_DIR}" ]]; then
@@ -5527,27 +6075,26 @@ step_08_sensor_deploy() {
   show_textbox "STEP 08 - Sensor VM Deployment unit" "${tmp_status}"
 
   if [[ "${vm_exists}" == "yes" ]]; then
-    if ! whiptail_yesno "STEP 08 - Existing VM" "mds VM already exists.\n\nDo you want to redeploy the existing VM?" 12 70
-    then
-      log "User canceled existing VM redeployment."
+    if ! confirm_destroy_vm "mds" "STEP 08 - Sensor VM Deployment"; then
+      log "[STEP 08] Existing mds VM was kept; redeployment canceled."
       return 0
-    else
-      log "[STEP 08] Removing existing mds VM"
-      if [[ "${vm_running}" == "yes" ]]; then
-        run_cmd "virsh destroy mds"
-      fi
-      run_cmd "virsh undefine mds --remove-all-storage"
-      
-      # Remove VM disk directory to ensure clean deployment
-      local vm_disk_dir="/var/lib/libvirt/images/mds/images/mds"
-      if [[ -d "${vm_disk_dir}" ]]; then
-        log "[STEP 08] Removing existing VM disk directory: ${vm_disk_dir}"
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-          log "[DRY-RUN] sudo rm -rf ${vm_disk_dir}"
-        else
-          run_cmd "sudo rm -rf ${vm_disk_dir}"
-          log "[STEP 08] VM disk directory removed: ${vm_disk_dir}"
-        fi
+    fi
+
+    log "[STEP 08] Exact confirmation received. Removing existing mds VM."
+    if [[ "${vm_running}" == "yes" ]]; then
+      run_cmd "virsh destroy mds"
+    fi
+    run_cmd "virsh undefine mds --remove-all-storage"
+    
+    # Remove VM disk directory to ensure clean deployment
+    local vm_disk_dir="/var/lib/libvirt/images/mds/images/mds"
+    if [[ -d "${vm_disk_dir}" ]]; then
+      log "[STEP 08] Removing existing VM disk directory: ${vm_disk_dir}"
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        log "[DRY-RUN] sudo rm -rf ${vm_disk_dir}"
+      else
+        run_cmd "sudo rm -rf ${vm_disk_dir}"
+        log "[STEP 08] VM disk directory removed: ${vm_disk_dir}"
       fi
     fi
   fi
@@ -6099,6 +6646,10 @@ step_08_sensor_deploy() {
   show_textbox "STEP 08 Result Summary" "${tmp_status}"
 
   log "[STEP 08] Sensor VM Deployment Completed"
+
+  # Generate the Ubuntu 22.04 self-installing management NIC guard in the
+  # background. The user copies and runs it once inside the Sensor VM.
+  queue_sensor_mgmt_nic_guard_generation "mds"
 
   return 0
 }
@@ -7639,10 +8190,19 @@ EOF
 📝 Next Steps:
    - VM is configured and ready for operation
    - Proceed to STEP 10 (Install DP CLI) if needed
+
+🛡️ Sensor Management NIC Guard:
+   - Ubuntu 22.04 self-installing recovery script generation is queued
+   - Output: ${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh
+   - Copy it into the Sensor VM and run once as root
 EOF
 )
 
-    whiptail_msgbox "STEP 09 Completed" "${summary}" 20 80
+    # Regenerate after final network/SPAN XML changes so the embedded MAC
+    # always matches the current Sensor management virtio NIC.
+    queue_sensor_mgmt_nic_guard_generation "${SENSOR_VM}"
+
+    whiptail_msgbox "STEP 09 Completed" "${summary}" 24 88
 
     if type mark_step_done >/dev/null 2>&1; then
         mark_step_done "${STEP_ID}"
@@ -9369,5 +9929,12 @@ The documentation site includes:
   rm -f "${tmp_help_file}"
 }
 
-# in Execution
+# Main execution
+# Silently refresh the helper artifact for an existing Sensor VM. STEP 08 and
+# STEP 09 also queue regeneration after deployment/network changes.
+load_config
+if [[ "${DRY_RUN:-1}" -eq 0 ]] && command -v virsh >/dev/null 2>&1    && virsh dominfo mds >/dev/null 2>&1; then
+  queue_sensor_mgmt_nic_guard_generation "mds"
+fi
+
 main_menu

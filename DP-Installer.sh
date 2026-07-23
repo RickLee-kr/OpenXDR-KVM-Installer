@@ -6549,19 +6549,9 @@ step_10_dl_master_deploy_v621() {
     return 0
   fi
 
-  # Clean up VM directories (hostname + role-based)
-  local DL_DIR_HOST="${DL_IMAGE_DIR}/${DL_HOSTNAME}"
-  local DL_DIR_ROLE="${DL_IMAGE_DIR}/dl-master"
-
-  if [[ "${_DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] rm -rf '${DL_DIR_HOST}' '${DL_DIR_ROLE}'"
-    log "[DRY-RUN] rm -f '${DL_IMAGE_DIR}/${DL_HOSTNAME}.raw' '${DL_IMAGE_DIR}/dl-master.raw'"
-  else
-    [[ -d "${DL_DIR_HOST}" ]] && sudo rm -rf "${DL_DIR_HOST}" 2>/dev/null || true
-    [[ -d "${DL_DIR_ROLE}" ]] && sudo rm -rf "${DL_DIR_ROLE}" 2>/dev/null || true
-    sudo rm -f "${DL_IMAGE_DIR}/${DL_HOSTNAME}.raw" "${DL_IMAGE_DIR}/${DL_HOSTNAME}.log" 2>/dev/null || true
-    sudo rm -f "${DL_IMAGE_DIR}/dl-master.raw" "${DL_IMAGE_DIR}/dl-master.log" 2>/dev/null || true
-  fi
+  # Safety: cleanup_dl_da_vm_and_images() already removed only the VM artifacts
+  # explicitly authorized by exact-name confirmation. Do not delete additional
+  # hostname/role directories that were not tied to a confirmed libvirt domain.
 
   # Host MGT IP
   local MGT_NIC_NAME="${MGT_NIC:-mgt}"
@@ -6868,19 +6858,9 @@ step_11_da_master_deploy_v621() {
     return 0
   fi
 
-  # Clean up VM directories (hostname + role-based)
-  local DA_DIR_HOST="${DA_IMAGE_DIR}/${DA_HOSTNAME}"
-  local DA_DIR_ROLE="${DA_IMAGE_DIR}/da-master"
-
-  if [[ "${_DRY_RUN}" -eq 1 ]]; then
-    log "[DRY-RUN] rm -rf '${DA_DIR_HOST}' '${DA_DIR_ROLE}'"
-    log "[DRY-RUN] rm -f '${DA_IMAGE_DIR}/${DA_HOSTNAME}.raw' '${DA_IMAGE_DIR}/da-master.raw'"
-  else
-    [[ -d "${DA_DIR_HOST}" ]] && sudo rm -rf "${DA_DIR_HOST}" 2>/dev/null || true
-    [[ -d "${DA_DIR_ROLE}" ]] && sudo rm -rf "${DA_DIR_ROLE}" 2>/dev/null || true
-    sudo rm -f "${DA_IMAGE_DIR}/${DA_HOSTNAME}.raw" "${DA_IMAGE_DIR}/${DA_HOSTNAME}.log" 2>/dev/null || true
-    sudo rm -f "${DA_IMAGE_DIR}/da-master.raw" "${DA_IMAGE_DIR}/da-master.log" 2>/dev/null || true
-  fi
+  # Safety: cleanup_dl_da_vm_and_images() already removed only the VM artifacts
+  # explicitly authorized by exact-name confirmation. Do not delete additional
+  # hostname/role directories that were not tied to a confirmed libvirt domain.
 
   # Host MGT IP
   : "${MGT_NIC:=mgt}"
@@ -9080,45 +9060,81 @@ confirm_destroy_vm() {
   local state
   state=$(virsh domstate "${vm_name}" 2>/dev/null | tr -d '\r')
 
-  local msg="${vm_name} VM is already defined. (state: ${state})\n\
+  local msg="CRITICAL WARNING: PERMANENT VM DELETION\n\
 \n\
-If you continue:\n\
-  - ${vm_name} VM will be destroyed and undefined\n\
-  - Existing disk image files (${vm_name}.raw / ${vm_name}.log, etc.) will be deleted\n\
+The existing VM '${vm_name}' is defined. (State: ${state})\n\
 \n\
-This can heavily impact a running cluster (DL / DA service).\n\
+Continuing this redeployment will:\n\
+  - Force-stop '${vm_name}' if it is running\n\
+  - Undefine '${vm_name}' from libvirt\n\
+  - Permanently delete its installer-managed disk images, logs, and VM directory\n\
+  - Interrupt services and destroy data stored only inside this VM\n\
 \n\
-Proceed with redeploy?"
+THIS ACTION CANNOT BE UNDONE. Verify that required backups exist.\n\
+\n\
+Do you want to continue to the typed confirmation step?"
+
+  local typed_name=""
 
   if command -v whiptail >/dev/null 2>&1; then
-      # Temporarily disable set -e to handle cancel gracefully
-      set +e
-      whiptail_yesno "${step_name} - ${vm_name} redeploy confirmation" "${msg}"
-      local confirm_rc=$?
-      set -e
-      
-      if [[ ${confirm_rc} -ne 0 ]]; then
-          log "[${step_name}] Redeploy of ${vm_name} canceled by user."
-          return 1
-      fi
+    local dialog_dims dialog_height dialog_width centered_msg confirm_rc
+    dialog_dims=$(calc_dialog_size 22 88)
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    centered_msg=$(center_message "${msg}")
+
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    whiptail --title "${step_name} - ${vm_name} DELETION WARNING" \
+             --defaultno \
+             --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+    confirm_rc=$?
+    if [[ ${had_errexit} -eq 1 ]]; then set -e; else set +e; fi
+
+    if [[ ${confirm_rc} -ne 0 ]]; then
+      log "[${step_name}] ${vm_name} redeployment canceled at warning prompt."
+      return 1
+    fi
+
+    if ! typed_name=$(whiptail_inputbox \
+      "${step_name} - Type VM Name" \
+      "To permanently delete and redeploy this VM, type its exact name below.\n\nVM name: ${vm_name}\n\nThe comparison is case-sensitive. Leaving this blank or pressing Cancel aborts the operation." \
+      "" 16 88); then
+      log "[${step_name}] ${vm_name} redeployment canceled at VM-name confirmation."
+      return 1
+    fi
   else
-  
     echo
-    echo "====================================================="
-    echo " ${step_name}: ${vm_name} redeploy warning"
-    echo "====================================================="
+    echo "=============================================================="
+    echo " ${step_name}: PERMANENT VM DELETION WARNING"
+    echo "=============================================================="
     echo -e "${msg}"
     echo
-    read -r -p "Continue? (type yes to proceed) [default: no] : " answer
-    case "${answer}" in
-      yes|y|Y) ;;
-      *)
-        log "[${step_name}] Redeploy of ${vm_name} canceled by user."
-        return 1
-        ;;
-    esac
+    read -r -p "Continue to typed confirmation? (type 'yes') [default: no]: " answer
+    if [[ "${answer}" != "yes" ]]; then
+      log "[${step_name}] ${vm_name} redeployment canceled at warning prompt."
+      return 1
+    fi
+    read -r -p "Type the exact VM name '${vm_name}' to continue: " typed_name
   fi
 
+  # Ignore accidental surrounding whitespace only; keep exact, case-sensitive matching.
+  typed_name="${typed_name#"${typed_name%%[![:space:]]*}"}"
+  typed_name="${typed_name%"${typed_name##*[![:space:]]}"}"
+
+  if [[ "${typed_name}" != "${vm_name}" ]]; then
+    log "[${step_name}] VM-name confirmation mismatch for ${vm_name}; deletion blocked."
+    if command -v whiptail >/dev/null 2>&1; then
+      whiptail_msgbox "Deletion Blocked" \
+        "The entered name did not exactly match '${vm_name}'.\n\nNo VM deletion was authorized. Redeployment has been canceled." \
+        12 78
+    else
+      echo "Deletion blocked: entered VM name did not exactly match '${vm_name}'." >&2
+    fi
+    return 1
+  fi
+
+  log "[${step_name}] Exact VM-name confirmation accepted for ${vm_name}."
   return 0
 }
 
@@ -9140,44 +9156,91 @@ confirm_destroy_vm_batch() {
     return 0
   fi
 
-  local msg="The following ${label} VMs are defined:\n\
+  local msg="CRITICAL WARNING: PERMANENT CLUSTER VM DELETION\n\
+\n\
+The following ${label} VMs are defined:\n\
 ${vm_list}\n\
 \n\
-If you continue:\n\
-  - All listed VMs will be destroyed and undefined\n\
-  - Their disk image files (raw/log and VM directories) will be deleted\n\
+Continuing this redeployment will:\n\
+  - Force-stop and undefine every listed VM\n\
+  - Permanently delete their installer-managed disk images, logs, and VM directories\n\
+  - Interrupt the ${label} service and destroy data stored only inside these VMs\n\
 \n\
-This can heavily impact a running cluster (${label} service).\n\
+THIS ACTION CANNOT BE UNDONE. Verify that required backups exist.\n\
 \n\
-Proceed with redeploy?"
+You must type every listed VM name exactly in the next screens.\n\
+Continue to typed confirmation?"
 
   if command -v whiptail >/dev/null 2>&1; then
-      # Temporarily disable set -e to handle cancel gracefully
-      set +e
-      whiptail_yesno "${step_name} - ${label} cluster redeploy confirmation" "${msg}"
-      local confirm_rc=$?
-      set -e
-      
-      if [[ ${confirm_rc} -ne 0 ]]; then
-          log "[${step_name}] Redeploy canceled by user."
-          return 1
-      fi
+    local dialog_dims dialog_height dialog_width centered_msg confirm_rc
+    dialog_dims=$(calc_dialog_size 24 92)
+    read -r dialog_height dialog_width <<< "${dialog_dims}"
+    centered_msg=$(center_message "${msg}")
+
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    whiptail --title "${step_name} - ${label} VM DELETION WARNING" \
+             --defaultno \
+             --yesno "${centered_msg}" "${dialog_height}" "${dialog_width}"
+    confirm_rc=$?
+    if [[ ${had_errexit} -eq 1 ]]; then set -e; else set +e; fi
+    if [[ ${confirm_rc} -ne 0 ]]; then
+      log "[${step_name}] ${label} redeployment canceled at warning prompt."
+      return 1
+    fi
   else
     echo
-    echo "====================================================="
-    echo " ${step_name}: ${label} cluster redeploy warning"
-    echo "====================================================="
+    echo "=============================================================="
+    echo " ${step_name}: PERMANENT ${label} VM DELETION WARNING"
+    echo "=============================================================="
     echo -e "${msg}"
     echo
-    read -r -p "Continue? (type yes to proceed) [default: no] : " answer
-    case "${answer}" in
-      yes|y|Y) ;;
-      *)
-        log "[${step_name}] Redeploy canceled by user."
-        return 1
-        ;;
-    esac
+    read -r -p "Continue to typed confirmation? (type 'yes') [default: no]: " answer
+    if [[ "${answer}" != "yes" ]]; then
+      log "[${step_name}] ${label} redeployment canceled at warning prompt."
+      return 1
+    fi
   fi
+
+  local vm_name typed_name
+  while IFS= read -r vm_name; do
+    vm_name="${vm_name#"${vm_name%%[![:space:]]*}"}"
+    vm_name="${vm_name%"${vm_name##*[![:space:]]}"}"
+    [[ -z "${vm_name}" ]] && continue
+
+    typed_name=""
+    if command -v whiptail >/dev/null 2>&1; then
+      if ! typed_name=$(whiptail_inputbox \
+        "${step_name} - Confirm ${vm_name}" \
+        "Type the exact VM name shown below to authorize its permanent deletion.\n\nVM name: ${vm_name}\n\nThe comparison is case-sensitive. Cancel or a mismatch aborts deletion of the entire batch." \
+        "" 16 90); then
+        log "[${step_name}] ${label} batch confirmation canceled while confirming ${vm_name}."
+        return 1
+      fi
+    else
+      read -r -p "Type the exact VM name '${vm_name}' to continue: " typed_name
+    fi
+
+    typed_name="${typed_name#"${typed_name%%[![:space:]]*}"}"
+    typed_name="${typed_name%"${typed_name##*[![:space:]]}"}"
+
+    if [[ "${typed_name}" != "${vm_name}" ]]; then
+      log "[${step_name}] VM-name confirmation mismatch for ${vm_name}; entire batch deletion blocked."
+      if command -v whiptail >/dev/null 2>&1; then
+        whiptail_msgbox "Batch Deletion Blocked" \
+          "The entered name did not exactly match '${vm_name}'.\n\nNo VM in this deletion batch is authorized for removal. Redeployment has been canceled." \
+          13 82
+      else
+        echo "Batch deletion blocked: entered VM name did not exactly match '${vm_name}'." >&2
+      fi
+      return 1
+    fi
+
+    log "[${step_name}] Exact VM-name confirmation accepted for ${vm_name}."
+  done <<< "${vm_list}"
+
+  return 0
 }
 
 cleanup_dl_da_vm_and_images() {
@@ -9357,25 +9420,11 @@ step_10_dl_master_deploy() {
     fi
 
     ############################################################
-    # Clean up all VM directories in /stellar/dl/images/ before deployment
+    # Safety: do not remove every directory under the DL image path.
+    # cleanup_dl_da_vm_and_images() removes only VMs whose exact names
+    # were entered and confirmed by the user. Unassociated stale
+    # directories are preserved for explicit review.
     ############################################################
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-        log "[DRY-RUN] Will clean up all VM directories in ${DL_IMAGE_DIR}/"
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Cleaning up all existing VM directories in ${DL_IMAGE_DIR}/..."
-        # Find and remove all subdirectories (VM directories like dl-master/, da-master/, etc.)
-        # but keep files (qcow2, sha1, scripts)
-        local vm_dir
-        while IFS= read -r -d '' vm_dir; do
-            if [[ -d "${vm_dir}" ]]; then
-                local dir_name
-                dir_name=$(basename "${vm_dir}")
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] Removing VM directory: ${dir_name}/"
-                sudo rm -rf "${vm_dir}" 2>/dev/null || log "[WARN] Failed to remove ${vm_dir}"
-            fi
-        done < <(find "${DL_IMAGE_DIR}" -maxdepth 1 -type d ! -path "${DL_IMAGE_DIR}" -print0 2>/dev/null || true)
-        log "[STEP 10] VM directories cleanup completed"
-    fi
 
     # Locate virt_deploy_uvp_centos.sh
     # - prefer DP_SCRIPT_PATH saved from STEP 09
@@ -9752,25 +9801,11 @@ step_11_da_master_deploy() {
     fi
 
     ############################################################
-    # Clean up all VM directories in /stellar/da/images/ before deployment
+    # Safety: do not remove every directory under the DA image path.
+    # cleanup_dl_da_vm_and_images() removes only VMs whose exact names
+    # were entered and confirmed by the user. Unassociated stale
+    # directories are preserved for explicit review.
     ############################################################
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-        log "[DRY-RUN] Will clean up all VM directories in ${DA_IMAGE_DIR}/"
-    else
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Cleaning up all existing VM directories in ${DA_IMAGE_DIR}/..."
-        # Find and remove all subdirectories (VM directories like da-master/, etc.)
-        # but keep files (qcow2, sha1, scripts)
-        local vm_dir
-        while IFS= read -r -d '' vm_dir; do
-            if [[ -d "${vm_dir}" ]]; then
-                local dir_name
-                dir_name=$(basename "${vm_dir}")
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] Removing VM directory: ${dir_name}/"
-                sudo rm -rf "${vm_dir}" 2>/dev/null || log "[WARN] Failed to remove ${vm_dir}"
-            fi
-        done < <(find "${DA_IMAGE_DIR}" -maxdepth 1 -type d ! -path "${DA_IMAGE_DIR}" -print0 2>/dev/null || true)
-        log "[STEP 11] VM directories cleanup completed"
-    fi
 
     local DA_IP="${DA_IP:-192.168.122.3}"
     local DA_NETMASK="${DA_NETMASK:-255.255.255.0}"

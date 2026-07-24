@@ -595,14 +595,22 @@ get_sensor_management_mac() {
   [[ "${mac}" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || return 1
   printf '%s\n' "${mac}"
 }
+
 generate_sensor_mgmt_nic_guard_installer() {
   local vm_name="${1:-mds}"
   local source_spec="${2:-}"
-  local output_dir="${BASE_DIR}/output"
+  # Publish directly in the KVM host stellar user's home so the Sensor VM can
+  # retrieve the files with the stellar account without requiring root access.
+  local output_dir="/home/stellar"
   local output_file="${output_dir}/sensor-mgmt-nic-guard-installer.sh"
   local checksum_file="${output_file}.sha256"
+  local legacy_output_file="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
+  local legacy_checksum_file="${legacy_output_file}.sha256"
+  local publish_user="stellar"
+  local publish_group="stellar"
   local mgmt_mac=""
   local tmp_file=""
+  local checksum_tmp=""
 
   SENSOR_MGMT_GUARD_OUTPUT_PATH="${output_file}"
 
@@ -616,16 +624,38 @@ generate_sensor_mgmt_nic_guard_installer() {
     return 1
   fi
 
-  mkdir -p "${output_dir}"
+  if ! id "${publish_user}" >/dev/null 2>&1; then
+    log "[ERROR] Host user '${publish_user}' does not exist; cannot publish Sensor NIC guard to ${output_dir}."
+    return 1
+  fi
 
-  # STEP 08, STEP 09 and installer startup can request generation close
-  # together. Serialize them so the final file and checksum remain consistent.
-  exec 8>"${output_dir}/.sensor-mgmt-nic-guard.lock"
-  if command -v flock >/dev/null 2>&1; then
-    if ! flock -w 30 8; then
-      log "[WARN] Timed out waiting for the Sensor NIC guard generation lock."
+  if [[ -e "${output_dir}" && ! -d "${output_dir}" ]]; then
+    log "[ERROR] Sensor NIC guard output path exists but is not a directory: ${output_dir}"
+    return 1
+  fi
+
+  # Do not change the permissions of an existing home directory. Create it only
+  # when missing, with ownership that allows the stellar account to access it.
+  if [[ ! -d "${output_dir}" ]]; then
+    if [[ "${EUID}" -eq 0 ]]; then
+      if ! install -d -m 0750 -o "${publish_user}" -g "${publish_group}" "${output_dir}"; then
+        log "[ERROR] Failed to create Sensor NIC guard output directory: ${output_dir}"
+        return 1
+      fi
+    elif [[ "$(id -un 2>/dev/null || true)" == "${publish_user}" ]]; then
+      if ! mkdir -p "${output_dir}" || ! chmod 0750 "${output_dir}"; then
+        log "[ERROR] Failed to create Sensor NIC guard output directory: ${output_dir}"
+        return 1
+      fi
+    else
+      log "[ERROR] Run the installer as root or '${publish_user}' to publish into ${output_dir}."
       return 1
     fi
+  fi
+
+  if [[ ! -w "${output_dir}" ]]; then
+    log "[ERROR] Sensor NIC guard output directory is not writable: ${output_dir}"
+    return 1
   fi
 
   tmp_file="$(mktemp "${output_dir}/.sensor-mgmt-nic-guard.XXXXXX")"
@@ -943,47 +973,111 @@ SENSOR_GUARD_INSTALLER
     return 1
   fi
 
-  mv -f "${tmp_file}" "${output_file}"
-  chmod 0700 "${output_file}"
+  # Atomic publication. The script is executable/readable by stellar and the
+  # checksum is world-readable so it can be copied from the Sensor VM directly.
+  if ! mv -f "${tmp_file}" "${output_file}"; then
+    rm -f "${tmp_file}" 2>/dev/null || true
+    log "[ERROR] Failed to publish Sensor NIC guard: ${output_file}"
+    return 1
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    if ! chown "${publish_user}:${publish_group}" "${output_file}"; then
+      log "[ERROR] Failed to set ownership on ${output_file}"
+      return 1
+    fi
+  elif [[ "$(id -un 2>/dev/null || true)" != "${publish_user}" ]]; then
+    log "[ERROR] Cannot publish ${output_file}: current user is not ${publish_user}."
+    return 1
+  fi
+  if ! chmod 0755 "${output_file}"; then
+    log "[ERROR] Failed to set permissions on ${output_file}"
+    return 1
+  fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (
+    checksum_tmp="$(mktemp "${output_dir}/.sensor-mgmt-nic-guard-sha256.XXXXXX")"
+    if ! (
       cd "${output_dir}"
-      sha256sum "$(basename "${output_file}")" > "$(basename "${checksum_file}")"
-    )
-    chmod 0600 "${checksum_file}"
+      sha256sum "$(basename "${output_file}")" > "${checksum_tmp}"
+    ); then
+      rm -f "${checksum_tmp}" 2>/dev/null || true
+      log "[ERROR] Failed to create Sensor NIC guard checksum."
+      return 1
+    fi
+    if ! mv -f "${checksum_tmp}" "${checksum_file}"; then
+      rm -f "${checksum_tmp}" 2>/dev/null || true
+      log "[ERROR] Failed to publish Sensor NIC guard checksum: ${checksum_file}"
+      return 1
+    fi
+    if [[ "${EUID}" -eq 0 ]]; then
+      if ! chown "${publish_user}:${publish_group}" "${checksum_file}"; then
+        log "[ERROR] Failed to set ownership on ${checksum_file}"
+        return 1
+      fi
+    elif [[ "$(id -un 2>/dev/null || true)" != "${publish_user}" ]]; then
+      log "[ERROR] Cannot publish ${checksum_file}: current user is not ${publish_user}."
+      return 1
+    fi
+    if ! chmod 0644 "${checksum_file}"; then
+      log "[ERROR] Failed to set permissions on ${checksum_file}"
+      return 1
+    fi
+  fi
+
+  # Remove legacy root-only publication after the new copy is safely available.
+  if [[ "${legacy_output_file}" != "${output_file}" ]]; then
+    rm -f "${legacy_output_file}" "${legacy_checksum_file}" 2>/dev/null || true
+    rmdir "$(dirname "${legacy_output_file}")" >/dev/null 2>&1 || true
   fi
 
   log "[SUCCESS] Sensor NIC guard automatically generated: ${output_file}"
+  log "[INFO] Published owner/mode: ${publish_user}:${publish_group} 0755 (checksum 0644)"
+  log "[INFO] Legacy root-only artifact removed: ${legacy_output_file}"
   log "[INFO] Embedded management MAC: ${mgmt_mac}"
   return 0
 }
 
-
-#######################################
-# Queue Sensor NIC guard generation without blocking the installer UI.
-# The worker logs success/failure but never changes STEP success status.
-#######################################
-queue_sensor_mgmt_nic_guard_generation() {
+# Queue generation as a detached background task. A lock prevents STEP 11,
+# STEP 12, and installer startup from generating the same artifact concurrently.
+schedule_sensor_mgmt_nic_guard_generation() {
   local vm_name="${1:-mds}"
   local source_spec="${2:-}"
-  local output_file="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
+  local reason="${3:-unspecified}"
+  local bg_log="${STATE_DIR}/sensor-mgmt-nic-guard-generation.log"
+  local lock_file="${STATE_DIR}/sensor-mgmt-nic-guard-generation.lock"
+  local bg_pid=""
+
+  SENSOR_MGMT_GUARD_OUTPUT_PATH="/home/stellar/sensor-mgmt-nic-guard-installer.sh"
 
   if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
-    log "[DRY-RUN] Would queue background Sensor NIC guard generation: ${output_file}"
+    log "[DRY-RUN] Would queue Sensor NIC guard generation (${reason}): ${SENSOR_MGMT_GUARD_OUTPUT_PATH}"
     return 0
   fi
 
+  mkdir -p "${STATE_DIR}"
   (
-    set +e
-    if generate_sensor_mgmt_nic_guard_installer "${vm_name}" "${source_spec}"; then
-      log "[INFO] Background Sensor NIC guard generation completed: ${output_file}"
-    else
-      log "[WARN] Background Sensor NIC guard generation failed; Sensor installation remains unaffected."
+    trap '' HUP
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>"${lock_file}"
+      if ! flock -n 9; then
+        log "[INFO] Sensor NIC guard generation already running; duplicate request skipped (${reason})."
+        exit 0
+      fi
     fi
-  ) >/dev/null 2>&1 &
 
-  log "[INFO] Sensor NIC guard generation queued in background (pid=$!, output=${output_file})"
+    log "[INFO] Background Sensor NIC guard generation started (${reason})."
+    if generate_sensor_mgmt_nic_guard_installer "${vm_name}" "${source_spec}"; then
+      log "[SUCCESS] Background Sensor NIC guard generation completed (${reason})."
+      exit 0
+    fi
+    log "[WARN] Background Sensor NIC guard generation failed (${reason})."
+    exit 1
+  ) >>"${bg_log}" 2>&1 &
+  bg_pid=$!
+  disown "${bg_pid}" 2>/dev/null || true
+
+  log "[INFO] Sensor NIC guard generation queued in background (pid=${bg_pid}, reason=${reason})."
+  log "[INFO] Expected files: /home/stellar/sensor-mgmt-nic-guard-installer.sh and .sha256"
   return 0
 }
 
@@ -6647,9 +6741,14 @@ step_08_sensor_deploy() {
 
   log "[STEP 08] Sensor VM Deployment Completed"
 
-  # Generate the Ubuntu 22.04 self-installing management NIC guard in the
-  # background. The user copies and runs it once inside the Sensor VM.
-  queue_sensor_mgmt_nic_guard_generation "mds"
+  # Generate the Ubuntu 22.04 management-NIC guard artifact in the background.
+  # Failure never changes STEP 08 success/failure. Bridge mode uses br-data;
+  # NAT mode tries virbr0 and the libvirt network name "default".
+  local sensor_guard_source_spec="virbr0 default"
+  [[ "${net_mode}" == "bridge" ]] && sensor_guard_source_spec="br-data"
+  if ! schedule_sensor_mgmt_nic_guard_generation "mds" "${sensor_guard_source_spec}" "STEP 08 deployment"; then
+    log "[WARN] STEP 08 completed, but Sensor management NIC guard generation could not be queued."
+  fi
 
   return 0
 }
@@ -8193,14 +8292,18 @@ EOF
 
 🛡️ Sensor Management NIC Guard:
    - Ubuntu 22.04 self-installing recovery script generation is queued
-   - Output: ${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh
-   - Copy it into the Sensor VM and run once as root
+   - Output: /home/stellar/sensor-mgmt-nic-guard-installer.sh
+   - Copy it into the Sensor VM (stellar-readable on the KVM host) and run once as root
 EOF
 )
 
     # Regenerate after final network/SPAN XML changes so the embedded MAC
-    # always matches the current Sensor management virtio NIC.
-    queue_sensor_mgmt_nic_guard_generation "${SENSOR_VM}"
+    # always matches the current Sensor management virtio interface.
+    local sensor_guard_source_spec="virbr0 default"
+    [[ "${net_mode}" == "bridge" ]] && sensor_guard_source_spec="br-data"
+    if ! schedule_sensor_mgmt_nic_guard_generation "${SENSOR_VM}" "${sensor_guard_source_spec}" "STEP 09 network/passthrough"; then
+        log "[WARN] ${SENSOR_VM}: Sensor management NIC guard generation could not be queued."
+    fi
 
     whiptail_msgbox "STEP 09 Completed" "${summary}" 24 88
 
@@ -9930,11 +10033,16 @@ The documentation site includes:
 }
 
 # Main execution
-# Silently refresh the helper artifact for an existing Sensor VM. STEP 08 and
-# STEP 09 also queue regeneration after deployment/network changes.
+# Silently refresh the helper artifact when an existing Sensor VM is detected.
+# STEP 08 and STEP 09 also regenerate it after deployment/network changes.
 load_config
-if [[ "${DRY_RUN:-1}" -eq 0 ]] && command -v virsh >/dev/null 2>&1    && virsh dominfo mds >/dev/null 2>&1; then
-  queue_sensor_mgmt_nic_guard_generation "mds"
+if [[ "${DRY_RUN:-1}" -eq 0 ]] && command -v virsh >/dev/null 2>&1 \
+   && virsh dominfo mds >/dev/null 2>&1; then
+  if [[ "${SENSOR_NET_MODE:-nat}" == "bridge" ]]; then
+    schedule_sensor_mgmt_nic_guard_generation "mds" "br-data" "installer startup refresh" >/dev/null 2>&1 || true
+  else
+    schedule_sensor_mgmt_nic_guard_generation "mds" "virbr0 default" "installer startup refresh" >/dev/null 2>&1 || true
+  fi
 fi
 
 main_menu

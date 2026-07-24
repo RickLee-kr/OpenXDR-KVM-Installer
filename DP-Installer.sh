@@ -5320,6 +5320,7 @@ step_07_lvm_storage() {
   # 0-5) Remove all existing LVM/VG/LV on selected disks
   #######################################
   log "[STEP 07] Removing existing LVM metadata (LV/VG/PV) from selected disks."
+  log "[STEP 07] If existing volumes are present, clearing them may take more than 10 minutes. Please wait and do not interrupt the process."
 
   local disk pv vg_name pv_list_for_disk
 

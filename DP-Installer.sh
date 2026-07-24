@@ -1686,6 +1686,99 @@ list_nic_candidates() {
   list_step01_phys_nics || true
 }
 
+# STEP 01 display-only helpers copied from the AIO/Sensor installer.
+# They enrich NIC menu descriptions and keep long text inside the whiptail border
+# without changing selected values or deployment logic.
+step01_get_pci_driver() {
+  local pci driver_path
+  pci=$(normalize_pci "$1")
+  driver_path=$(readlink -f "/sys/bus/pci/devices/${pci}/driver" 2>/dev/null || true)
+  [[ -n "${driver_path}" ]] && basename "${driver_path}"
+}
+
+step01_get_pci_description() {
+  local pci desc vendor device
+  pci=$(normalize_pci "$1")
+  if [[ -n "${pci}" ]] && command -v lspci >/dev/null 2>&1; then
+    desc=$(lspci -Dnn -s "${pci}" 2>/dev/null | head -n 1 | cut -d' ' -f2- || true)
+  fi
+  if [[ -z "${desc:-}" ]]; then
+    vendor=$(cat "/sys/bus/pci/devices/${pci}/vendor" 2>/dev/null || echo "unknown")
+    device=$(cat "/sys/bus/pci/devices/${pci}/device" 2>/dev/null || echo "unknown")
+    desc="vendor=${vendor}, device=${device}"
+  fi
+  echo "${desc}"
+}
+
+step01_get_compact_pci_description() {
+  local pci desc
+  pci=$(normalize_pci "$1")
+  desc=$(step01_get_pci_description "${pci}")
+  printf '%s\n' "${desc}" | sed -E \
+    -e 's/^(Ethernet|Network) controller \[[^]]+\]:[[:space:]]*//' \
+    -e 's/Broadcom Inc\. and subsidiaries/Broadcom/g' \
+    -e 's/Intel Corporation/Intel/g' \
+    -e 's/[[:space:]]+Ethernet Controller([[:space:]]|$)/ /g' \
+    -e 's/[[:space:]]+\(rev [^)]+\)$//' \
+    -e 's/[[:space:]]+/ /g' \
+    -e 's/^[[:space:]]+//' \
+    -e 's/[[:space:]]+$//'
+}
+
+step01_clip_menu_text() {
+  local text="$1"
+  local max_len="${2:-90}"
+  (( max_len < 4 )) && max_len=4
+  if (( ${#text} <= max_len )); then
+    printf '%s\n' "${text}"
+  else
+    printf '%s...\n' "${text:0:max_len-3}"
+  fi
+}
+
+step01_calc_wide_menu_size() {
+  local item_count="$1"
+  local min_width="${2:-100}"
+  local min_height="${3:-10}"
+  local max_width="${4:-160}"
+  local dims dialog_height ignored_width menu_height terminal_width available_width dialog_width
+
+  dims=$(calc_menu_size "${item_count}" 80 "${min_height}")
+  read -r dialog_height ignored_width menu_height <<< "${dims}"
+
+  terminal_width=$(tput cols 2>/dev/null || echo 100)
+  [[ -z "${terminal_width}" ]] && terminal_width=100
+  available_width=$((terminal_width - 6))
+  (( available_width < 20 )) && available_width=20
+
+  dialog_width="${available_width}"
+  (( dialog_width > max_width )) && dialog_width="${max_width}"
+  if (( dialog_width < min_width && available_width >= min_width )); then
+    dialog_width="${min_width}"
+  fi
+  (( dialog_width > available_width )) && dialog_width="${available_width}"
+
+  echo "${dialog_height} ${dialog_width} ${menu_height}"
+}
+
+step01_copy_menu_with_clipped_descriptions() {
+  local source_name="$1"
+  local destination_name="$2"
+  local stride="$3"
+  local max_description="$4"
+  local -n source_ref="${source_name}"
+  local -n destination_ref="${destination_name}"
+  local i
+
+  destination_ref=()
+  for ((i=0; i<${#source_ref[@]}; i+=stride)); do
+    destination_ref+=("${source_ref[i]}" "$(step01_clip_menu_text "${source_ref[i+1]}" "${max_description}")")
+    if (( stride == 3 )); then
+      destination_ref+=("${source_ref[i+2]}")
+    fi
+  done
+}
+
 # Find interface name by PCI address
 # Excludes virtual interfaces (lo, virbr*, vnet*, docker*, br-*, ovs*)
 find_if_by_pci() {
@@ -2226,16 +2319,19 @@ step_01_hw_detect() {
   nic_list=()
   idx=0
   while IFS= read -r name; do
-    # Collect IP info and ethtool speed/duplex for each NIC
+    # Display link, speed, duplex, IPv4, PCI, driver, and adapter model.
     local ipinfo speed duplex et_out link_state
+    local nic_pci nic_driver nic_pci_desc
 
-    # IP info
-    ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
-    [[ -z "${ipinfo}" ]] && ipinfo="(no ip)"
+    # Keep the menu readable by showing IPv4 here. Stable PCI/driver/model
+    # information is included in the same description.
+    ipinfo=$(ip -o -4 addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
+    [[ -z "${ipinfo}" ]] && ipinfo="(no IPv4)"
 
     # Defaults
     speed="Unknown"
     duplex="Unknown"
+    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
 
     # Fetch Speed / Duplex via ethtool
     if command -v ethtool >/dev/null 2>&1; then
@@ -2251,10 +2347,13 @@ step_01_hw_detect() {
       [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
     fi
 
-    link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
+    nic_pci="$(get_if_pci "${name}")"
+    [[ -n "${nic_pci}" ]] && nic_pci="$(normalize_pci "${nic_pci}")"
+    nic_driver="$(step01_get_pci_driver "${nic_pci}")"
+    [[ -z "${nic_driver}" ]] && nic_driver="none"
+    nic_pci_desc="$(step01_get_compact_pci_description "${nic_pci}")"
 
-    # Show as "speed=..., duplex=..., ip=..." in whiptail menu
-    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
+    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}, pci=${nic_pci:-unknown}, driver=${nic_driver}, ${nic_pci_desc}")
     ((idx++))
   done <<< "${nics}"
 
@@ -2264,11 +2363,15 @@ step_01_hw_detect() {
   local mgt_nic=""
   local mgt_nic_active=""
   local mgt_nic_passive=""
-  # Calculate menu size dynamically based on terminal size and number of NICs
+  # Use the same wide, bounded NIC display as the AIO/Sensor installer.
   local menu_dims
-  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  menu_dims=$(step01_calc_wide_menu_size "${idx}" 110 8 160)
   local menu_height menu_width menu_list_height
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+  local nic_menu_items=()
+  local nic_description_width=$((menu_width - 28))
+  (( nic_description_width < 12 )) && nic_description_width=12
+  step01_copy_menu_with_clipped_descriptions nic_list nic_menu_items 2 "${nic_description_width}"
   
   if [[ "${mgt_mode}" == "single" ]]; then
     local msg_content="Choose the management (mgt) NIC.\nThis is the external uplink for VM management traffic (NAT/bridge side).\nDo NOT select the hostmgmt NIC here.\nCurrent: ${mgt_display:-<none>}\n"
@@ -2277,7 +2380,7 @@ step_01_hw_detect() {
     mgt_nic=$(whiptail --title "STEP 01 - Select mgt NIC" \
                        --menu "${centered_msg}" \
                        "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
+                       "${nic_menu_items[@]}" \
                        3>&1 1>&2 2>&3) || {
       log "User canceled mgt NIC selection."
       return 1
@@ -2305,7 +2408,7 @@ step_01_hw_detect() {
     mgt_nic_active=$(whiptail --title "STEP 01 - Select mgt active NIC (primary)" \
                        --menu "${centered_a}" \
                        "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
+                       "${nic_menu_items[@]}" \
                        3>&1 1>&2 2>&3) || {
       log "User canceled mgt active NIC selection."
       return 1
@@ -2315,7 +2418,7 @@ step_01_hw_detect() {
     mgt_nic_passive=$(whiptail --title "STEP 01 - Select mgt passive NIC (backup)" \
                        --menu "${centered_b}" \
                        "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                       "${nic_list[@]}" \
+                       "${nic_menu_items[@]}" \
                        3>&1 1>&2 2>&3) || {
       log "User canceled mgt passive NIC selection."
       return 1
@@ -2350,7 +2453,7 @@ step_01_hw_detect() {
   ########################
   local host_nic
   # Calculate menu size dynamically (reuse same calculation as mgt/cltr0 NIC)
-  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  menu_dims=$(step01_calc_wide_menu_size "${idx}" 110 8 160)
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message
@@ -2361,7 +2464,7 @@ step_01_hw_detect() {
   host_nic=$(whiptail --title "STEP 01 - Select Host Access NIC" \
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                      "${nic_list[@]}" \
+                      "${nic_menu_items[@]}" \
                       3>&1 1>&2 2>&3) || {
     log "User canceled HOST_NIC selection."
     return 1
@@ -2399,7 +2502,7 @@ step_01_hw_detect() {
   # Warn if cltr0 NIC matches mgt NIC
   local cltr0_nic
   # Calculate menu size dynamically (reuse same calculation as mgt NIC)
-  menu_dims=$(calc_menu_size $((idx)) 90 8)
+  menu_dims=$(step01_calc_wide_menu_size "${idx}" 110 8 160)
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
   
   # Center-align the menu message based on terminal height
@@ -2410,7 +2513,7 @@ step_01_hw_detect() {
   cltr0_nic=$(whiptail --title "STEP 01 - Select cltr0 NIC" \
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                      "${nic_list[@]}" \
+                      "${nic_menu_items[@]}" \
                       3>&1 1>&2 2>&3) || {
     log "User canceled cltr0 NIC selection."
     return 1

@@ -458,6 +458,118 @@ run_cmd_linkscan() {
   return "${exit_code}"
 }
 
+
+# Download a file with HTTP error detection and atomic replacement.
+# Arguments: URL destination username password label
+download_acps_file_atomic() {
+  local url="$1"
+  local destination="$2"
+  local username="$3"
+  local password="$4"
+  local label="${5:-file}"
+  local tmp_file="${destination}.part.$$"
+
+  rm -f "${tmp_file}" 2>/dev/null || true
+
+  if ! curl \
+      --fail \
+      --show-error \
+      --location \
+      --retry 3 \
+      --retry-delay 2 \
+      --connect-timeout 20 \
+      --user "${username}:${password}" \
+      --output "${tmp_file}" \
+      "${url}"; then
+    log "[ERROR] Failed to download ${label}: ${url}"
+    rm -f "${tmp_file}" 2>/dev/null || true
+    return 1
+  fi
+
+  if [[ ! -s "${tmp_file}" ]]; then
+    log "[ERROR] Downloaded ${label} is empty: ${url}"
+    rm -f "${tmp_file}" 2>/dev/null || true
+    return 1
+  fi
+
+  mv -f "${tmp_file}" "${destination}"
+  return 0
+}
+
+# Validate that a downloaded deployment script is really a shell script,
+# not an HTML error/login page returned with HTTP status 200/404.
+validate_downloaded_shell_script() {
+  local script_path="$1"
+
+  [[ -s "${script_path}" ]] || return 1
+
+  if head -c 4096 "${script_path}" 2>/dev/null \
+      | LC_ALL=C grep -Eiq '<!doctype[[:space:]]+html|<html([[:space:]>])|<head([[:space:]>])|404[[:space:]]+not[[:space:]]+found|access[[:space:]]+denied|unauthorized|authentication[[:space:]]+required'; then
+    return 1
+  fi
+
+  if ! head -n 1 "${script_path}" 2>/dev/null \
+      | grep -Eq '^#![[:space:]]*/.*(bash|sh)([[:space:]]|$)'; then
+    return 1
+  fi
+
+  bash -n "${script_path}" >/dev/null 2>&1
+}
+
+# Validate the downloaded qcow2 image using qemu-img when available.
+validate_qcow2_image() {
+  local image_path="$1"
+
+  [[ -s "${image_path}" ]] || return 1
+
+  # Reject obviously invalid tiny responses such as HTML/XML error pages.
+  local image_size
+  image_size=$(stat -c '%s' "${image_path}" 2>/dev/null || echo 0)
+  [[ "${image_size}" =~ ^[0-9]+$ ]] || return 1
+  (( image_size >= 1048576 )) || return 1
+
+  if command -v qemu-img >/dev/null 2>&1; then
+    qemu-img info "${image_path}" >/dev/null 2>&1 || return 1
+  fi
+
+  return 0
+}
+
+# Strict validation for a Sensor deployment image.
+# The filename must exactly match the selected Sensor release so an AIO/DP image
+# cannot be silently copied and renamed as a Sensor image.
+validate_sensor_qcow2_candidate() {
+  local image_path="$1"
+  local sensor_version="$2"
+  local expected_name="aella-modular-ds-${sensor_version}.qcow2"
+  local actual_name
+  local image_format
+
+  actual_name="$(basename -- "${image_path}")"
+  [[ "${actual_name}" == "${expected_name}" ]] || return 1
+  validate_qcow2_image "${image_path}" || return 1
+
+  command -v qemu-img >/dev/null 2>&1 || return 1
+  image_format=$(LC_ALL=C qemu-img info "${image_path}" 2>/dev/null     | awk -F': ' '/^file format:/ {print $2; exit}')
+  [[ "${image_format}" == "qcow2" ]] || return 1
+
+  return 0
+}
+
+# Return the qcow2 virtual size in bytes. This is used before STEP 11 so the
+# deployment script is never asked to shrink an image implicitly.
+get_qcow2_virtual_size_bytes() {
+  local image_path="$1"
+  local info_json
+  local virtual_bytes
+
+  command -v qemu-img >/dev/null 2>&1 || return 1
+  info_json=$(LC_ALL=C qemu-img info --output=json "${image_path}" 2>/dev/null) || return 1
+  virtual_bytes=$(printf '%s' "${info_json}"     | tr -d '\n'     | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  [[ "${virtual_bytes}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${virtual_bytes}"
+}
+
 # Expand ubuntu-vg from unallocated OS disk space when free extents are insufficient.
 # Args: step_label ubuntu_vg root_dev required_lv_mib [safety_buffer_mib]
 ensure_ubuntu_vg_free_space() {
@@ -693,11 +805,18 @@ get_sensor_management_mac() {
 generate_sensor_mgmt_nic_guard_installer() {
   local vm_name="${1:-mds}"
   local mgmt_bridge="${2:-virbr0}"
-  local output_dir="${BASE_DIR}/output"
+  # Publish directly in the KVM host stellar user's home so the Sensor VM can
+  # retrieve the files with the stellar account without requiring root access.
+  local output_dir="/home/stellar"
   local output_file="${output_dir}/sensor-mgmt-nic-guard-installer.sh"
   local checksum_file="${output_file}.sha256"
+  local legacy_output_file="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
+  local legacy_checksum_file="${legacy_output_file}.sha256"
+  local publish_user="stellar"
+  local publish_group="stellar"
   local mgmt_mac=""
   local tmp_file=""
+  local checksum_tmp=""
 
   SENSOR_MGMT_GUARD_OUTPUT_PATH="${output_file}"
 
@@ -711,7 +830,40 @@ generate_sensor_mgmt_nic_guard_installer() {
     return 1
   fi
 
-  mkdir -p "${output_dir}"
+  if ! id "${publish_user}" >/dev/null 2>&1; then
+    log "[ERROR] Host user '${publish_user}' does not exist; cannot publish Sensor NIC guard to ${output_dir}."
+    return 1
+  fi
+
+  if [[ -e "${output_dir}" && ! -d "${output_dir}" ]]; then
+    log "[ERROR] Sensor NIC guard output path exists but is not a directory: ${output_dir}"
+    return 1
+  fi
+
+  # Do not change the permissions of an existing home directory. Create it only
+  # when missing, with ownership that allows the stellar account to access it.
+  if [[ ! -d "${output_dir}" ]]; then
+    if [[ "${EUID}" -eq 0 ]]; then
+      if ! install -d -m 0750 -o "${publish_user}" -g "${publish_group}" "${output_dir}"; then
+        log "[ERROR] Failed to create Sensor NIC guard output directory: ${output_dir}"
+        return 1
+      fi
+    elif [[ "$(id -un 2>/dev/null || true)" == "${publish_user}" ]]; then
+      if ! mkdir -p "${output_dir}" || ! chmod 0750 "${output_dir}"; then
+        log "[ERROR] Failed to create Sensor NIC guard output directory: ${output_dir}"
+        return 1
+      fi
+    else
+      log "[ERROR] Run the installer as root or '${publish_user}' to publish into ${output_dir}."
+      return 1
+    fi
+  fi
+
+  if [[ ! -w "${output_dir}" ]]; then
+    log "[ERROR] Sensor NIC guard output directory is not writable: ${output_dir}"
+    return 1
+  fi
+
   tmp_file="$(mktemp "${output_dir}/.sensor-mgmt-nic-guard.XXXXXX")"
 
   cat > "${tmp_file}" <<'SENSOR_GUARD_INSTALLER'
@@ -1027,19 +1179,111 @@ SENSOR_GUARD_INSTALLER
     return 1
   fi
 
-  mv -f "${tmp_file}" "${output_file}"
-  chmod 0700 "${output_file}"
+  # Atomic publication. The script is executable/readable by stellar and the
+  # checksum is world-readable so it can be copied from the Sensor VM directly.
+  if ! mv -f "${tmp_file}" "${output_file}"; then
+    rm -f "${tmp_file}" 2>/dev/null || true
+    log "[ERROR] Failed to publish Sensor NIC guard: ${output_file}"
+    return 1
+  fi
+  if [[ "${EUID}" -eq 0 ]]; then
+    if ! chown "${publish_user}:${publish_group}" "${output_file}"; then
+      log "[ERROR] Failed to set ownership on ${output_file}"
+      return 1
+    fi
+  elif [[ "$(id -un 2>/dev/null || true)" != "${publish_user}" ]]; then
+    log "[ERROR] Cannot publish ${output_file}: current user is not ${publish_user}."
+    return 1
+  fi
+  if ! chmod 0755 "${output_file}"; then
+    log "[ERROR] Failed to set permissions on ${output_file}"
+    return 1
+  fi
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (
+    checksum_tmp="$(mktemp "${output_dir}/.sensor-mgmt-nic-guard-sha256.XXXXXX")"
+    if ! (
       cd "${output_dir}"
-      sha256sum "$(basename "${output_file}")" > "$(basename "${checksum_file}")"
-    )
-    chmod 0600 "${checksum_file}"
+      sha256sum "$(basename "${output_file}")" > "${checksum_tmp}"
+    ); then
+      rm -f "${checksum_tmp}" 2>/dev/null || true
+      log "[ERROR] Failed to create Sensor NIC guard checksum."
+      return 1
+    fi
+    if ! mv -f "${checksum_tmp}" "${checksum_file}"; then
+      rm -f "${checksum_tmp}" 2>/dev/null || true
+      log "[ERROR] Failed to publish Sensor NIC guard checksum: ${checksum_file}"
+      return 1
+    fi
+    if [[ "${EUID}" -eq 0 ]]; then
+      if ! chown "${publish_user}:${publish_group}" "${checksum_file}"; then
+        log "[ERROR] Failed to set ownership on ${checksum_file}"
+        return 1
+      fi
+    elif [[ "$(id -un 2>/dev/null || true)" != "${publish_user}" ]]; then
+      log "[ERROR] Cannot publish ${checksum_file}: current user is not ${publish_user}."
+      return 1
+    fi
+    if ! chmod 0644 "${checksum_file}"; then
+      log "[ERROR] Failed to set permissions on ${checksum_file}"
+      return 1
+    fi
+  fi
+
+  # Remove legacy root-only publication after the new copy is safely available.
+  if [[ "${legacy_output_file}" != "${output_file}" ]]; then
+    rm -f "${legacy_output_file}" "${legacy_checksum_file}" 2>/dev/null || true
+    rmdir "$(dirname "${legacy_output_file}")" >/dev/null 2>&1 || true
   fi
 
   log "[SUCCESS] Sensor NIC guard automatically generated: ${output_file}"
+  log "[INFO] Published owner/mode: ${publish_user}:${publish_group} 0755 (checksum 0644)"
+  log "[INFO] Legacy root-only artifact removed: ${legacy_output_file}"
   log "[INFO] Embedded management MAC: ${mgmt_mac}"
+  return 0
+}
+
+# Queue generation as a detached background task. A lock prevents STEP 11,
+# STEP 12, and installer startup from generating the same artifact concurrently.
+schedule_sensor_mgmt_nic_guard_generation() {
+  local vm_name="${1:-mds}"
+  local mgmt_bridge="${2:-virbr0}"
+  local reason="${3:-unspecified}"
+  local bg_log="${STATE_DIR}/sensor-mgmt-nic-guard-generation.log"
+  local lock_file="${STATE_DIR}/sensor-mgmt-nic-guard-generation.lock"
+  local bg_pid=""
+
+  SENSOR_MGMT_GUARD_OUTPUT_PATH="/home/stellar/sensor-mgmt-nic-guard-installer.sh"
+
+  if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+    log "[DRY-RUN] Would queue Sensor NIC guard generation (${reason}): ${SENSOR_MGMT_GUARD_OUTPUT_PATH}"
+    return 0
+  fi
+
+  mkdir -p "${STATE_DIR}"
+  (
+    trap '' HUP
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>"${lock_file}"
+      if ! flock -n 9; then
+        log "[INFO] Sensor NIC guard generation already running; duplicate request skipped (${reason})."
+        exit 0
+      fi
+    fi
+
+    log "[INFO] Background Sensor NIC guard generation started (${reason})."
+    if generate_sensor_mgmt_nic_guard_installer "${vm_name}" "${mgmt_bridge}"; then
+      log "[SUCCESS] Background Sensor NIC guard generation completed (${reason})."
+      exit 0
+    fi
+    log "[WARN] Background Sensor NIC guard generation failed (${reason})."
+    exit 1
+  ) >>"${bg_log}" 2>&1 &
+  bg_pid=$!
+  disown "${bg_pid}" 2>/dev/null || true
+
+  log "[INFO] Sensor NIC guard generation queued in background (pid=${bg_pid}, reason=${reason})."
+  log "[INFO] Expected files: /home/stellar/sensor-mgmt-nic-guard-installer.sh and .sha256"
   return 0
 }
 
@@ -1671,6 +1915,12 @@ run_step() {
       ;;
   esac
 
+  if [[ "${rc}" -eq 20 ]]; then
+    RUN_STEP_STATUS="CANCELED"
+    log "===== STEP CANCELED: ${step_id} - ${step_name} ====="
+    return 0
+  fi
+
   if [[ "${rc}" -eq 0 ]]; then
     RUN_STEP_STATUS="DONE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP DONE: ${step_id} - ${step_name} ====="
@@ -1799,12 +2049,15 @@ run_step() {
       "08_dp_download")
         local download_status="Unverified"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
-          if [[ -f /stellar/aio/images/virt_deploy_uvp_centos.sh ]] && \
-             [[ -f /stellar/aio/images/aella-dataprocessor-*.qcow2 ]]; then
-            download_status="Completed (script + image)"
-          elif [[ -f /stellar/aio/images/virt_deploy_uvp_centos.sh ]] || \
-               [[ -f /stellar/aio/images/aella-dataprocessor-*.qcow2 ]]; then
-            download_status="Partially downloaded"
+          local verify_script="/stellar/aio/images/virt_deploy_uvp_centos.sh"
+          local verify_image=""
+          verify_image=$(compgen -G '/stellar/aio/images/aella-dataprocessor-*.qcow2' | head -n 1 || true)
+
+          if validate_downloaded_shell_script "${verify_script}" && \
+             [[ -n "${verify_image}" ]] && validate_qcow2_image "${verify_image}"; then
+            download_status="Completed and validated (script + image)"
+          elif [[ -s "${verify_script}" || -n "${verify_image}" ]]; then
+            download_status="Partially downloaded or invalid"
           else
             download_status="Not downloaded"
           fi
@@ -1830,10 +2083,11 @@ run_step() {
       "10_sensor_lv_download")
         local sensor_lv_status="Unverified"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
+          local verify_sensor_image="/var/lib/libvirt/images/mds/images/aella-modular-ds-${SENSOR_VERSION}.qcow2"
           if lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1 && \
              mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null && \
-             [[ -f /var/lib/libvirt/images/mds/aella-modular-ds-*.qcow2 ]]; then
-            sensor_lv_status="Completed (LV + mount + image)"
+             validate_sensor_qcow2_candidate "${verify_sensor_image}" "${SENSOR_VERSION}"; then
+            sensor_lv_status="Completed and validated (LV + mount + Sensor image)"
           elif lvs ubuntu-vg/lv_sensor_root_mds >/dev/null 2>&1 && \
                mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then
             sensor_lv_status="LV created (image pending)"
@@ -2267,6 +2521,183 @@ normalize_pci() {
   echo "0000:${p}"
 }
 
+
+# Return the source PCI BDFs assigned to a libvirt VM as normalized
+# domain:bus:slot.function values. Only <hostdev type='pci'><source> addresses
+# are returned; guest-side PCI addresses are intentionally ignored.
+list_vm_hostdev_pcis() {
+  local vm_name="$1"
+  [[ -n "${vm_name}" ]] || return 0
+  command -v virsh >/dev/null 2>&1 || return 0
+  virsh dominfo "${vm_name}" >/dev/null 2>&1 || return 0
+
+  local in_hostdev=0
+  local in_source=0
+  local line domain bus slot function
+
+  while IFS= read -r line; do
+    if [[ "${line}" == *"<hostdev "* && "${line}" == *"type='pci'"* ]]; then
+      in_hostdev=1
+      in_source=0
+    fi
+
+    if [[ "${in_hostdev}" -eq 1 && "${line}" == *"<source"* ]]; then
+      in_source=1
+    fi
+
+    if [[ "${in_hostdev}" -eq 1 && "${in_source}" -eq 1 && "${line}" == *"<address "* ]]; then
+      domain=$(sed -n "s/.*domain=['\"]\\([^'\"]*\\)['\"].*/\\1/p" <<< "${line}")
+      bus=$(sed -n "s/.*bus=['\"]\\([^'\"]*\\)['\"].*/\\1/p" <<< "${line}")
+      slot=$(sed -n "s/.*slot=['\"]\\([^'\"]*\\)['\"].*/\\1/p" <<< "${line}")
+      function=$(sed -n "s/.*function=['\"]\\([^'\"]*\\)['\"].*/\\1/p" <<< "${line}")
+
+      domain="${domain#0x}"; domain="${domain#0X}"
+      bus="${bus#0x}"; bus="${bus#0X}"
+      slot="${slot#0x}"; slot="${slot#0X}"
+      function="${function#0x}"; function="${function#0X}"
+
+      if [[ "${domain}" =~ ^[0-9a-fA-F]+$ && "${bus}" =~ ^[0-9a-fA-F]+$ && \
+            "${slot}" =~ ^[0-9a-fA-F]+$ && "${function}" =~ ^[0-9a-fA-F]+$ ]]; then
+        printf '%04x:%02x:%02x.%x\n' \
+          "$((16#${domain}))" "$((16#${bus}))" "$((16#${slot}))" "$((16#${function}))"
+      fi
+    fi
+
+    if [[ "${line}" == *"</source>"* ]]; then
+      in_source=0
+    fi
+    if [[ "${line}" == *"</hostdev>"* ]]; then
+      in_hostdev=0
+      in_source=0
+    fi
+  done < <(virsh dumpxml "${vm_name}" --inactive 2>/dev/null || true)
+}
+
+# Enumerate all Ethernet-class PCI functions that still exist on the KVM host,
+# including functions currently bound to vfio-pci and therefore absent from
+# /sys/class/net.
+list_host_ethernet_pcis() {
+  local dev_path class_value
+  for dev_path in /sys/bus/pci/devices/*; do
+    [[ -r "${dev_path}/class" ]] || continue
+    class_value=$(cat "${dev_path}/class" 2>/dev/null || true)
+    [[ "${class_value,,}" == 0x0200* ]] || continue
+    basename "${dev_path}"
+  done | sort -u
+}
+
+step01_get_pci_ifaces() {
+  local pci
+  pci=$(normalize_pci "$1")
+  [[ -d "/sys/bus/pci/devices/${pci}/net" ]] || return 0
+  find "/sys/bus/pci/devices/${pci}/net" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort -u
+}
+
+step01_get_pci_driver() {
+  local pci driver_path
+  pci=$(normalize_pci "$1")
+  driver_path=$(readlink -f "/sys/bus/pci/devices/${pci}/driver" 2>/dev/null || true)
+  [[ -n "${driver_path}" ]] && basename "${driver_path}"
+}
+
+step01_get_pci_description() {
+  local pci desc vendor device
+  pci=$(normalize_pci "$1")
+  if command -v lspci >/dev/null 2>&1; then
+    desc=$(lspci -Dnn -s "${pci}" 2>/dev/null | head -n 1 | cut -d' ' -f2-)
+  fi
+  if [[ -z "${desc:-}" ]]; then
+    vendor=$(cat "/sys/bus/pci/devices/${pci}/vendor" 2>/dev/null || echo "unknown")
+    device=$(cat "/sys/bus/pci/devices/${pci}/device" 2>/dev/null || echo "unknown")
+    desc="vendor=${vendor}, device=${device}"
+  fi
+  echo "${desc}"
+}
+
+
+# STEP 01 menu-only helpers. These keep long NIC/PCI descriptions inside the
+# whiptail border without changing selected values or deployment logic.
+step01_get_compact_pci_description() {
+  local pci desc
+  pci=$(normalize_pci "$1")
+  desc=$(step01_get_pci_description "${pci}")
+  printf '%s\n' "${desc}" | sed -E \
+    -e 's/^(Ethernet|Network) controller \[[^]]+\]:[[:space:]]*//' \
+    -e 's/Broadcom Inc\. and subsidiaries/Broadcom/g' \
+    -e 's/Intel Corporation/Intel/g' \
+    -e 's/[[:space:]]+Ethernet Controller([[:space:]]|$)/ /g' \
+    -e 's/[[:space:]]+\(rev [^)]+\)$//' \
+    -e 's/[[:space:]]+/ /g' \
+    -e 's/^[[:space:]]+//' \
+    -e 's/[[:space:]]+$//'
+}
+
+step01_compact_candidate_state() {
+  case "$1" in
+    "attached-to-mds, stored") echo "mds+stored" ;;
+    "attached-to-mds")         echo "mds" ;;
+    "stored, not-visible")     echo "stored" ;;
+    "host-pci, vfio-bound")   echo "host+vfio" ;;
+    "host-visible")            echo "host" ;;
+    "host-pci")                echo "host-pci" ;;
+    *)                           echo "$1" ;;
+  esac
+}
+
+step01_clip_menu_text() {
+  local text="$1"
+  local max_len="${2:-90}"
+  (( max_len < 4 )) && max_len=4
+  if (( ${#text} <= max_len )); then
+    printf '%s\n' "${text}"
+  else
+    printf '%s...\n' "${text:0:max_len-3}"
+  fi
+}
+
+step01_calc_wide_menu_size() {
+  local item_count="$1"
+  local min_width="${2:-100}"
+  local min_height="${3:-10}"
+  local max_width="${4:-160}"
+  local dims dialog_height ignored_width menu_height terminal_width available_width dialog_width
+
+  dims=$(calc_menu_size "${item_count}" 80 "${min_height}")
+  read -r dialog_height ignored_width menu_height <<< "${dims}"
+
+  terminal_width=$(tput cols 2>/dev/null || echo 100)
+  [[ -z "${terminal_width}" ]] && terminal_width=100
+  available_width=$((terminal_width - 6))
+  (( available_width < 20 )) && available_width=20
+
+  dialog_width="${available_width}"
+  (( dialog_width > max_width )) && dialog_width="${max_width}"
+  if (( dialog_width < min_width && available_width >= min_width )); then
+    dialog_width="${min_width}"
+  fi
+  (( dialog_width > available_width )) && dialog_width="${available_width}"
+
+  echo "${dialog_height} ${dialog_width} ${menu_height}"
+}
+
+step01_copy_menu_with_clipped_descriptions() {
+  local source_name="$1"
+  local destination_name="$2"
+  local stride="$3"
+  local max_description="$4"
+  local -n source_ref="${source_name}"
+  local -n destination_ref="${destination_name}"
+  local i
+
+  destination_ref=()
+  for ((i=0; i<${#source_ref[@]}; i+=stride)); do
+    destination_ref+=("${source_ref[i]}" "$(step01_clip_menu_text "${source_ref[i+1]}" "${max_description}")")
+    if (( stride == 3 )); then
+      destination_ref+=("${source_ref[i+2]}")
+    fi
+  done
+}
+
 normalize_mac() {
   local mac="$1"
   [[ -z "$mac" ]] && { echo ""; return 0; }
@@ -2508,10 +2939,12 @@ step_01_hw_detect() {
   while IFS= read -r name; do
     # IP information assigned to each NIC + ethtool Speed/Duplex Display
     local ipinfo speed duplex et_out link_state
+    local nic_pci nic_driver nic_pci_desc
 
-    # IP information
-    ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
-    [[ -z "${ipinfo}" ]] && ipinfo="(no ip)"
+    # Keep the menu readable by showing IPv4 here. Stable PCI/driver/model
+    # information is included in the same description.
+    ipinfo=$(ip -o -4 addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
+    [[ -z "${ipinfo}" ]] && ipinfo="(no IPv4)"
 
     # default value
     speed="Unknown"
@@ -2532,8 +2965,14 @@ step_01_hw_detect() {
       [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
     fi
 
-    # whiptail in menu "link=..., speed=..., duplex=..., ip=..." in the form of Display
-    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}")
+    nic_pci="$(get_if_pci "${name}")"
+    [[ -n "${nic_pci}" ]] && nic_pci="$(normalize_pci "${nic_pci}")"
+    nic_driver="$(step01_get_pci_driver "${nic_pci}")"
+    [[ -z "${nic_driver}" ]] && nic_driver="none"
+    nic_pci_desc="$(step01_get_compact_pci_description "${nic_pci}")"
+
+    # Display-only enhancement for NAT-uplink and host-access menus.
+    nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}, pci=${nic_pci:-unknown}, driver=${nic_driver}, ${nic_pci_desc}")
     ((idx++))
   done <<< "${nics}"
 
@@ -2544,9 +2983,14 @@ step_01_hw_detect() {
     log "[STEP 01] NAT Mode - NAT uplink NIC selection (select one)"
     
     local nat_nic
-    # Calculate menu size dynamically
-    menu_dims=$(calc_menu_size ${#nic_list[@]} 90 10)
+    local nat_menu_items=()
+    local nat_description_width
+    # STEP 01-only wide dialog; descriptions are clipped to its actual width.
+    menu_dims=$(step01_calc_wide_menu_size $((${#nic_list[@]} / 2)) 110 10 160)
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+    nat_description_width=$((menu_width - 28))
+    (( nat_description_width < 12 )) && nat_description_width=12
+    step01_copy_menu_with_clipped_descriptions nic_list nat_menu_items 2 "${nat_description_width}"
     
     # Center-align menu message
     menu_msg=$(center_menu_message "Select NAT network uplink NIC.\nThis NIC will be renamed to 'mgt' and used for external connections.\nDo NOT select the hostmgmt NIC here.\nSensor VM will be connected to virbr0 NAT bridge.\nCurrent setting: ${HOST_NIC:-<None>}" "${menu_height}")
@@ -2554,7 +2998,7 @@ step_01_hw_detect() {
     nat_nic=$(whiptail --title "STEP 01 - NAT uplink NIC Selection (NAT Mode)" \
                       --menu "${menu_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                      "${nic_list[@]}" \
+                      "${nat_menu_items[@]}" \
                       3>&1 1>&2 2>&3) || {
       log "User canceled NAT uplink NIC selection."
       return 1
@@ -2595,9 +3039,14 @@ step_01_hw_detect() {
     log "[STEP 01] No available NICs for host access (all NICs are already used). Skipping host access NIC selection."
     HOST_ACCESS_NIC=""
   else
-    # Calculate menu size dynamically
-    menu_dims=$(calc_menu_size ${#available_nics[@]} 90 10)
+    local host_access_menu_items=()
+    local host_access_description_width
+    # Use the same detailed, bounded display as the NAT-uplink menu.
+    menu_dims=$(step01_calc_wide_menu_size $((${#available_nics[@]} / 2)) 110 10 160)
     read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
+    host_access_description_width=$((menu_width - 28))
+    (( host_access_description_width < 12 )) && host_access_description_width=12
+    step01_copy_menu_with_clipped_descriptions available_nics host_access_menu_items 2 "${host_access_description_width}"
     
     # Center-align menu message
     local msg_content="Select NIC for direct access (hostmgmt) to the KVM host only.\nThis is NOT the mgt NIC. It is used for host access (no VM NAT).\nIt will be configured as 192.168.0.100/24 without gateway.\n\nCurrent setting: ${HOST_ACCESS_NIC:-<none>}\n"
@@ -2608,7 +3057,7 @@ step_01_hw_detect() {
     host_access_nic=$(whiptail --title "STEP 01 - Select Host Access NIC" \
                       --menu "${centered_msg}" \
                       "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                      "${available_nics[@]}" \
+                      "${host_access_menu_items[@]}" \
                       3>&1 1>&2 2>&3) || {
       log "User canceled HOST_ACCESS_NIC selection."
       HOST_ACCESS_NIC=""
@@ -2630,109 +3079,255 @@ step_01_hw_detect() {
 
   ########################
   # 4-3) SPAN NIC Selection (Multiple selection)
+  #
+  # Candidate sources are merged without changing the rest of STEP 01:
+  #   1) NICs currently visible in /sys/class/net
+  #   2) Previously saved SPAN NIC names/PCI BDFs
+  #   3) PCI hostdevs currently assigned to the mds VM XML
+  #   4) Host Ethernet PCI functions, including vfio-pci-bound devices
   ########################
   local span_nic_list=()
+  local stored_span_names="${SPAN_NICS_MDS:-${SPAN_NICS:-}}"
+  local stored_span_pcis="${SENSOR_SPAN_VF_PCIS_MDS:-${SENSOR_SPAN_VF_PCIS:-}}"
+  local host_nic_pci="${HOST_NIC_PCI:-}"
+  local host_access_pci="${HOST_ACCESS_NIC_PCI:-}"
+  local attached_pci=""
+  local stored_name="" stored_pci="" pci_addr="" pci_desc="" pci_driver="" pci_ifaces=""
+  local candidate_tag="" candidate_state="" flag="OFF"
+  local array_index=0
+
+  [[ -z "${host_nic_pci}" ]] && host_nic_pci="$(get_if_pci "${HOST_NIC}")"
+  [[ -z "${host_access_pci}" && -n "${HOST_ACCESS_NIC:-}" ]] && host_access_pci="$(get_if_pci "${HOST_ACCESS_NIC}")"
+  [[ -n "${host_nic_pci}" ]] && host_nic_pci="$(normalize_pci "${host_nic_pci}")"
+  [[ -n "${host_access_pci}" ]] && host_access_pci="$(normalize_pci "${host_access_pci}")"
+
+  declare -A span_candidate_pci=()
+  declare -A span_candidate_seen_tag=()
+  declare -A span_candidate_seen_pci=()
+  declare -A span_stored_name_set=()
+  declare -A span_stored_pci_set=()
+  declare -A span_stored_pci_name=()
+  declare -A span_attached_pci_set=()
+
+  local stored_name_array=()
+  local stored_pci_array=()
+  read -r -a stored_name_array <<< "${stored_span_names}"
+  read -r -a stored_pci_array <<< "${stored_span_pcis}"
+
+  for stored_name in "${stored_name_array[@]}"; do
+    [[ -n "${stored_name}" ]] && span_stored_name_set["${stored_name}"]=1
+  done
+
+  for array_index in "${!stored_pci_array[@]}"; do
+    stored_pci="$(normalize_pci "${stored_pci_array[${array_index}]}")"
+    stored_pci="${stored_pci,,}"
+    [[ "${stored_pci}" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]] || continue
+    span_stored_pci_set["${stored_pci}"]=1
+    stored_name="${stored_name_array[${array_index}]:-}"
+    [[ -n "${stored_name}" ]] && span_stored_pci_name["${stored_pci}"]="${stored_name}"
+  done
+
+  while IFS= read -r attached_pci; do
+    [[ -n "${attached_pci}" ]] || continue
+    attached_pci="$(normalize_pci "${attached_pci}")"
+    attached_pci="${attached_pci,,}"
+    [[ "${attached_pci}" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]] || continue
+    span_attached_pci_set["${attached_pci}"]=1
+  done < <(list_vm_hostdev_pcis mds | sort -u)
+
+  # First preserve the existing user experience for host-visible NICs, while
+  # adding stable PCI/vendor/driver information to each description.
   while IFS= read -r name; do
     if [[ "${name}" == "${HOST_NIC}" || "${name}" == "${HOST_ACCESS_NIC}" ]]; then
       continue
     fi
-    # IP information assigned to each NIC + ethtool Speed/Duplex Display
-    local ipinfo speed duplex et_out link_state
 
-    # IP information
+    pci_addr="$(get_if_pci "${name}")"
+    [[ -n "${pci_addr}" ]] && pci_addr="$(normalize_pci "${pci_addr}")"
+    pci_addr="${pci_addr,,}"
+
+    if [[ -n "${pci_addr}" && ( "${pci_addr}" == "${host_nic_pci,,}" || "${pci_addr}" == "${host_access_pci,,}" ) ]]; then
+      continue
+    fi
+
+    local ipinfo speed duplex et_out link_state
     ipinfo=$(ip -o addr show dev "${name}" 2>/dev/null | awk '{print $4}' | paste -sd "," -)
     [[ -z "${ipinfo}" ]] && ipinfo="(no ip)"
-
-    # default value
     speed="Unknown"
     duplex="Unknown"
     link_state="${STEP01_LINK_STATE[${name}]:-unknown}"
 
-    # ethtoolas  Speed / Duplex Get
     if command -v ethtool >/dev/null 2>&1; then
-      # set -e protection: ethtool so script doesn't die even if it fails || true
       et_out=$(ethtool "${name}" 2>/dev/null || true)
-
-      # Speed:
       tmp_speed=$(printf '%s\n' "${et_out}" | awk -F': ' '/Speed:/ {print $2; exit}')
       [[ -n "${tmp_speed}" ]] && speed="${tmp_speed}"
-
-      # Duplex:
       tmp_duplex=$(printf '%s\n' "${et_out}" | awk -F': ' '/Duplex:/ {print $2; exit}')
       [[ -n "${tmp_duplex}" ]] && duplex="${tmp_duplex}"
     fi
 
-    # If existing SPAN_NIC is selected, set ON, otherwise OFF
-    local flag="OFF"
-    for s in ${SPAN_NICS}; do
-      if [[ "${s}" == "${name}" ]]; then
-        flag="ON"
-        break
-      fi
-    done
-    span_nic_list+=("${name}" "link=${link_state}, speed=${speed}, duplex=${duplex}, ip=${ipinfo}" "${flag}")
+    pci_desc="$(step01_get_compact_pci_description "${pci_addr}")"
+    pci_driver="$(step01_get_pci_driver "${pci_addr}")"
+    [[ -z "${pci_driver}" ]] && pci_driver="none"
+    candidate_state="host-visible"
+    [[ -n "${span_attached_pci_set[${pci_addr}]:-}" ]] && candidate_state="attached-to-mds"
+
+    flag="OFF"
+    if [[ -n "${span_stored_name_set[${name}]:-}" || -n "${span_stored_pci_set[${pci_addr}]:-}" || \
+          -n "${span_attached_pci_set[${pci_addr}]:-}" ]]; then
+      flag="ON"
+    fi
+
+    span_nic_list+=("${name}" "state=$(step01_compact_candidate_state "${candidate_state}"), pci=${pci_addr:-unknown}, driver=${pci_driver}, ${pci_desc}, link=${link_state}/${speed}/${duplex}, ip=${ipinfo}" "${flag}")
+    span_candidate_pci["${name}"]="${pci_addr}"
+    span_candidate_seen_tag["${name}"]=1
+    [[ -n "${pci_addr}" ]] && span_candidate_seen_pci["${pci_addr}"]=1
   done <<< "${nics}"
 
+  # Merge saved PCI BDFs, active mds hostdevs, and every Ethernet-class host
+  # PCI function. This is what keeps passthrough NICs selectable even though
+  # vfio-pci removes their netdev names from /sys/class/net.
+  local merged_pci_candidates=""
+  merged_pci_candidates=$(printf '%s\n%s\n%s\n' \
+    "${stored_span_pcis}" \
+    "$(list_vm_hostdev_pcis mds 2>/dev/null || true)" \
+    "$(list_host_ethernet_pcis 2>/dev/null || true)" \
+    | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | while IFS= read -r pci_addr; do normalize_pci "${pci_addr}"; done | tr '[:upper:]' '[:lower:]' | sort -u)
+
+  while IFS= read -r pci_addr; do
+    [[ -n "${pci_addr}" ]] || continue
+    [[ "${pci_addr}" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]] || continue
+    [[ "${pci_addr}" == "${host_nic_pci,,}" || "${pci_addr}" == "${host_access_pci,,}" ]] && continue
+    [[ -n "${span_candidate_seen_pci[${pci_addr}]:-}" ]] && continue
+    [[ -e "/sys/bus/pci/devices/${pci_addr}" ]] || {
+      log "[STEP 01] Ignoring saved/VM PCI that no longer exists on host: ${pci_addr}"
+      continue
+    }
+
+    stored_name="${span_stored_pci_name[${pci_addr}]:-}"
+    pci_ifaces="$(step01_get_pci_ifaces "${pci_addr}" | paste -sd ',' -)"
+    if [[ -n "${stored_name}" && -z "${span_candidate_seen_tag[${stored_name}]:-}" ]]; then
+      candidate_tag="${stored_name}"
+    elif [[ -n "${pci_ifaces}" ]]; then
+      candidate_tag="${pci_ifaces%%,*}"
+      if [[ -n "${span_candidate_seen_tag[${candidate_tag}]:-}" ]]; then
+        candidate_tag="pci:${pci_addr}"
+      fi
+    else
+      candidate_tag="pci:${pci_addr}"
+    fi
+
+    pci_desc="$(step01_get_compact_pci_description "${pci_addr}")"
+    pci_driver="$(step01_get_pci_driver "${pci_addr}")"
+    [[ -z "${pci_driver}" ]] && pci_driver="none"
+    [[ -z "${pci_ifaces}" ]] && pci_ifaces="not-visible"
+
+    candidate_state="host-pci"
+    if [[ -n "${span_attached_pci_set[${pci_addr}]:-}" && -n "${span_stored_pci_set[${pci_addr}]:-}" ]]; then
+      candidate_state="attached-to-mds, stored"
+    elif [[ -n "${span_attached_pci_set[${pci_addr}]:-}" ]]; then
+      candidate_state="attached-to-mds"
+    elif [[ -n "${span_stored_pci_set[${pci_addr}]:-}" ]]; then
+      candidate_state="stored, not-visible"
+    elif [[ "${pci_driver}" == "vfio-pci" ]]; then
+      candidate_state="host-pci, vfio-bound"
+    fi
+
+    flag="OFF"
+    if [[ -n "${span_attached_pci_set[${pci_addr}]:-}" || -n "${span_stored_pci_set[${pci_addr}]:-}" ]]; then
+      flag="ON"
+    fi
+
+    span_nic_list+=("${candidate_tag}" "state=$(step01_compact_candidate_state "${candidate_state}"), pci=${pci_addr}, if=${pci_ifaces}, driver=${pci_driver}, ${pci_desc}" "${flag}")
+    span_candidate_pci["${candidate_tag}"]="${pci_addr}"
+    span_candidate_seen_tag["${candidate_tag}"]=1
+    span_candidate_seen_pci["${pci_addr}"]=1
+    log "[STEP 01] Added SPAN candidate: tag=${candidate_tag}, pci=${pci_addr}, state=${candidate_state}"
+  done <<< "${merged_pci_candidates}"
+
+  if [[ ${#span_nic_list[@]} -eq 0 ]]; then
+    whiptail_msgbox "STEP 01 - SPAN NIC Detection Failed" "No SPAN-capable Ethernet PCI candidates were found.\n\nCheck lspci, VM XML, and the saved installer configuration." 13 80
+    log "[STEP 01] No SPAN NIC candidates after merging host NICs, saved configuration, and mds XML."
+    return 1
+  fi
+
   local selected_span_nics
-  # Calculate menu size dynamically
-  menu_dims=$(calc_menu_size $((${#span_nic_list[@]} / 3)) 80 10)
+  local span_menu_items=()
+  local span_description_width
+  menu_dims=$(step01_calc_wide_menu_size $((${#span_nic_list[@]} / 3)) 120 10 170)
   read -r menu_height menu_width menu_list_height <<< "${menu_dims}"
-  
-  # Center-align menu message
-  menu_msg=$(center_menu_message "Select NICs for sensor SPAN traffic collection.\n(At least 1 selection required)\n\nCurrent selection: ${SPAN_NICS:-<None>}" "${menu_height}")
-  
+  # Reserve room for checkbox, tag, spacing, and borders. Long model strings
+  # end with an ellipsis instead of being drawn outside the dialog border.
+  span_description_width=$((menu_width - 34))
+  (( span_description_width < 12 )) && span_description_width=12
+  step01_copy_menu_with_clipped_descriptions span_nic_list span_menu_items 3 "${span_description_width}"
+  menu_msg=$(center_menu_message "Select NICs for sensor SPAN traffic collection.\nCandidates include host-visible NICs, saved selections, mds passthrough devices, and host Ethernet PCI devices.\n(At least 1 selection required)\n\nCurrent selection: ${SPAN_NICS:-<None>}" "${menu_height}")
+
   selected_span_nics=$(whiptail --title "STEP 01 - SPAN NIC Selection" \
                                 --checklist "${menu_msg}" \
                                 "${menu_height}" "${menu_width}" "${menu_list_height}" \
-                                "${span_nic_list[@]}" \
+                                "${span_menu_items[@]}" \
                                 3>&1 1>&2 2>&3) || {
     log "User canceled SPAN NIC selection."
     return 1
   }
 
-  # whiptail output is "nic1" "nic2" form → Remove double quotes(Important)
   selected_span_nics=$(echo "${selected_span_nics}" | tr -d '"')
+  if [[ -z "${selected_span_nics}" ]]; then
+    whiptail_msgbox "SPAN NIC Selection Required" "No SPAN NIC was selected.\n\nSelect at least one SPAN NIC or passthrough PCI device." 11 75
+    log "SPAN NIC selection is required but none was selected."
+    return 1
+  fi
 
   log "Selected SPAN NICs(All): ${selected_span_nics}"
   SPAN_NICS="${selected_span_nics}"
   save_config_var "SPAN_NICS" "${SPAN_NICS}"
 
-  # All SPAN NICs are assigned to mds (single sensor)
   SPAN_NICS_MDS="${SPAN_NICS}"
   save_config_var "SPAN_NICS_MDS" "${SPAN_NICS_MDS}"
-
   log "SPAN NIC(mds): ${SPAN_NICS_MDS}"
 
   ########################
   # 6) SPAN NIC PF PCI Address Collection (PCI passthrough specific)
   ########################
   log "[STEP 01] SR-IOV based VF creation is not used (PF PCI direct assignment mode)."
-  log "[STEP 01] Physical PCI address of SPAN NIC(PF)Collecting."
+  log "[STEP 01] Collecting selected SPAN PF PCI addresses from the merged candidate map."
 
   local span_pci_list_mds=""
+  declare -A selected_pci_seen=()
 
   if [[ "${SPAN_ATTACH_MODE}" == "pci" ]]; then
-    # PCI passthrough mode: Directly use Physical Function (PF) PCI address
     for nic in ${SPAN_NICS_MDS}; do
-      pci_addr=$(readlink -f "/sys/class/net/${nic}/device" 2>/dev/null | awk -F'/' '{print $NF}')
-      if [[ -z "${pci_addr}" ]]; then
-        log "WARNING: ${nic} PCI address could not be found."
+      pci_addr="${span_candidate_pci[${nic}]:-}"
+      [[ -z "${pci_addr}" ]] && pci_addr="$(get_if_pci "${nic}")"
+      [[ -n "${pci_addr}" ]] && pci_addr="$(normalize_pci "${pci_addr}")"
+      pci_addr="${pci_addr,,}"
+
+      if [[ ! "${pci_addr}" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
+        log "WARNING: ${nic} PCI address could not be resolved from the merged SPAN candidate map."
         continue
       fi
+      if [[ -n "${selected_pci_seen[${pci_addr}]:-}" ]]; then
+        continue
+      fi
+
+      selected_pci_seen["${pci_addr}"]=1
       span_pci_list_mds="${span_pci_list_mds} ${pci_addr}"
       log "[STEP 01] ${nic} (mds SPAN NIC) -> Physical PCI: ${pci_addr}"
     done
+  fi
 
+  if [[ -z "${span_pci_list_mds# }" ]]; then
+    whiptail_msgbox "STEP 01 - SPAN PCI Resolution Failed" "The selected SPAN entries could not be resolved to any physical PCI BDF.\n\nNo configuration was saved. Check the host PCI devices and mds VM XML." 14 85
+    log "[STEP 01] ERROR: Selected SPAN entries resolved to an empty PCI list."
+    return 1
   fi
 
   SPAN_ATTACH_MODE="pci"
 
-  # Store PCI list for mds
   SENSOR_SPAN_VF_PCIS_MDS="${span_pci_list_mds# }"
   save_config_var "SENSOR_SPAN_VF_PCIS_MDS" "${SENSOR_SPAN_VF_PCIS_MDS}"
   log "mds SPAN NIC PCI List: ${SENSOR_SPAN_VF_PCIS_MDS}"
 
-  # Legacy combined(For compatibility) + SPAN_NIC_LIST Update
   SENSOR_SPAN_VF_PCIS="${SENSOR_SPAN_VF_PCIS_MDS}"
   save_config_var "SENSOR_SPAN_VF_PCIS" "${SENSOR_SPAN_VF_PCIS}"
 
@@ -2882,8 +3477,15 @@ step_02_hwe_kernel() {
   # 0) Ubuntu according to version HWE package determination
   #######################################
   local ubuntu_version pkg_name
-  ubuntu_version=$(lsb_release -rs 2>/dev/null || echo "unknown")
-  
+  ubuntu_version=""
+  if [[ -r /etc/os-release ]]; then
+    ubuntu_version=$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true)
+  fi
+  if [[ -z "${ubuntu_version}" ]] && command -v lsb_release >/dev/null 2>&1; then
+    ubuntu_version=$(lsb_release -rs 2>/dev/null || true)
+  fi
+  [[ -z "${ubuntu_version}" ]] && ubuntu_version="unknown"
+
   case "${ubuntu_version}" in
     "20.04")
       pkg_name="linux-generic-hwe-20.04"
@@ -2899,7 +3501,7 @@ step_02_hwe_kernel() {
       pkg_name="linux-generic"
       ;;
   esac
-  
+
   log "[STEP 02] Ubuntu ${ubuntu_version} Detected, HWE package: ${pkg_name}"
   local tmp_status="/tmp/xdr_step02_status.txt"
 
@@ -2907,16 +3509,32 @@ step_02_hwe_kernel() {
   # 1) Current kernel / Check package status
   #######################################
   local cur_kernel hwe_installed hwe_status_detail
+  local hwe_image_pkg active_kernel_pkg active_kernel_source
   cur_kernel=$(uname -r 2>/dev/null || echo "unknown")
-  
-  # Check HWE package installation status
-  # Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
+  hwe_image_pkg=""
+  if [[ "${pkg_name}" == linux-generic-hwe-* ]]; then
+    hwe_image_pkg="linux-image-${pkg_name#linux-}"
+  fi
+
+  # Check the expected HWE meta package for the detected Ubuntu release.
+  # Also recognize a currently booted HWE kernel if its meta package was later removed.
   hwe_installed="no"
   hwe_status_detail="not installed"
-  
-  if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+  active_kernel_pkg=$(dpkg-query -S "/boot/vmlinuz-${cur_kernel}" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+  [[ -z "${active_kernel_pkg}" ]] && active_kernel_pkg="linux-image-${cur_kernel}"
+  active_kernel_source=$(dpkg-query -W -f='${Source}\n' "${active_kernel_pkg}" 2>/dev/null || true)
+
+  if [[ "${active_kernel_source}" == *hwe* ]]; then
     hwe_installed="yes"
-    hwe_status_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+    hwe_status_detail="HWE kernel installed and active (${cur_kernel}, source: ${active_kernel_source})"
+  elif [[ "${pkg_name}" == linux-generic-hwe-* ]] && \
+       dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
+    hwe_installed="yes"
+    hwe_status_detail="HWE kernel installed (${pkg_name})"
+  elif [[ -n "${hwe_image_pkg}" ]] && \
+       dpkg-query -W -f='${Status}\n' "${hwe_image_pkg}" 2>/dev/null | grep -qx 'install ok installed'; then
+    hwe_installed="yes"
+    hwe_status_detail="HWE kernel installed (${hwe_image_pkg})"
   fi
 
   {
@@ -3039,13 +3657,23 @@ step_02_hwe_kernel() {
   else
     # In actual execution mode, check current kernel version and HWE package installation status again
     new_kernel=$(uname -r 2>/dev/null || echo "unknown")
-      hwe_now="no"
+    hwe_now="no"
     hwe_now_detail="not installed"
-    
-    # Re-check HWE status: Check if linux-image-generic-hwe-24.04 is installed via dpkg -l | grep hwe
-    if dpkg -l 2>/dev/null | grep hwe | grep -q "linux-image-generic-hwe-24.04"; then
+    active_kernel_pkg=$(dpkg-query -S "/boot/vmlinuz-${new_kernel}" 2>/dev/null | head -n 1 | cut -d: -f1 || true)
+    [[ -z "${active_kernel_pkg}" ]] && active_kernel_pkg="linux-image-${new_kernel}"
+    active_kernel_source=$(dpkg-query -W -f='${Source}\n' "${active_kernel_pkg}" 2>/dev/null || true)
+
+    if [[ "${active_kernel_source}" == *hwe* ]]; then
       hwe_now="yes"
-      hwe_now_detail="HWE kernel installed (linux-image-generic-hwe-24.04)"
+      hwe_now_detail="HWE kernel installed and active (${new_kernel}, source: ${active_kernel_source})"
+    elif [[ "${pkg_name}" == linux-generic-hwe-* ]] && \
+         dpkg-query -W -f='${Status}\n' "${pkg_name}" 2>/dev/null | grep -qx 'install ok installed'; then
+      hwe_now="yes"
+      hwe_now_detail="HWE kernel installed (${pkg_name})"
+    elif [[ -n "${hwe_image_pkg}" ]] && \
+         dpkg-query -W -f='${Status}\n' "${hwe_image_pkg}" 2>/dev/null | grep -qx 'install ok installed'; then
+      hwe_now="yes"
+      hwe_now_detail="HWE kernel installed (${hwe_image_pkg})"
     fi
   fi
 
@@ -4490,46 +5118,214 @@ step_06_ntpsec_only() {
   fi
 
   #######################################
-  # 5) Add Google NTP + us.pool servers, tinker panic 0, restrict default
+  # 5) Normalize the CLI-managed NTPsec block and add defaults when absent
   #######################################
-  log "[STEP 06] Add Google NTP servers plus tinker panic 0, restrict default"
+  log "[STEP 06] Normalize XDR NTPsec managed block"
 
-  local TAG_BEGIN="# XDR_NTPSEC_CONFIG_BEGIN"
-  local TAG_END="# XDR_NTPSEC_CONFIG_END"
+  local TAG_BEGIN="# === XDR_NTPSEC_CONFIG_BEGIN ==="
+  local TAG_END="# === XDR_NTPSEC_CONFIG_END ==="
+  local LEGACY_TAG_BEGIN="# XDR_NTPSEC_CONFIG_BEGIN"
+  local LEGACY_TAG_END="# XDR_NTPSEC_CONFIG_END"
 
   if [[ -f "${NTP_CONF}" ]]; then
-    if grep -q "${TAG_BEGIN}" "${NTP_CONF}" 2>/dev/null; then
-      log "[STEP 06] XDR_NTPSEC_CONFIG block already present in ${NTP_CONF} → skip add"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would normalize all supported XDR NTPsec marker blocks in ${NTP_CONF} to one canonical pair (${TAG_BEGIN} / ${TAG_END}); append the default block only when no managed block exists."
     else
-      local ntp_block
-      ntp_block=$(cat <<EOF
+      if ! sudo python3 - "${NTP_CONF}" <<'PY_NTPSEC_NORMALIZE'
+from pathlib import Path
+import os
+import stat
+import sys
+import tempfile
 
-${TAG_BEGIN}
-# Alternate NTP servers (per docs)
-server time1.google.com prefer
-server time2.google.com
-server time3.google.com
-server time4.google.com
-server 0.us.pool.ntp.org
-server 1.us.pool.ntp.org
+path = Path(sys.argv[1])
+canonical_begin = "# === XDR_NTPSEC_CONFIG_BEGIN ==="
+canonical_end = "# === XDR_NTPSEC_CONFIG_END ==="
+legacy_begin = "# XDR_NTPSEC_CONFIG_BEGIN"
+legacy_end = "# XDR_NTPSEC_CONFIG_END"
+marker_pairs = {
+    canonical_begin: canonical_end,
+    legacy_begin: legacy_end,
+}
+begin_tags = set(marker_pairs)
+end_tags = set(marker_pairs.values())
 
-# Allow large time offsets to be corrected
-tinker panic 0
+def normalized(line):
+    return line.replace("\r", "").strip()
 
-# Update restrict rule
-restrict default nomodify nopeer noquery notrap
-${TAG_END}
-EOF
+original = path.read_text(encoding="utf-8")
+lines = original.splitlines(keepends=True)
+newline = "\r\n" if "\r\n" in original else "\n"
+
+outside = []
+blocks = []
+first_insert_at = None
+current_begin = None
+current_lines = []
+
+for line_number, line in enumerate(lines, 1):
+    token = normalized(line)
+
+    if token in begin_tags:
+        if current_begin is not None:
+            raise SystemExit(
+                "Nested NTPsec managed block marker at line {}: {}".format(
+                    line_number, token
+                )
+            )
+        current_begin = token
+        current_lines = []
+        if first_insert_at is None:
+            first_insert_at = len(outside)
+        continue
+
+    if token in end_tags:
+        if current_begin is None:
+            raise SystemExit(
+                "Orphan NTPsec managed block end marker at line {}: {}".format(
+                    line_number, token
+                )
+            )
+        expected_end = marker_pairs[current_begin]
+        if token != expected_end:
+            raise SystemExit(
+                "Mismatched NTPsec managed block markers at line {}: "
+                "begin={!r}, end={!r}, expected={!r}".format(
+                    line_number, current_begin, token, expected_end
+                )
+            )
+        blocks.append(current_lines)
+        current_begin = None
+        current_lines = []
+        continue
+
+    if current_begin is None:
+        outside.append(line)
+    else:
+        current_lines.append(line)
+
+if current_begin is not None:
+    raise SystemExit(
+        "Unterminated NTPsec managed block: begin marker {!r}".format(
+            current_begin
+        )
+    )
+
+if not blocks:
+    managed_lines = [
+        canonical_begin + newline,
+        "# Alternate NTP servers (per docs)" + newline,
+        "server time1.google.com prefer" + newline,
+        "server time2.google.com" + newline,
+        "server time3.google.com" + newline,
+        "server time4.google.com" + newline,
+        "server 0.us.pool.ntp.org" + newline,
+        "server 1.us.pool.ntp.org" + newline,
+        newline,
+        "# Allow large time offsets to be corrected" + newline,
+        "tinker panic 0" + newline,
+        newline,
+        "# Update restrict rule" + newline,
+        "restrict default nomodify nopeer noquery notrap" + newline,
+        canonical_end + newline,
+    ]
+
+    updated = original
+    if updated and not updated.endswith(("\n", "\r")):
+        updated += newline
+    if updated and not updated.endswith(newline + newline):
+        updated += newline
+    updated += "".join(managed_lines)
+    action = "added canonical managed block"
+else:
+    merged = list(blocks[0])
+    seen = {
+        normalized(line)
+        for line in merged
+        if normalized(line)
+    }
+    additions = []
+
+    for block in blocks[1:]:
+        for line in block:
+            token = normalized(line)
+            if not token or token in seen:
+                continue
+            additions.append(token + newline)
+            seen.add(token)
+
+    if additions:
+        if merged and normalized(merged[-1]):
+            merged.append(newline)
+        merged.extend(additions)
+
+    managed_lines = [canonical_begin + newline]
+    for line in merged:
+        if line.endswith(("\n", "\r")):
+            managed_lines.append(line)
+        else:
+            managed_lines.append(line + newline)
+    managed_lines.append(canonical_end + newline)
+
+    assert first_insert_at is not None
+    rebuilt = outside[:first_insert_at] + managed_lines + outside[first_insert_at:]
+    updated = "".join(rebuilt)
+    action = "normalized {} managed block(s) to one canonical block".format(
+        len(blocks)
+    )
+
+if updated == original:
+    print("XDR NTPsec managed block already canonical; no file change required.")
+    raise SystemExit(0)
+
+st = path.stat()
+fd, temp_name = tempfile.mkstemp(
+    prefix=".{}.".format(path.name),
+    dir=str(path.parent),
+    text=True,
 )
-      if [[ "${DRY_RUN}" -eq 1 ]]; then
-        log "[DRY-RUN] Would append block to ${NTP_CONF}:\n${ntp_block}"
-      else
-        printf "%s\n" "${ntp_block}" | sudo tee -a "${NTP_CONF}" >/dev/null
-        log "Added XDR_NTPSEC_CONFIG block to ${NTP_CONF}"
+try:
+    os.fchmod(fd, stat.S_IMODE(st.st_mode))
+    try:
+        os.fchown(fd, st.st_uid, st.st_gid)
+    except PermissionError:
+        current = os.fstat(fd)
+        if (current.st_uid, current.st_gid) != (st.st_uid, st.st_gid):
+            raise
+
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+        fd = None
+        stream.write(updated)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    os.replace(temp_name, path)
+    temp_name = None
+
+    directory_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    if fd is not None:
+        os.close(fd)
+    if temp_name is not None:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+print(action + ".")
+PY_NTPSEC_NORMALIZE
+      then
+        log "[ERROR] Failed to normalize XDR NTPsec managed block markers in ${NTP_CONF}. The existing backup was preserved at ${NTP_CONF_BACKUP}."
+        return 1
       fi
+      log "[STEP 06] XDR NTPsec managed block normalized successfully in ${NTP_CONF}"
     fi
   else
-    log "[STEP 06] ${NTP_CONF} missing; cannot append NTP server settings."
+    log "[STEP 06] ${NTP_CONF} missing; cannot configure NTP server settings."
   fi
 
   #######################################
@@ -5616,12 +6412,18 @@ step_08_dp_download() {
   local qcow2="aella-dataprocessor-${ver}.qcow2"
   local sha1="${qcow2}.sha1"
 
-  local url_script="${acps_url}/release/${ver}/dataprocessor/${dp_script}"
+  # The AIO image follows AIO_VERSION, but the compatible deployment script is
+  # published under the stable 6.2.0 release path for current 6.3+ deployments.
+  # This can be overridden from the environment/config if ACPS changes the path.
+  local script_ver="${AIO_DEPLOY_SCRIPT_VERSION:-6.2.0}"
+
+  local url_script="${acps_url}/release/${script_ver}/dataprocessor/${dp_script}"
   local url_qcow2="${acps_url}/release/${ver}/dataprocessor/${qcow2}"
   local url_sha1="${acps_url}/release/${ver}/dataprocessor/${sha1}"
 
   log "[STEP 08] Configuration summary:"
   log "  - AIO_VERSION  = ${ver}"
+  log "  - DEPLOY_SCRIPT_VERSION = ${script_ver}"
   log "  - ACPS_USERNAME= ${acps_user}"
   log "  - ACPS_BASE_URL= ${acps_url}"
   log "  - download path= ${aio_img_dir}"
@@ -5734,13 +6536,20 @@ step_08_dp_download() {
     need_script=1
   fi
 
-  # qcow2: only need download if local qcow2 was not used
+  # qcow2: reuse an already downloaded current-version image only after validation.
   if [[ "${use_local_qcow}" -eq 1 ]]; then
     log "[STEP 08] Using local qcow2 file → skip qcow2 download"
     need_qcow2=0
+  elif [[ -f "${aio_img_dir}/${qcow2}" ]] && validate_qcow2_image "${aio_img_dir}/${qcow2}"; then
+    log "[STEP 08] Existing ${aio_img_dir}/${qcow2} passed image validation → skip download"
+    need_qcow2=0
   else
-    # Don't check /stellar/aio/images - only check current directory (already done above)
-    log "[STEP 08] ${qcow2} missing → will download"
+    if [[ -e "${aio_img_dir}/${qcow2}" ]]; then
+      log "[WARN] Existing ${aio_img_dir}/${qcow2} is invalid → removing and downloading again"
+      [[ "${DRY_RUN}" -eq 1 ]] || rm -f "${aio_img_dir}/${qcow2}" 2>/dev/null || true
+    else
+      log "[STEP 08] ${qcow2} missing → will download"
+    fi
     need_qcow2=1
   fi
 
@@ -5770,14 +6579,29 @@ step_08_dp_download() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${dp_script}' '${url_script}'"
     else
-      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${dp_script}" "${url_script}"; then
-        log "[STEP 08] ${dp_script} download completed"
-        run_cmd "sudo chmod +x ${aio_img_dir}/${dp_script}"
-      else
-        log "[ERROR] ${dp_script} download failed"
-        whiptail_msgbox "STEP 08 - Download Error" "Failed to download ${dp_script}.\n\nCheck network connection and ACPS credentials." 12 70
+      if ! download_acps_file_atomic \
+          "${url_script}" \
+          "${aio_img_dir}/${dp_script}" \
+          "${acps_user}" \
+          "${acps_pass}" \
+          "${dp_script}"; then
+        whiptail_msgbox "STEP 08 - Download Error" \
+          "Failed to download ${dp_script}.\n\nURL: ${url_script}\n\nThe server may not contain the requested release path, or authentication/network access may have failed." \
+          16 88
         return 1
       fi
+
+      if ! validate_downloaded_shell_script "${aio_img_dir}/${dp_script}"; then
+        log "[ERROR] Downloaded ${dp_script} is not a valid shell script. It may be an HTML error page."
+        rm -f "${aio_img_dir}/${dp_script}" 2>/dev/null || true
+        whiptail_msgbox "STEP 08 - Invalid Deployment Script" \
+          "The downloaded ${dp_script} is not a valid Bash script.\n\nAn HTML error/login page may have been returned instead.\n\nURL: ${url_script}\n\nSTEP 08 has stopped without keeping the invalid file." \
+          18 90
+        return 1
+      fi
+
+      chmod 0755 "${aio_img_dir}/${dp_script}"
+      log "[STEP 08] ${dp_script} download and syntax validation completed"
     fi
   fi
 
@@ -5786,13 +6610,28 @@ step_08_dp_download() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${qcow2}' '${url_qcow2}'"
     else
-      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${qcow2}" "${url_qcow2}"; then
-        log "[STEP 08] ${qcow2} download completed"
-      else
-        log "[ERROR] ${qcow2} download failed"
-        whiptail_msgbox "STEP 08 - Download Error" "Failed to download ${qcow2}.\n\nCheck network connection and ACPS credentials." 12 70
+      if ! download_acps_file_atomic \
+          "${url_qcow2}" \
+          "${aio_img_dir}/${qcow2}" \
+          "${acps_user}" \
+          "${acps_pass}" \
+          "${qcow2}"; then
+        whiptail_msgbox "STEP 08 - Download Error" \
+          "Failed to download ${qcow2}.\n\nURL: ${url_qcow2}\n\nCheck the AIO version, ACPS credentials, and network connectivity." \
+          16 88
         return 1
       fi
+
+      if ! validate_qcow2_image "${aio_img_dir}/${qcow2}"; then
+        log "[ERROR] Downloaded ${qcow2} is not a valid qcow2 image."
+        rm -f "${aio_img_dir}/${qcow2}" 2>/dev/null || true
+        whiptail_msgbox "STEP 08 - Invalid AIO Image" \
+          "The downloaded ${qcow2} is empty, too small, or not a valid qcow2 image.\n\nURL: ${url_qcow2}\n\nThe invalid file has been removed." \
+          16 88
+        return 1
+      fi
+
+      log "[STEP 08] ${qcow2} download and image validation completed"
     fi
   fi
 
@@ -5801,9 +6640,15 @@ step_08_dp_download() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
       log "[DRY-RUN] curl -u '${acps_user}:***' -o '${aio_img_dir}/${sha1}' '${url_sha1}'"
     else
-      if curl -u "${acps_user}:${acps_pass}" -o "${aio_img_dir}/${sha1}" "${url_sha1}"; then
+      if download_acps_file_atomic \
+          "${url_sha1}" \
+          "${aio_img_dir}/${sha1}" \
+          "${acps_user}" \
+          "${acps_pass}" \
+          "${sha1}"; then
         log "[STEP 08] ${sha1} download completed"
       else
+        rm -f "${aio_img_dir}/${sha1}" 2>/dev/null || true
         log "[WARN] ${sha1} download failed (non-critical)"
       fi
     fi
@@ -5887,6 +6732,28 @@ step_08_dp_download() {
       log "[STEP 08] ${aio_img_dir}/${sha1} found but ${aio_img_dir}/${qcow2} missing; skipping SHA1 verification."
     elif [[ -f "${aio_img_dir}/${qcow2}" ]]; then
       log "[STEP 08] ${aio_img_dir}/${qcow2} found but ${aio_img_dir}/${sha1} missing; skipping SHA1 verification."
+    fi
+  fi
+
+  #######################################
+  # 5.5) Mandatory artifact validation
+  #######################################
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    if ! validate_downloaded_shell_script "${aio_img_dir}/${dp_script}"; then
+      log "[ERROR] Mandatory validation failed for ${aio_img_dir}/${dp_script}"
+      rm -f "${aio_img_dir}/${dp_script}" 2>/dev/null || true
+      whiptail_msgbox "STEP 08 - Validation Failed" \
+        "A valid AIO deployment script is not available.\n\nExpected: ${aio_img_dir}/${dp_script}\n\nRe-run STEP 08 after checking the ACPS path and credentials." \
+        16 88
+      return 1
+    fi
+
+    if ! validate_qcow2_image "${aio_img_dir}/${qcow2}"; then
+      log "[ERROR] Mandatory validation failed for ${aio_img_dir}/${qcow2}"
+      whiptail_msgbox "STEP 08 - Validation Failed" \
+        "A valid AIO qcow2 image is not available.\n\nExpected: ${aio_img_dir}/${qcow2}\n\nRe-run STEP 08 after checking the selected AIO version." \
+        16 88
+      return 1
     fi
   fi
 
@@ -6043,6 +6910,18 @@ step_09_aio_deploy() {
             whiptail_msgbox "STEP 09 - AIO deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 08 (download script/image) first.\nSkipping this step." 14 80
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 09] virt_deploy_uvp_centos.sh not found. Skipping."
             return 0
+        fi
+    fi
+
+    # Reject HTML/error pages or syntactically invalid deployment scripts before execution.
+    if [[ "${_DRY_RUN}" -eq 0 ]]; then
+        if ! validate_downloaded_shell_script "${DP_SCRIPT_PATH}"; then
+            log "[ERROR] Invalid AIO deployment script detected: ${DP_SCRIPT_PATH}"
+            rm -f "${DP_SCRIPT_PATH}" 2>/dev/null || true
+            whiptail_msgbox "STEP 09 - Invalid Deployment Script" \
+              "${DP_SCRIPT_PATH} is not a valid Bash deployment script.\n\nIt may contain an HTML 404/login response.\n\nThe invalid file was removed. Re-run STEP 08 before deploying AIO." \
+              18 90
+            return 1
         fi
     fi
 
@@ -6426,14 +7305,28 @@ step_10_sensor_lv_download() {
     LV_LOCATION="${UBUNTU_VG}"
   fi
 
+  local LV_MDS="lv_sensor_root_mds"
+  local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
+  local lv_device="/dev/${lv_path_mds}"
+  local mount_mds="/var/lib/libvirt/images/mds"
+
   #######################################
   # Prompt for Sensor LV size configuration
   #######################################
-  # Check ubuntu-vg free space (accurate available space)
-  local ubuntu_vg_free_size
+  # Check current VG free space. When an existing Sensor LV is recreated,
+  # its extents are returned to the VG before the new LV is created.
+  local ubuntu_vg_free_size available_gb existing_lv_size_gb effective_available_gb
   ubuntu_vg_free_size=$(vgs "${UBUNTU_VG}" --noheadings --units g --nosuffix -o vg_free 2>/dev/null | tr -d ' ' || echo "0")
-  local available_gb=${ubuntu_vg_free_size%.*}
+  available_gb=${ubuntu_vg_free_size%.*}
+  [[ "${available_gb}" =~ ^[0-9]+$ ]] || available_gb=0
   [[ ${available_gb} -lt 0 ]] && available_gb=0
+
+  existing_lv_size_gb=0
+  if lvs "${lv_path_mds}" >/dev/null 2>&1; then
+    existing_lv_size_gb=$(lvs --noheadings --units g --nosuffix -o lv_size "${lv_path_mds}" 2>/dev/null       | awk 'NF {printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
+    [[ "${existing_lv_size_gb}" =~ ^[0-9]+$ ]] || existing_lv_size_gb=0
+  fi
+  effective_available_gb=$((available_gb + existing_lv_size_gb))
   
   # Default LV size
   local default_sensor_disk_gb=200
@@ -6442,7 +7335,7 @@ step_10_sensor_lv_download() {
   local lv_size_gb
   while true; do
     lv_size_gb=$(whiptail_inputbox "STEP 10 - Sensor (MDS) Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Available space: ${available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Current VG free space: ${available_gb}GB\n- Existing Sensor LV size: ${existing_lv_size_gb}GB\n- Available after deleting existing Sensor LV: ${effective_available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
                          "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
                          18 80) || {
       log "User canceled sensor storage size configuration."
@@ -6485,10 +7378,6 @@ step_10_sensor_lv_download() {
   local lv_exists_mds="no"
   local mounted_mds="no"
 
-  local LV_MDS="lv_sensor_root_mds"
-
-  local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
-
   if lvs "${lv_path_mds}" >/dev/null 2>&1; then lv_exists_mds="yes"; fi
 
   if mountpoint -q /var/lib/libvirt/images/mds 2>/dev/null; then mounted_mds="yes"; fi
@@ -6498,14 +7387,18 @@ step_10_sensor_lv_download() {
     echo "-------------------"
     echo "LV path(mds) : ${lv_path_mds}"
     echo "LV exists (mds) : ${lv_exists_mds}"
-    echo "Mounted (mds)  : ${mounted_mds} (/var/lib/libvirt/images/mds)"
+    echo "Existing LV size: ${existing_lv_size_gb}GB"
+    echo "Mounted (mds)  : ${mounted_mds} (${mount_mds})"
+    if [[ "${mounted_mds}" == "yes" ]]; then
+      echo "Mount source   : $(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || echo unknown)"
+    fi
     echo
     echo "User configuration:"
     echo "  - LV location: ${LV_LOCATION}"
     echo "  - Disk size: ${SENSOR_LV_SIZE_GB_PER_VM}GB"
     echo
     echo "This STEP performs the following tasks:"
-    echo "  1) LV create (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
+    echo "  1) Create/recreate the LV, or keep the existing LV when recreation is canceled"
     echo "     - ${lv_path_mds}"
     echo "  2) Create ext4 filesystem and mount"
     echo "     - /var/lib/libvirt/images/mds"
@@ -6517,84 +7410,312 @@ step_10_sensor_lv_download() {
     echo "  5) Configure stellar:stellar ownership"
   } > "${tmp_status}"
 
-  show_textbox "STEP 07 - Sensor LV and download Overview" "${tmp_status}"
-
-  # Continue with image download even if LV is already configured
-  local skip_lv_creation="no"
-  if [[ "${lv_exists_mds}" == "yes" && "${mounted_mds}" == "yes" ]]; then
-    if whiptail_yesno "STEP 07 - LV Already configured" "LV and mount are already configured.\n\n- ${lv_path_mds}\n\nSkip LV create/mount and proceed with qcow2 image download only?" 14 90
-    then
-      skip_lv_creation="yes"
-      log "LV is already configured, so skip LV create/mount and proceed with image download only"
-    else
-      log "User chose to force re-execute STEP 07."
-    fi
-  fi
-
-  if ! whiptail_yesno "STEP 07 Execution Confirmation" "Do you want to proceed with Sensor LV creation and image download?" 10 60
-  then
-    log "User canceled STEP 07 execution."
-    return 0
-  fi
+  show_textbox "STEP 10 - Sensor LV and Download Overview" "${tmp_status}"
 
   #######################################
-  # 1) LV create (mds single) - OpenXDR method (ubuntu-vg)
+  # Existing LV policy:
+  # - Delete and Recreate: remove the existing LV and create a fresh one.
+  # - Cancel Recreate: keep the existing LV unchanged and continue with
+  #   Sensor image/script download.
   #######################################
-  if [[ "${skip_lv_creation}" == "no" ]]; then
-    log "[STEP 10] Start creating/mounting LV for mds (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
+  local lv_action="CREATE"
+  local mounted_dev=""
+  local expected_majmin=""
+  local mounted_majmin=""
 
-    # mds LV
+  get_block_majmin() {
+    local device_path="$1"
+    local resolved=""
+    resolved=$(readlink -f "${device_path}" 2>/dev/null || true)
+    [[ -n "${resolved}" && -b "${resolved}" ]] || return 1
+    lsblk -dn -o MAJ:MIN "${resolved}" 2>/dev/null | awk 'NF {print $1; exit}'
+  }
+
+  # Never touch a mountpoint backed by a different device.
+  if mountpoint -q "${mount_mds}" 2>/dev/null; then
+    mounted_dev=$(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || true)
     if lvs "${lv_path_mds}" >/dev/null 2>&1; then
-      log "[STEP 10] LV ${lv_path_mds} already exists → skip creation"
-    else
-      local required_lv_mib
-      required_lv_mib=$((SENSOR_LV_SIZE_GB_PER_VM * 1024))
-      if ! ensure_ubuntu_vg_free_space "STEP 10" "${UBUNTU_VG}" "${root_dev}" "${required_lv_mib}" 1024; then
+      expected_majmin=$(get_block_majmin "${lv_device}" 2>/dev/null || true)
+      mounted_majmin=$(get_block_majmin "${mounted_dev}" 2>/dev/null || true)
+      if [[ -z "${expected_majmin}" || -z "${mounted_majmin}" || "${expected_majmin}" != "${mounted_majmin}" ]]; then
+        log "[ERROR] ${mount_mds} is mounted by a different device: ${mounted_dev} (expected ${lv_device})"
+        whiptail_msgbox "STEP 10 - Mount Conflict" \
+          "${mount_mds} is mounted by a different block device.\n\nMounted source: ${mounted_dev}\nExpected Sensor LV: ${lv_device}\n\nThe installer will not unmount or delete an unrelated device." \
+          16 90
         return 1
       fi
-      run_cmd "sudo lvcreate -L ${SENSOR_LV_SIZE_GB_PER_VM}G -n ${LV_MDS} ${UBUNTU_VG}"
-      run_cmd "sudo mkfs.ext4 -F /dev/${lv_path_mds}"
+      log "[STEP 10] Mount source aliases resolve to the same device (${expected_majmin}): ${mounted_dev} == ${lv_device}"
+    else
+      log "[ERROR] ${mount_mds} is mounted by ${mounted_dev}, but ${lv_path_mds} does not exist."
+      whiptail_msgbox "STEP 10 - Mount Conflict" \
+        "${mount_mds} is already mounted by ${mounted_dev}, but the expected Sensor LV does not exist.\n\nThe installer will not modify this mount." \
+        14 90
+      return 1
+    fi
+  fi
+
+  if lvs "${lv_path_mds}" >/dev/null 2>&1; then
+    local existing_fs="unknown"
+    existing_fs=$(blkid -s TYPE -o value "${lv_device}" 2>/dev/null || echo "unknown")
+    local warning_message
+    warning_message="An existing Sensor logical volume was found.\n\n"
+    warning_message+="LV: ${lv_device}\n"
+    warning_message+="Current size: ${existing_lv_size_gb}GB\n"
+    warning_message+="Requested new size: ${SENSOR_LV_SIZE_GB_PER_VM}GB\n"
+    warning_message+="Filesystem: ${existing_fs}\n"
+    warning_message+="Mount point: ${mount_mds}\n"
+    warning_message+="Mount source: ${mounted_dev:-not mounted}\n\n"
+    warning_message+="Delete and Recreate will permanently remove:\n"
+    warning_message+="  - The complete existing Sensor LV and filesystem\n"
+    warning_message+="  - All Sensor images, logs, and files stored on this LV\n"
+    warning_message+="  - The existing mds VM definition, if present\n\n"
+    warning_message+="The LV will then be recreated as ${SENSOR_LV_SIZE_GB_PER_VM}GB and formatted as ext4.\n\n"
+    warning_message+="Select 'Cancel Recreate' to keep the existing LV unchanged and continue with Sensor image/script download.\n\n"
+    warning_message+="Delete and Recreate cannot be undone."
+
+    local confirm_rc=0
+    set +e
+    whiptail --title "STEP 10 - Existing Sensor LV" \
+      --defaultno \
+      --yes-button "Delete and Recreate" \
+      --no-button "Cancel Recreate" \
+      --yesno "$(center_message "${warning_message}")" 29 96
+    confirm_rc=$?
+    set -e
+
+    if [[ "${confirm_rc}" -ne 0 ]]; then
+      lv_action="KEEP_EXISTING"
+      log "[STEP 10] User canceled Sensor LV recreation. Existing LV will be kept and image/script download will continue."
+    else
+      lv_action="RECREATE"
+    fi
+  fi
+
+  log "[STEP 10] Sensor LV action: ${lv_action}"
+
+  #######################################
+  # Delete existing LV when explicitly authorized
+  #######################################
+  if [[ "${lv_action}" == "RECREATE" ]]; then
+    # Stop and undefine the Sensor VM before deleting its backing volume.
+    if virsh dominfo mds >/dev/null 2>&1; then
+      log "[STEP 10] Removing existing mds VM definition before Sensor LV recreation"
+      if virsh list --name 2>/dev/null | grep -qx 'mds'; then
+        run_cmd "virsh destroy mds || true"
+      fi
+      run_cmd "virsh managedsave-remove mds || true"
+      if ! run_cmd "virsh undefine mds --nvram || virsh undefine mds"; then
+        log "[ERROR] Failed to undefine existing mds VM. Sensor LV deletion stopped."
+        return 1
+      fi
     fi
 
-    # Safety check: Ensure mountpoint is not already mounted by different device
-    local mount_mds="/var/lib/libvirt/images/mds"
-    
+    # Remove only fstab entries whose mountpoint is the Sensor mountpoint.
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] Would remove /etc/fstab entries for ${mount_mds}"
+    else
+      local fstab_tmp
+      fstab_tmp=$(mktemp)
+      if ! awk -v mp="${mount_mds}" 'NF < 2 || $2 != mp {print}' /etc/fstab > "${fstab_tmp}"; then
+        rm -f "${fstab_tmp}"
+        log "[ERROR] Failed to prepare updated /etc/fstab. Sensor LV deletion stopped."
+        return 1
+      fi
+      if ! cat "${fstab_tmp}" > /etc/fstab; then
+        rm -f "${fstab_tmp}"
+        log "[ERROR] Failed to update /etc/fstab. Sensor LV deletion stopped."
+        return 1
+      fi
+      rm -f "${fstab_tmp}"
+      log "[STEP 10] Removed existing /etc/fstab entries for ${mount_mds}"
+    fi
+
     if mountpoint -q "${mount_mds}" 2>/dev/null; then
-      local mounted_dev
-      mounted_dev=$(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || echo "")
-      if [[ -n "${mounted_dev}" && "${mounted_dev}" != "/dev/${lv_path_mds}" ]]; then
-        log "[ERROR] ${mount_mds} is already mounted by ${mounted_dev}, expected /dev/${lv_path_mds}"
-        whiptail_msgbox "STEP 07 - Mount Conflict" "Mount point ${mount_mds} is already mounted by a different device (${mounted_dev}).\n\nPlease unmount it first or use a different mount point." 12 80
+      if ! run_cmd "sudo umount ${mount_mds}"; then
+        log "[ERROR] Failed to unmount ${mount_mds}. Sensor LV deletion stopped."
         return 1
       fi
     fi
 
-    # mount
-    run_cmd "sudo mkdir -p ${mount_mds}"
-    if ! mountpoint -q "${mount_mds}" 2>/dev/null; then
-      run_cmd "sudo mount /dev/${lv_path_mds} ${mount_mds}"
+    if [[ "${DRY_RUN}" -eq 0 ]] && mountpoint -q "${mount_mds}" 2>/dev/null; then
+      log "[ERROR] ${mount_mds} remains mounted after umount. Sensor LV deletion stopped."
+      return 1
     fi
 
-    # fstab
-    append_fstab_if_missing "/dev/${lv_path_mds}  ${mount_mds}  ext4 defaults,noatime 0 2"  "${mount_mds}"
+    if ! run_cmd "sudo lvremove --force --yes ${lv_device}"; then
+      log "[ERROR] Failed to remove existing Sensor LV: ${lv_device}"
+      return 1
+    fi
 
-    run_cmd "sudo systemctl daemon-reload"
-    run_cmd "sudo mount -a"
+    if [[ "${DRY_RUN}" -eq 0 ]] && lvs "${lv_path_mds}" >/dev/null 2>&1; then
+      log "[ERROR] Sensor LV still exists after lvremove: ${lv_path_mds}"
+      return 1
+    fi
+  fi
 
-    # Ownership: Only change ownership of mount point, not entire /var/lib/libvirt/images
-    log "[STEP 10] Change mount point ownership to stellar:stellar"
-    if id stellar >/dev/null 2>&1; then
-      run_cmd "sudo chown -R stellar:stellar ${mount_mds}"
-    else
-      log "[WARN] 'stellar' user account not found, skipping chown."
+  #######################################
+  # Create a fresh LV and filesystem only for CREATE/RECREATE.
+  # KEEP_EXISTING skips all destructive storage operations and continues
+  # to the Sensor image/script download section below.
+  #######################################
+  if [[ "${lv_action}" != "KEEP_EXISTING" ]]; then
+    log "[STEP 10] Creating new LV ${lv_path_mds} (${SENSOR_LV_SIZE_GB_PER_VM}GB)"
+
+  local required_lv_mib
+  required_lv_mib=$((SENSOR_LV_SIZE_GB_PER_VM * 1024))
+  if ! ensure_ubuntu_vg_free_space "STEP 10" "${UBUNTU_VG}" "${root_dev}" "${required_lv_mib}" 1024; then
+    return 1
+  fi
+
+  # --wipesignatures y + --yes is required on redeployment because lvremove
+  # removes LVM metadata but old ext4 signatures can remain in reused extents.
+  if ! run_cmd "sudo lvcreate --yes --wipesignatures y --zero y -L ${SENSOR_LV_SIZE_GB_PER_VM}G -n ${LV_MDS} ${UBUNTU_VG}"; then
+    log "[ERROR] Failed to create Sensor LV: ${lv_path_mds}"
+    return 1
+  fi
+
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    sudo udevadm settle >/dev/null 2>&1 || true
+    local wait_try
+    for wait_try in $(seq 1 30); do
+      [[ -b "${lv_device}" ]] && break
+      sleep 0.2
+    done
+    if [[ ! -b "${lv_device}" ]]; then
+      log "[ERROR] Sensor LV block device does not exist after CREATE: ${lv_device}"
+      return 1
+    fi
+  fi
+
+  # Clear any signature not removed by LVM, then create the requested filesystem.
+  if command -v wipefs >/dev/null 2>&1; then
+    if ! run_cmd "sudo wipefs --all --force ${lv_device}"; then
+      log "[ERROR] Failed to clear residual signatures on ${lv_device}"
+      return 1
+    fi
+  fi
+
+  if ! run_cmd "sudo mkfs.ext4 -F ${lv_device}"; then
+    log "[ERROR] Failed to create ext4 filesystem on ${lv_device}"
+    return 1
+  fi
+
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    local fs_type
+    fs_type=$(blkid -s TYPE -o value "${lv_device}" 2>/dev/null || true)
+    if [[ "${fs_type}" != "ext4" ]]; then
+      log "[ERROR] Filesystem verification failed for ${lv_device}: ${fs_type:-unknown}"
+      return 1
+    fi
+  fi
+
+  #######################################
+  # Mount and register the newly created LV
+  #######################################
+  if ! run_cmd "sudo mkdir -p ${mount_mds}"; then
+    return 1
+  fi
+  if ! run_cmd "sudo mount ${lv_device} ${mount_mds}"; then
+    log "[ERROR] Failed to mount ${lv_device} on ${mount_mds}"
+    return 1
+  fi
+
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    mounted_dev=$(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || true)
+    expected_majmin=$(get_block_majmin "${lv_device}" 2>/dev/null || true)
+    mounted_majmin=$(get_block_majmin "${mounted_dev}" 2>/dev/null || true)
+    if [[ -z "${expected_majmin}" || "${expected_majmin}" != "${mounted_majmin}" ]]; then
+      log "[ERROR] Mount verification failed: ${mount_mds}=${mounted_dev:-unknown}, expected=${lv_device}"
+      return 1
+    fi
+  fi
+
+  append_fstab_if_missing "${lv_device}  ${mount_mds}  ext4 defaults,noatime 0 2" "${mount_mds}"
+  if ! run_cmd "sudo systemctl daemon-reload"; then
+    return 1
+  fi
+    if ! run_cmd "sudo mount -a"; then
+      log "[ERROR] mount -a failed after Sensor LV fstab registration"
+      return 1
     fi
   else
-    log "[STEP 10] LV create/mount already configured, skipping"
+    #######################################
+    # Keep the existing LV and continue downloads
+    #######################################
+    log "[STEP 10] Keeping existing Sensor LV unchanged: ${lv_device}"
+
+    local keep_fs_type=""
+    keep_fs_type=$(blkid -s TYPE -o value "${lv_device}" 2>/dev/null || true)
+    if [[ "${keep_fs_type}" != "ext4" ]]; then
+      log "[ERROR] Existing Sensor LV filesystem is not ext4: ${keep_fs_type:-unknown}"
+      whiptail_msgbox "STEP 10 - Unsupported Existing Filesystem" \
+        "The existing Sensor LV cannot be used for image download because its filesystem is not ext4.\n\nLV: ${lv_device}\nDetected filesystem: ${keep_fs_type:-unknown}\n\nSelect Delete and Recreate to create a supported ext4 filesystem." \
+        17 92
+      return 1
+    fi
+
+    if ! run_cmd "sudo mkdir -p ${mount_mds}"; then
+      return 1
+    fi
+
+    if ! mountpoint -q "${mount_mds}" 2>/dev/null; then
+      if ! run_cmd "sudo mount ${lv_device} ${mount_mds}"; then
+        log "[ERROR] Failed to mount existing Sensor LV ${lv_device} on ${mount_mds}"
+        return 1
+      fi
+    else
+      log "[STEP 10] Existing Sensor LV is already mounted on ${mount_mds}"
+    fi
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+      mounted_dev=$(findmnt -n -o SOURCE "${mount_mds}" 2>/dev/null || true)
+      expected_majmin=$(get_block_majmin "${lv_device}" 2>/dev/null || true)
+      mounted_majmin=$(get_block_majmin "${mounted_dev}" 2>/dev/null || true)
+      if [[ -z "${expected_majmin}" || -z "${mounted_majmin}" || "${expected_majmin}" != "${mounted_majmin}" ]]; then
+        log "[ERROR] Existing Sensor LV mount verification failed: ${mount_mds}=${mounted_dev:-unknown}, expected=${lv_device}"
+        return 1
+      fi
+    fi
+
+    append_fstab_if_missing "${lv_device}  ${mount_mds}  ext4 defaults,noatime 0 2" "${mount_mds}"
+    if ! run_cmd "sudo systemctl daemon-reload"; then
+      return 1
+    fi
+    if ! run_cmd "sudo mount -a"; then
+      log "[ERROR] mount -a failed while retaining the existing Sensor LV"
+      return 1
+    fi
+
+    # The requested size applies only to recreation. When recreation is
+    # canceled, align defaults used by STEP 11 with the actual existing LV.
+    local actual_existing_lv_gb
+    actual_existing_lv_gb=$(sudo lvs --noheadings --units g --nosuffix -o lv_size "${lv_path_mds}" 2>/dev/null \
+      | awk 'NF {printf "%d", ($1 == int($1) ? $1 : int($1) + 1); exit}')
+    if [[ ! "${actual_existing_lv_gb}" =~ ^[0-9]+$ || "${actual_existing_lv_gb}" -lt 1 ]]; then
+      log "[ERROR] Could not determine the existing Sensor LV size after keeping it."
+      return 1
+    fi
+
+    SENSOR_LV_SIZE_GB_PER_VM="${actual_existing_lv_gb}"
+    SENSOR_TOTAL_LV_SIZE_GB="${actual_existing_lv_gb}"
+    LV_SIZE_GB="${actual_existing_lv_gb}"
+    save_config_var "SENSOR_TOTAL_LV_SIZE_GB" "${SENSOR_TOTAL_LV_SIZE_GB}"
+    save_config_var "SENSOR_LV_SIZE_GB_PER_VM" "${SENSOR_LV_SIZE_GB_PER_VM}"
+    save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
+    log "[STEP 10] Existing Sensor LV retained (${actual_existing_lv_gb}GB); proceeding to image/script download."
   fi
 
+  log "[STEP 10] Change mount point ownership to stellar:stellar"
+  if id stellar >/dev/null 2>&1; then
+    if ! run_cmd "sudo chown -R stellar:stellar ${mount_mds}"; then
+      return 1
+    fi
+  else
+    log "[WARN] 'stellar' user account not found, skipping chown."
+  fi
 
-  # Store for use in STEP08/09
-  save_config_var "SENSOR_LV_MDS"  "${lv_path_mds}"
+  # Store for use in STEP 11/12.
+  save_config_var "SENSOR_LV_MDS" "${lv_path_mds}"
 
 
   #######################################
@@ -6604,51 +7725,72 @@ step_10_sensor_lv_download() {
   run_cmd "sudo mkdir -p ${SENSOR_IMAGE_DIR}"
 
   #######################################
-  # 6-A) Check if 1GB+ qcow2 in current directory can be reused (OpenXDR pattern)
+  # 6-A) Use only the exact Sensor qcow2 for the selected release
   #######################################
   local qcow2_name="aella-modular-ds-${SENSOR_VERSION}.qcow2"
   local use_local_qcow=0
   local local_qcow=""
   local local_qcow_size_h=""
-  
   local search_dir="."
-  
-  # Find 1GB(=1000M)+ *.qcow2 files and select the most recent one (OpenXDR method)
-  local_qcow="$(
-    find "${search_dir}" -maxdepth 1 -type f -name '*.qcow2' -size +1000M -printf '%T@ %p\n' 2>/dev/null \
-      | sort -nr \
-      | head -n1 \
-      | awk '{print $2}'
-  )"
-  
-  if [[ -n "${local_qcow}" ]]; then
-    local_qcow_size_h="$(ls -lh "${local_qcow}" 2>/dev/null | awk '{print $5}')"
-    
-    local msg
-    msg="Found 1GB+ qcow2 file in current directory.\n\n"
-    msg+="  File: ${local_qcow}\n"
-    msg+="  Size: ${local_qcow_size_h}\n\n"
-    msg+="Do you want to use this file without downloading for Sensor VM deployment?\n\n"
-    msg+="[Yes] Use this file (copy to sensor image directory, skip download)\n"
-    msg+="[No] Use existing file/download procedure as is"
-    
-    if whiptail_yesno "STEP 07 - Reuse Local qcow2" "${msg}"; then
-      use_local_qcow=1
-      log "[STEP 07] User chose to use local qcow2 file (${local_qcow})."
-      
-      if [[ "${DRY_RUN}" -eq 1 ]]; then
-        log "[DRY-RUN] sudo cp \"${local_qcow}\" \"${SENSOR_IMAGE_DIR}/${qcow2_name}\""
+  local expected_local_qcow="${search_dir}/${qcow2_name}"
+
+  # Explicitly ignore every qcow2 whose basename is not the exact Sensor image
+  # name. In particular, aella-dataprocessor-*.qcow2 must never be copied and
+  # renamed as aella-modular-ds-*.qcow2.
+  while IFS= read -r rejected_qcow; do
+    [[ -n "${rejected_qcow}" ]] || continue
+    if [[ "$(basename -- "${rejected_qcow}")" != "${qcow2_name}" ]]; then
+      log "[STEP 10] Ignoring non-Sensor qcow2 candidate: ${rejected_qcow} (expected: ${qcow2_name})"
+    fi
+  done < <(find "${search_dir}" -maxdepth 1 -type f -name '*.qcow2' -print 2>/dev/null | sort)
+
+  if [[ -f "${expected_local_qcow}" ]]; then
+    if validate_sensor_qcow2_candidate "${expected_local_qcow}" "${SENSOR_VERSION}"; then
+      local_qcow="${expected_local_qcow}"
+      local_qcow_size_h="$(ls -lh "${local_qcow}" 2>/dev/null | awk '{print $5}')"
+
+      local msg
+      msg="Found the exact Sensor qcow2 for release ${SENSOR_VERSION}.\n\n"
+      msg+="  File: ${local_qcow}\n"
+      msg+="  Size: ${local_qcow_size_h}\n"
+      msg+="  Required name: ${qcow2_name}\n\n"
+      msg+="Do you want to use this validated Sensor image without downloading it?\n\n"
+      msg+="[Yes] Validate, copy atomically, and skip image download\n"
+      msg+="[No] Download the Sensor image from ACPS"
+
+      if whiptail_yesno "STEP 10 - Use Local Sensor qcow2" "${msg}"; then
+        use_local_qcow=1
+        log "[STEP 10] User chose the validated local Sensor qcow2 (${local_qcow})."
+
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+          log "[DRY-RUN] Validate and atomically copy ${local_qcow} to ${SENSOR_IMAGE_DIR}/${qcow2_name}"
+        else
+          local local_copy_tmp="${SENSOR_IMAGE_DIR}/.${qcow2_name}.part.$$"
+          rm -f "${local_copy_tmp}" 2>/dev/null || true
+          if ! cp --reflink=auto --sparse=always -- "${local_qcow}" "${local_copy_tmp}"; then
+            rm -f "${local_copy_tmp}" 2>/dev/null || true
+            log "[ERROR] Failed to copy local Sensor qcow2: ${local_qcow}"
+            return 1
+          fi
+          if ! validate_qcow2_image "${local_copy_tmp}" ||              [[ "$(LC_ALL=C qemu-img info "${local_copy_tmp}" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')" != "qcow2" ]]; then
+            rm -f "${local_copy_tmp}" 2>/dev/null || true
+            log "[ERROR] Copied local Sensor qcow2 failed format/integrity validation."
+            return 1
+          fi
+          mv -f -- "${local_copy_tmp}" "${SENSOR_IMAGE_DIR}/${qcow2_name}"
+          log "[STEP 10] Validated local Sensor qcow2 copied atomically to ${SENSOR_IMAGE_DIR}/${qcow2_name}"
+        fi
       else
-        sudo cp "${local_qcow}" "${SENSOR_IMAGE_DIR}/${qcow2_name}"
-        log "[STEP 10] Local qcow2 copied (replaced) to ${SENSOR_IMAGE_DIR}/${qcow2_name} completed"
+        log "[STEP 10] User chose ACPS download instead of the local Sensor qcow2."
       fi
     else
-      log "[STEP 10] User chose not to use local qcow2 and maintain existing file/download procedure."
+      whiptail_msgbox "STEP 10 - Invalid Local Sensor Image"         "The expected local file exists but failed validation:\n\n${expected_local_qcow}\n\nRequired conditions:\n- Exact filename: ${qcow2_name}\n- Valid qcow2 format\n- Readable qemu-img metadata\n\nThe file will not be used. STEP 10 will download a fresh Sensor image from ACPS."         18 88
+      log "[WARN] Local Sensor qcow2 exists but is invalid; forcing ACPS download: ${expected_local_qcow}"
     fi
   else
-    log "[STEP 10] No 1GB+ qcow2 file in current directory → use default download/existing file."
+    log "[STEP 10] Exact local Sensor qcow2 not found (${qcow2_name}); ACPS download will be used."
   fi
-  
+
   #######################################
   # 6-B) Determine download files (always download except 1GB+ qcow2 in current directory)
   #######################################
@@ -6689,27 +7831,51 @@ step_10_sensor_lv_download() {
     (
       cd "${SENSOR_IMAGE_DIR}" || exit 1
       
-      # 1) Download deployment script (always)
+      # 1) Download deployment script atomically (always)
+      local script_tmp=".${script_name}.part.$$"
+      rm -f "${script_tmp}" 2>/dev/null || true
       log "[STEP 10] ${script_name} download started: ${script_url}"
       echo "=== Downloading deployment script ==="
-      if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${script_url}" 2>&1 | tee -a "${LOG_FILE}"; then
+      if wget --progress=bar:force           --user="${ACPS_USERNAME}"           --password="${ACPS_PASSWORD}"           --output-document="${script_tmp}"           "${script_url}" 2>&1 | tee -a "${LOG_FILE}"; then
+        chmod +x "${script_tmp}"
+        if ! validate_downloaded_shell_script "${script_tmp}"; then
+          rm -f "${script_tmp}"
+          log "[ERROR] Downloaded ${script_name} is not a valid shell deployment script."
+          exit 1
+        fi
+        mv -f -- "${script_tmp}" "${script_name}"
         chmod +x "${script_name}"
         echo "=== Deployment script download completed ==="
-        log "[STEP 10] ${script_name} download completed"
+        log "[STEP 10] ${script_name} download completed, validated, and installed atomically"
       else
+        rm -f "${script_tmp}" 2>/dev/null || true
         log "[ERROR] ${script_name} download failed"
         exit 1
       fi
       
-      # 2) qcow2 image download (large capacity, only if local qcow2 is not used)
+      # 2) Download the exact Sensor qcow2 atomically when a local image was not used.
       if [[ "${need_qcow2}" -eq 1 ]]; then
+        local image_tmp=".${qcow2_name}.part.$$"
+        rm -f "${image_tmp}" 2>/dev/null || true
         log "[STEP 10] ${qcow2_name} download started: ${image_url}"
         echo "=== ${qcow2_name} downloading (large capacity file, may take a long time) ==="
         echo "File size may be very large, please wait..."
-        if wget --progress=bar:force --user="${ACPS_USERNAME}" --password="${ACPS_PASSWORD}" "${image_url}" 2>&1 | tee -a "${LOG_FILE}"; then
-          echo "=== ${qcow2_name} download Completed ==="
-          log "[STEP 10] ${qcow2_name} download Completed"
+        if wget --progress=bar:force             --user="${ACPS_USERNAME}"             --password="${ACPS_PASSWORD}"             --output-document="${image_tmp}"             "${image_url}" 2>&1 | tee -a "${LOG_FILE}"; then
+          if ! validate_qcow2_image "${image_tmp}" ||              [[ "$(LC_ALL=C qemu-img info "${image_tmp}" 2>/dev/null | awk -F': ' '/^file format:/ {print $2; exit}')" != "qcow2" ]]; then
+            rm -f "${image_tmp}"
+            log "[ERROR] Downloaded ${qcow2_name} failed qcow2 format/integrity validation."
+            exit 1
+          fi
+          mv -f -- "${image_tmp}" "${qcow2_name}"
+          if ! validate_sensor_qcow2_candidate "${qcow2_name}" "${SENSOR_VERSION}"; then
+            rm -f "${qcow2_name}"
+            log "[ERROR] Installed ${qcow2_name} failed final Sensor image validation."
+            exit 1
+          fi
+          echo "=== ${qcow2_name} download completed and validated ==="
+          log "[STEP 10] ${qcow2_name} download completed, validated, and installed atomically"
         else
+          rm -f "${image_tmp}" 2>/dev/null || true
           log "[ERROR] ${qcow2_name} download failed"
           exit 1
         fi
@@ -6719,7 +7885,7 @@ step_10_sensor_lv_download() {
       return 1
     }
     
-    log "[STEP 07] Sensor image and script download completed"
+    log "[STEP 10] Sensor image and script download completed"
   fi
 
   #######################################
@@ -6738,16 +7904,15 @@ step_10_sensor_lv_download() {
   local final_lv_mds="unknown"
   local final_mount_mds="unknown"
   local final_image="unknown"
+  local final_script="unknown"
 
-  # (Safety) Reconstruct LV path here as well (set -u response)
-  local UBUNTU_VG="ubuntu-vg"
-  local LV_MDS="lv_sensor_root_mds"
-  local lv_path_mds="${UBUNTU_VG}/${LV_MDS}"
+  # LV path was resolved from the root filesystem VG at the beginning of STEP 10.
 
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     final_lv_mds="(DRY-RUN mode)"
     final_mount_mds="(DRY-RUN mode)"
     final_image="(DRY-RUN mode)"
+    final_script="(DRY-RUN mode)"
   else
     # Re-check LV
     if lvs "${lv_path_mds}" >/dev/null 2>&1; then
@@ -6763,11 +7928,17 @@ step_10_sensor_lv_download() {
       final_mount_mds="FAIL"
     fi
 
-    # Re-check image file
-    if [[ -f "${SENSOR_IMAGE_DIR}/${qcow2_name}" ]]; then
+    # Re-check the exact Sensor image and deployment script.
+    if validate_sensor_qcow2_candidate "${SENSOR_IMAGE_DIR}/${qcow2_name}" "${SENSOR_VERSION}"; then
       final_image="OK"
     else
       final_image="FAIL"
+    fi
+
+    if validate_downloaded_shell_script "${SENSOR_IMAGE_DIR}/virt_deploy_modular_ds.sh"; then
+      final_script="OK"
+    else
+      final_script="FAIL"
     fi
   fi
 
@@ -6781,6 +7952,7 @@ step_10_sensor_lv_download() {
       echo "  • lv_sensor_root LV (mds): ${final_lv_mds}"
       echo "  • /var/lib/libvirt/images/mds mount: ${final_mount_mds}"
       echo "  • Sensor image status: ${final_image}"
+      echo "  • Deployment script status: ${final_script}"
       echo
       echo "ℹ️  In real execution mode, the following would occur:"
       echo "  1. LVM Volume Creation:"
@@ -6812,6 +7984,7 @@ step_10_sensor_lv_download() {
       echo "  • lv_sensor_root LV (mds): ${final_lv_mds}"
       echo "  • /var/lib/libvirt/images/mds mount: ${final_mount_mds}"
       echo "  • Sensor image status: ${final_image}"
+      echo "  • Deployment script status: ${final_script}"
       echo
       echo "📦 STORAGE CONFIGURATION:"
       echo "  • LV Path: ${lv_path_mds}"
@@ -6843,6 +8016,11 @@ step_10_sensor_lv_download() {
 
   show_textbox "STEP 10 Result Summary" "${tmp_status}"
 
+  if [[ "${DRY_RUN}" -eq 0 ]] &&      [[ "${final_lv_mds}" != "OK" || "${final_mount_mds}" != "OK" ||         "${final_image}" != "OK" || "${final_script}" != "OK" ]]; then
+    log "[ERROR] STEP 10 final validation failed: LV=${final_lv_mds}, mount=${final_mount_mds}, image=${final_image}, script=${final_script}"
+    return 1
+  fi
+
   log "[STEP 10] Sensor LV creation and image download completed"
   
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END: ${STEP_ID} - ${STEP_NAME} ====="
@@ -6868,43 +8046,27 @@ step_11_sensor_deploy() {
   log "[STEP 11] Sensor network mode: ${net_mode} (NAT only)"
 
   #######################################
-  # 0) Clean up existing VMs
+  # 0) Validate exact Sensor deployment artifacts before any destructive action
   #######################################
-  local SENSOR_VMS=("mds")
-  local vm_exists="no"
-  if virsh list --all | grep -Eq "\smds\s" 2>/dev/null; then
-    vm_exists="yes"
-  fi
+  local script_path="/var/lib/libvirt/images/mds/images/virt_deploy_modular_ds.sh"
+  local sensor_image_path="/var/lib/libvirt/images/mds/images/aella-modular-ds-${SENSOR_VERSION}.qcow2"
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    if ! validate_downloaded_shell_script "${script_path}"; then
+      whiptail_msgbox "STEP 11 - Invalid Deployment Script"         "The Sensor deployment script is missing or invalid:\n\n${script_path}\n\nRe-run STEP 10 and download the deployment script again."         14 88
+      log "[ERROR] STEP 11 blocked before VM cleanup: invalid deployment script: ${script_path}"
+      return 1
+    fi
 
-  if [[ "${vm_exists}" == "yes" ]]; then
-    for vm in "${SENSOR_VMS[@]}"; do
-      if virsh dominfo "${vm}" >/dev/null 2>&1; then
-        if ! confirm_destroy_vm "${vm}" "STEP 11 - Sensor VM Deployment"; then
-          log "[STEP 11] Existing ${vm} VM was kept; redeployment canceled."
-          return 0
-        fi
-
-        log "[STEP 11] Exact confirmation received. Deleting existing ${vm} VM."
-        if virsh list --state-running | grep -q "\s${vm}\s" 2>/dev/null; then
-          run_cmd "virsh destroy ${vm}"
-        fi
-        run_cmd "virsh undefine ${vm} --remove-all-storage"
-      fi
-    done
+    if ! validate_sensor_qcow2_candidate "${sensor_image_path}" "${SENSOR_VERSION}"; then
+      whiptail_msgbox "STEP 11 - Invalid Sensor Image"         "The exact Sensor image is missing or invalid:\n\n${sensor_image_path}\n\nAIO/Data Processor images are not accepted. Re-run STEP 10 with the exact file aella-modular-ds-${SENSOR_VERSION}.qcow2 or download it from ACPS."         16 92
+      log "[ERROR] STEP 11 blocked before VM cleanup: invalid Sensor qcow2: ${sensor_image_path}"
+      return 1
+    fi
   fi
 
   if ! whiptail_yesno "STEP 11 Execution Confirmation" "Do you want to proceed with Sensor VM deployment for mds?"; then
     log "User canceled STEP 11 execution."
     return 0
-  fi
-
-  #######################################
-  # 1) Deploy script check
-  #######################################
-  local script_path="/var/lib/libvirt/images/mds/images/virt_deploy_modular_ds.sh"
-  if [[ ! -f "${script_path}" && "${DRY_RUN}" -eq 0 ]]; then
-    whiptail_msgbox "STEP 11 - Script Not Found" "Deployment script not found:\n${script_path}"
-    return 1
   fi
 
   #######################################
@@ -7053,6 +8215,44 @@ step_11_sensor_deploy() {
   local cpus_mds="${sensor_vcpus}"
   local disksize="${sensor_disk_gb}"
 
+  # Preflight: never ask qemu-img to shrink the base image, and never request a
+  # VM disk larger than the Sensor LV that will contain the RAW disk.
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    local image_virtual_bytes
+    local image_virtual_gib
+    local requested_disk_bytes=$((disksize * 1024 * 1024 * 1024))
+    local sensor_lv_bytes
+    local sensor_lv_gib
+
+    image_virtual_bytes="$(get_qcow2_virtual_size_bytes "${sensor_image_path}" 2>/dev/null || true)"
+    if [[ ! "${image_virtual_bytes}" =~ ^[0-9]+$ ]]; then
+      whiptail_msgbox "STEP 11 - Image Metadata Error"         "Could not read the virtual size of the Sensor image:\n\n${sensor_image_path}\n\nDeployment has been stopped before qemu-img conversion."         14 88
+      log "[ERROR] Could not read Sensor qcow2 virtual size: ${sensor_image_path}"
+      return 1
+    fi
+    image_virtual_gib=$(( (image_virtual_bytes + 1024*1024*1024 - 1) / (1024*1024*1024) ))
+
+    if (( requested_disk_bytes < image_virtual_bytes )); then
+      whiptail_msgbox "STEP 11 - Disk Size Too Small"         "The requested Sensor disk size would shrink the qcow2 image and is not allowed.\n\nSensor image: ${sensor_image_path}\nImage virtual size: ${image_virtual_gib}GB\nRequested disk size: ${disksize}GB\n\nEnter at least ${image_virtual_gib}GB. The installer will not use qemu-img --shrink."         18 92
+      log "[ERROR] STEP 11 blocked: requested disk ${disksize}GB < image virtual size ${image_virtual_gib}GB"
+      return 1
+    fi
+
+    sensor_lv_bytes=$(sudo lvs --noheadings --units b --nosuffix -o lv_size ubuntu-vg/lv_sensor_root_mds 2>/dev/null       | awk 'NF {printf "%.0f\n", $1; exit}')
+    if [[ ! "${sensor_lv_bytes}" =~ ^[0-9]+$ ]]; then
+      log "[ERROR] Could not determine Sensor LV size for STEP 11 preflight."
+      return 1
+    fi
+    sensor_lv_gib=$((sensor_lv_bytes / 1024 / 1024 / 1024))
+    if (( requested_disk_bytes > sensor_lv_bytes )); then
+      whiptail_msgbox "STEP 11 - Disk Size Exceeds Sensor LV"         "The requested VM disk does not fit in the Sensor LV.\n\nSensor LV size: ${sensor_lv_gib}GB\nRequested disk size: ${disksize}GB\n\nEnter a value no larger than ${sensor_lv_gib}GB, or recreate the Sensor LV in STEP 10 with a larger size."         17 92
+      log "[ERROR] STEP 11 blocked: requested disk ${disksize}GB > Sensor LV ${sensor_lv_gib}GB"
+      return 1
+    fi
+
+    log "[STEP 11] Sensor image preflight passed: format=qcow2, virtual_size=${image_virtual_gib}GB, requested_disk=${disksize}GB, LV=${sensor_lv_gib}GB"
+  fi
+
   # NUMA Aware CPUSET Calculation Logic for mds (NUMA1)
   local numa_nodes=1
   local node1_cpus=""
@@ -7092,6 +8292,33 @@ step_11_sensor_deploy() {
   if type save_config >/dev/null 2>&1; then
     save_config
   fi
+
+  #######################################
+  # 2.5) Remove an existing Sensor VM only after all image/disk preflights pass
+  #######################################
+  local SENSOR_VMS=("mds")
+  local vm_exists="no"
+  if virsh list --all | grep -Eq "\smds\s" 2>/dev/null; then
+    vm_exists="yes"
+  fi
+
+  if [[ "${vm_exists}" == "yes" ]]; then
+    for vm in "${SENSOR_VMS[@]}"; do
+      if virsh dominfo "${vm}" >/dev/null 2>&1; then
+        if ! confirm_destroy_vm "${vm}" "STEP 11 - Sensor VM Deployment"; then
+          log "[STEP 11] Existing ${vm} VM was kept; redeployment canceled."
+          return 0
+        fi
+
+        log "[STEP 11] Exact confirmation received. Deleting existing ${vm} VM."
+        if virsh list --state-running | grep -q "\s${vm}\s" 2>/dev/null; then
+          run_cmd "virsh destroy ${vm}"
+        fi
+        run_cmd "virsh undefine ${vm} --remove-all-storage"
+      fi
+    done
+  fi
+
 
   #######################################
   # 3) Sensor VM deployment (mds single)
@@ -7211,18 +8438,18 @@ step_11_sensor_deploy() {
   #######################################
   # 4) Generate the manual Sensor management NIC guard installer
   #######################################
-  local sensor_guard_generation_status="Not generated"
-  local sensor_guard_path="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
-  if generate_sensor_mgmt_nic_guard_installer "mds" "virbr0"; then
+  local sensor_guard_generation_status="Not queued"
+  local sensor_guard_path="/home/stellar/sensor-mgmt-nic-guard-installer.sh"
+  if schedule_sensor_mgmt_nic_guard_generation "mds" "virbr0" "STEP 11 deployment"; then
     sensor_guard_path="${SENSOR_MGMT_GUARD_OUTPUT_PATH:-${sensor_guard_path}}"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-      sensor_guard_generation_status="Would be generated (DRY-RUN)"
+      sensor_guard_generation_status="Would be queued (DRY-RUN)"
     else
-      sensor_guard_generation_status="Generated"
+      sensor_guard_generation_status="Queued in background"
     fi
   else
-    sensor_guard_generation_status="Generation failed - check installer log"
-    log "[WARN] STEP 11 completed, but the Sensor management NIC guard installer could not be generated."
+    sensor_guard_generation_status="Queue failed - check installer log"
+    log "[WARN] STEP 11 completed, but Sensor management NIC guard generation could not be queued."
   fi
   
   # Create summary message
@@ -7460,19 +8687,7 @@ step_12_sensor_passthrough() {
             while IFS= read -r pci_addr; do
                 [[ -z "${pci_addr}" ]] && continue
                 current_pcis+=("${pci_addr}")
-            done < <(virsh dumpxml "${SENSOR_VM}" --inactive 2>/dev/null | awk -F"'" '
-                /<hostdev / { in_hostdev=1; next }
-                in_hostdev && /address/ && /domain=/ && /bus=/ && /slot=/ && /function=/ && $0 !~ /type=.pci./ {
-                    addr_domain=$2
-                    addr_bus=$4
-                    addr_slot=$6
-                    addr_func=$8
-                    if (addr_domain != "" && addr_bus != "" && addr_slot != "" && addr_func != "") {
-                        printf "%s:%s:%s.%s\n", addr_domain, addr_bus, addr_slot, addr_func
-                    }
-                }
-                /<\/hostdev>/ { in_hostdev=0 }
-            ' | tr '[:upper:]' '[:lower:]')
+            done < <(list_vm_hostdev_pcis "${SENSOR_VM}" | tr '[:upper:]' '[:lower:]' | sort -u)
 
             if [[ ${#current_pcis[@]} -gt 0 ]]; then
                 for p in "${current_pcis[@]}"; do
@@ -7654,18 +8869,18 @@ EOF
         # 4.6 Regenerate the manual Sensor management NIC guard installer
         #     using the current libvirt management MAC.
         #######################################################################
-        local sensor_guard_generation_status="Not generated"
-        local sensor_guard_path="${BASE_DIR}/output/sensor-mgmt-nic-guard-installer.sh"
-        if generate_sensor_mgmt_nic_guard_installer "${SENSOR_VM}" "virbr0"; then
+        local sensor_guard_generation_status="Not queued"
+        local sensor_guard_path="/home/stellar/sensor-mgmt-nic-guard-installer.sh"
+        if schedule_sensor_mgmt_nic_guard_generation "${SENSOR_VM}" "virbr0" "STEP 12 passthrough"; then
             sensor_guard_path="${SENSOR_MGMT_GUARD_OUTPUT_PATH:-${sensor_guard_path}}"
             if [[ "${_DRY}" -eq 1 ]]; then
-                sensor_guard_generation_status="Would be generated (DRY-RUN)"
+                sensor_guard_generation_status="Would be queued (DRY-RUN)"
             else
-                sensor_guard_generation_status="Generated"
+                sensor_guard_generation_status="Queued in background"
             fi
         else
-            sensor_guard_generation_status="Generation failed - check installer log"
-            log "[WARN] ${SENSOR_VM}: Sensor management NIC guard installer regeneration failed."
+            sensor_guard_generation_status="Queue failed - check installer log"
+            log "[WARN] ${SENSOR_VM}: Sensor management NIC guard generation could not be queued."
         fi
 
         #######################################################################
@@ -10354,7 +11569,7 @@ Log Files:
 load_config
 if [[ "${DRY_RUN:-1}" -eq 0 ]] && command -v virsh >/dev/null 2>&1 \
    && virsh dominfo mds >/dev/null 2>&1; then
-  generate_sensor_mgmt_nic_guard_installer "mds" "virbr0" >/dev/null 2>&1 || true
+  schedule_sensor_mgmt_nic_guard_generation "mds" "virbr0" "installer startup refresh" >/dev/null 2>&1 || true
 fi
 
 main_menu

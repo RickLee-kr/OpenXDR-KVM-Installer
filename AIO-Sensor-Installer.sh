@@ -1457,6 +1457,7 @@ load_config() {
 
   : "${SENSOR_TOTAL_LV_SIZE_GB:=}"
   : "${SENSOR_LV_SIZE_GB_PER_VM:=}"
+  : "${SENSOR_DISK_SIZE_GB:=}"       # Sensor VM virtual disk size (separate from host LV)
 
   # ===== Legacy/Compatible (per-vm) =====
   : "${SENSOR_VCPUS:=}"
@@ -1506,7 +1507,7 @@ save_config() {
   local esc_sensor_vm_count
   local esc_sensor_total_vcpus esc_sensor_vcpus_per_vm esc_sensor_cpuset_mds
   local esc_sensor_total_mem_mb esc_sensor_mem_mb_per_vm
-  local esc_sensor_total_lv_gb esc_sensor_lv_gb_per_vm
+  local esc_sensor_total_lv_gb esc_sensor_lv_gb_per_vm esc_sensor_disk_gb
   local esc_aio_vcpus esc_aio_memory_gb esc_aio_memory_mb esc_aio_disk_gb esc_aio_cpuset
 
   local esc_span_nics_mds
@@ -1528,6 +1529,7 @@ save_config() {
 
   esc_sensor_total_lv_gb=${SENSOR_TOTAL_LV_SIZE_GB//\"/\\\"}
   esc_sensor_lv_gb_per_vm=${SENSOR_LV_SIZE_GB_PER_VM//\"/\\\"}
+  esc_sensor_disk_gb=${SENSOR_DISK_SIZE_GB//\"/\\\"}
 
   esc_aio_vcpus=${AIO_VCPUS//\"/\\\"}
   esc_aio_memory_gb=${AIO_MEMORY_GB//\"/\\\"}
@@ -1604,6 +1606,7 @@ SENSOR_MEMORY_MB_PER_VM="${esc_sensor_mem_mb_per_vm}"
 
 SENSOR_TOTAL_LV_SIZE_GB="${esc_sensor_total_lv_gb}"
 SENSOR_LV_SIZE_GB_PER_VM="${esc_sensor_lv_gb_per_vm}"
+SENSOR_DISK_SIZE_GB="${esc_sensor_disk_gb}"
 
 # ---- Legacy/Compatible (per-vm) ----
 SENSOR_VCPUS="${esc_sensor_vcpus}"
@@ -1688,6 +1691,7 @@ save_config_var() {
     SENSOR_LV_MDS)  SENSOR_LV_MDS="${value}" ;;
     SENSOR_TOTAL_LV_SIZE_GB) SENSOR_TOTAL_LV_SIZE_GB="${value}" ;;
     SENSOR_LV_SIZE_GB_PER_VM) SENSOR_LV_SIZE_GB_PER_VM="${value}" ;;
+    SENSOR_DISK_SIZE_GB) SENSOR_DISK_SIZE_GB="${value}" ;;
 
     # ---- Legacy/Compatible (per-vm) ----
     SENSOR_VCPUS)   SENSOR_VCPUS="${value}" ;;
@@ -7328,15 +7332,15 @@ step_10_sensor_lv_download() {
   fi
   effective_available_gb=$((available_gb + existing_lv_size_gb))
   
-  # Default LV size
-  local default_sensor_disk_gb=200
+  # Default host LV size. Keep free space above the Sensor VM virtual disk.
+  local default_sensor_lv_gb=400
   
   # Prompt for LV size
   local lv_size_gb
   while true; do
     lv_size_gb=$(whiptail_inputbox "STEP 10 - Sensor (MDS) Storage Size Configuration" \
-                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Current VG free space: ${available_gb}GB\n- Existing Sensor LV size: ${existing_lv_size_gb}GB\n- Available after deleting existing Sensor LV: ${effective_available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_disk_gb}GB\n\nExample: Enter 200\n\nSize (GB):" \
-                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" \
+                         "Please enter the storage size (GB) for the sensor VM (mds).\n\n- LV location: ${UBUNTU_VG} (OpenXDR method)\n- Current VG free space: ${available_gb}GB\n- Existing Sensor LV size: ${existing_lv_size_gb}GB\n- Available after deleting existing Sensor LV: ${effective_available_gb}GB\n- Minimum size: 80GB\n- Default value: ${default_sensor_lv_gb}GB\n\nExample: Enter 400\n\nSize (GB):" \
+                         "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_lv_gb}}" \
                          18 80) || {
       log "User canceled sensor storage size configuration."
       return 1
@@ -8116,12 +8120,13 @@ step_11_sensor_deploy() {
     [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
   fi
   
-  local default_sensor_disk_gb=200
+  local default_sensor_disk_gb=350
   
   # Use existing values if set, otherwise use calculated defaults
   : "${SENSOR_MEMORY_MB:=}"
   : "${SENSOR_VCPUS:=}"
   : "${SENSOR_LV_SIZE_GB_PER_VM:=}"
+  : "${SENSOR_DISK_SIZE_GB:=}"
   
   # 1) Memory
   # Always use calculated default value for input box (not saved value)
@@ -8183,7 +8188,7 @@ step_11_sensor_deploy() {
   # 3) Disk size
   local _SENSOR_DISK_INPUT
   local disk_input_rc
-  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter 200" "${SENSOR_LV_SIZE_GB_PER_VM:-${default_sensor_disk_gb}}" 12 70)"
+  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 11 - Sensor (MDS) disk" "Enter disk size (GB) for Sensor VM (mds).\n\nThis virtual disk is intentionally smaller than the host Sensor LV to preserve host filesystem headroom.\nMinimum size: 80GB\nDefault value: ${default_sensor_disk_gb}GB\nExample: Enter 350" "${SENSOR_DISK_SIZE_GB:-${default_sensor_disk_gb}}" 14 80)"
   disk_input_rc=$?
 
   local sensor_disk_gb
@@ -8283,11 +8288,10 @@ step_11_sensor_deploy() {
   SENSOR_VCPUS_PER_VM="${cpus_mds}"
   SENSOR_TOTAL_VCPUS="${cpus_mds}"
   SENSOR_CPUSET_MDS="${sensor_cpuset_mds}"
-  SENSOR_LV_SIZE_GB_PER_VM="${sensor_disk_gb}"
-  SENSOR_TOTAL_LV_SIZE_GB="${sensor_disk_gb}"
-  LV_SIZE_GB="${sensor_disk_gb}"
+  SENSOR_DISK_SIZE_GB="${sensor_disk_gb}"
 
   log "Configured sensor vCPU: ${SENSOR_VCPUS} (mds cpuset=${SENSOR_CPUSET_MDS})"
+  log "Configured Sensor storage: host LV=${SENSOR_LV_SIZE_GB_PER_VM:-unknown}GB, VM disk=${SENSOR_DISK_SIZE_GB}GB"
 
   if type save_config >/dev/null 2>&1; then
     save_config

@@ -1220,7 +1220,8 @@ load_config() {
   : "${SPAN_BRIDGE_LIST:=}"
   : "${SENSOR_NET_MODE:=nat}"
   : "${LV_LOCATION:=}"
-  : "${LV_SIZE_GB:=}"
+  : "${LV_SIZE_GB:=}"              # Host Sensor LV size
+  : "${SENSOR_DISK_SIZE_GB:=}"     # Sensor VM virtual disk size (separate from host LV)
 
   # Network (STEP 03)
   : "${MGT_IP_ADDR:=}"
@@ -1247,7 +1248,7 @@ save_config() {
 
   # ★ Also escape NIC / sensor related values
   local esc_host_nic esc_data_nic esc_hostmgmt_nic esc_span_nics esc_sensor_vcpus esc_sensor_memory_mb esc_sensor_passthrough_pcis
-  local esc_span_attach_mode esc_span_nic_list esc_span_bridge_list esc_sensor_net_mode esc_lv_location esc_lv_size_gb
+  local esc_span_attach_mode esc_span_nic_list esc_span_bridge_list esc_sensor_net_mode esc_lv_location esc_lv_size_gb esc_sensor_disk_size_gb
   esc_host_nic=${HOST_NIC//\"/\\\"}
   esc_data_nic=${DATA_NIC//\"/\\\"}
   esc_hostmgmt_nic=${HOSTMGMT_NIC//\"/\\\"}
@@ -1261,6 +1262,7 @@ save_config() {
   esc_sensor_net_mode=${SENSOR_NET_MODE//\"/\\\"}
   esc_lv_location=${LV_LOCATION//\"/\\\"}
   esc_lv_size_gb=${LV_SIZE_GB//\"/\\\"}
+  esc_sensor_disk_size_gb=${SENSOR_DISK_SIZE_GB//\"/\\\"}
   : "${MGT_IP_ADDR:=}"
   : "${MGT_IP_PREFIX:=}"
   : "${MGT_GW:=}"
@@ -1304,6 +1306,7 @@ SPAN_BRIDGE_LIST="${esc_span_bridge_list}"
 SENSOR_NET_MODE="${esc_sensor_net_mode}"
 LV_LOCATION="${esc_lv_location}"
 LV_SIZE_GB="${esc_lv_size_gb}"
+SENSOR_DISK_SIZE_GB="${esc_sensor_disk_size_gb}"
 
 # Network (STEP 03)
 MGT_IP_ADDR="${MGT_IP_ADDR//\"/\\\"}"
@@ -1359,6 +1362,7 @@ save_config_var() {
     SENSOR_NET_MODE) SENSOR_NET_MODE="${value}" ;;
     LV_LOCATION) LV_LOCATION="${value}" ;;
     LV_SIZE_GB) LV_SIZE_GB="${value}" ;;
+    SENSOR_DISK_SIZE_GB) SENSOR_DISK_SIZE_GB="${value}" ;;
     MGT_IP_ADDR) MGT_IP_ADDR="${value}" ;;
     MGT_IP_PREFIX) MGT_IP_PREFIX="${value}" ;;
     MGT_GW) MGT_GW="${value}" ;;
@@ -5279,8 +5283,10 @@ step_07_sensor_download() {
   
   local disk_info_msg="Disk Information:\n- ubuntu-vg Total Size: ${ubuntu_vg_total_size}GB\n- System use (ubuntu-lv): ${ubuntu_lv_size}GB\n- Available: approximately ${available_gb}GB\n\n"
   
+  # Host Sensor LV default. The VM virtual disk is configured separately in STEP 08.
+  local default_sensor_lv_gb=400
   local lv_size_gb
-  lv_size_gb=$(whiptail_inputbox "STEP 07 - Sensor LV Creation Size" "${disk_info_msg}Enter Sensor LV Creation size (GB):\n\nDefault: 300GB\nMinimum Size: 100GB\n\nSize (GB):" "300" 16 70) || {
+  lv_size_gb=$(whiptail_inputbox "STEP 07 - Sensor LV Creation Size" "${disk_info_msg}Enter Sensor LV Creation size (GB):\n\nDefault: ${default_sensor_lv_gb}GB\nMinimum Size: 100GB\n\nThis host LV should remain larger than the Sensor VM virtual disk configured in STEP 08.\n\nExample: Enter 400\n\nSize (GB):" "${default_sensor_lv_gb}" 20 78) || {
     log "User canceled Sensor LV size configuration."
     return 1
   }
@@ -5910,12 +5916,13 @@ step_08_sensor_deploy() {
   local default_sensor_vcpus=$((total_cpus - 4))
   [[ ${default_sensor_vcpus} -lt 2 ]] && default_sensor_vcpus=2
   
-  local default_sensor_disk_gb=300
+  local default_sensor_disk_gb=350
   
   # Use existing values if set, otherwise use calculated defaults
   : "${SENSOR_MEMORY_MB:=}"
   : "${SENSOR_VCPUS:=}"
-  : "${LV_SIZE_GB:=}"
+  : "${LV_SIZE_GB:=}"              # Host Sensor LV size from STEP 07
+  : "${SENSOR_DISK_SIZE_GB:=}"     # Sensor VM virtual disk size
   
   # 1) Memory
   # Always use calculated default value for input box (not saved value)
@@ -5972,7 +5979,7 @@ step_08_sensor_deploy() {
   # 3) Disk
   local _SENSOR_DISK_INPUT
   local disk_input_rc
-  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM disk" "Enter disk size (GB) for Sensor VM.\n\nDefault value: ${default_sensor_disk_gb}GB\nMinimum: 100GB\nExample: Enter 300" "${default_sensor_disk_gb}" 12 80)"
+  _SENSOR_DISK_INPUT="$(whiptail_inputbox "STEP 08 - Sensor VM disk" "Enter disk size (GB) for Sensor VM.\n\nThis virtual disk is intentionally smaller than the host Sensor LV to preserve host filesystem headroom.\nHost Sensor LV configured in STEP 07: ${LV_SIZE_GB:-unknown}GB\nDefault value: ${default_sensor_disk_gb}GB\nMinimum: 100GB\nExample: Enter 350" "${SENSOR_DISK_SIZE_GB:-${default_sensor_disk_gb}}" 15 84)"
   disk_input_rc=$?
 
   if [ ${disk_input_rc} -ne 0 ]; then
@@ -6114,18 +6121,89 @@ step_08_sensor_deploy() {
     log "[STEP 08] Bridge Mode IP Configuration: IP=${sensor_ip}, Netmask=${sensor_netmask}, Gateway=${sensor_gateway}, DNS=${sensor_dns}"
   fi
 
-  # Save configuration
+  # Save configuration. Keep host LV and guest virtual disk as independent values.
   SENSOR_MEMORY_MB="${mem_mb}"
   SENSOR_VCPUS="${cpus}"
-  LV_SIZE_GB="${sensor_disk_gb}"
+  SENSOR_DISK_SIZE_GB="${sensor_disk_gb}"
   save_config_var "SENSOR_MEMORY_MB" "${SENSOR_MEMORY_MB}"
   save_config_var "SENSOR_VCPUS" "${SENSOR_VCPUS}"
-  save_config_var "LV_SIZE_GB" "${LV_SIZE_GB}"
+  save_config_var "SENSOR_DISK_SIZE_GB" "${SENSOR_DISK_SIZE_GB}"
 
   log "[STEP 08] Sensor VM Configuration:"
   log "  Memory: ${sensor_mem_gb}GB (${mem_mb}MB)"
   log "  vCPU: ${cpus}"
-  log "  Disk: ${sensor_disk_gb}GB"
+  log "  Host Sensor LV: ${LV_SIZE_GB:-unknown}GB"
+  log "  VM Disk: ${SENSOR_DISK_SIZE_GB}GB"
+
+  #######################################
+  # 0.5) Sensor storage preflight
+  #
+  # Keep the host LV and guest disk independent and verify the selected guest
+  # disk actually fits in the mounted Sensor LV before any existing VM is removed.
+  #######################################
+  if [[ "${DRY_RUN}" -eq 0 ]]; then
+    local sensor_mount_point="/var/lib/libvirt/images/mds"
+    local sensor_lv_device=""
+    local sensor_lv_bytes=""
+    local sensor_lv_gib=0
+    local requested_disk_bytes=$((sensor_disk_gb * 1024 * 1024 * 1024))
+    local configured_headroom_gib=0
+
+    sensor_lv_device=$(findmnt -n -o SOURCE "${sensor_mount_point}" 2>/dev/null || true)
+    if [[ -z "${sensor_lv_device}" ]]; then
+      whiptail_msgbox "STEP 08 - Sensor LV Not Mounted" \
+        "The Sensor storage mount is not available:\n\n${sensor_mount_point}\n\nRun STEP 07 first and verify that lv_sensor_root is mounted before deploying the Sensor VM." \
+        15 88
+      log "[ERROR] STEP 08 blocked: Sensor mount is missing: ${sensor_mount_point}"
+      return 1
+    fi
+
+    sensor_lv_bytes=$(sudo lvs --noheadings --units b --nosuffix -o lv_size "${sensor_lv_device}" 2>/dev/null \
+      | awk 'NF {printf "%.0f\n", $1; exit}')
+    if [[ ! "${sensor_lv_bytes}" =~ ^[0-9]+$ ]]; then
+      whiptail_msgbox "STEP 08 - Sensor LV Size Error" \
+        "Could not determine the actual size of the Sensor LV mounted at:\n\n${sensor_mount_point}\n\nDetected device: ${sensor_lv_device}\n\nDeployment has been stopped before any existing VM is removed." \
+        16 90
+      log "[ERROR] STEP 08 blocked: could not determine LV size for ${sensor_lv_device}"
+      return 1
+    fi
+
+    sensor_lv_gib=$((sensor_lv_bytes / 1024 / 1024 / 1024))
+    configured_headroom_gib=$((sensor_lv_gib - sensor_disk_gb))
+
+    if (( requested_disk_bytes > sensor_lv_bytes )); then
+      whiptail_msgbox "STEP 08 - Disk Size Exceeds Sensor LV" \
+        "The requested Sensor VM disk does not fit in the host Sensor LV.\n\nActual Sensor LV size: ${sensor_lv_gib}GB\nRequested VM disk size: ${sensor_disk_gb}GB\n\nEnter a value no larger than ${sensor_lv_gib}GB, or recreate the Sensor LV in STEP 07 with a larger size." \
+        17 92
+      log "[ERROR] STEP 08 blocked: requested disk ${sensor_disk_gb}GB > Sensor LV ${sensor_lv_gib}GB"
+      return 1
+    fi
+
+    local sensor_image_path="/var/lib/libvirt/images/mds/images/aella-modular-ds-${SENSOR_VERSION}.qcow2"
+    if [[ -f "${sensor_image_path}" ]] && command -v qemu-img >/dev/null 2>&1; then
+      local image_virtual_bytes=""
+      local image_virtual_gib=0
+      image_virtual_bytes=$(LC_ALL=C qemu-img info --output=json "${sensor_image_path}" 2>/dev/null \
+        | tr -d '\n' \
+        | sed -n 's/.*"virtual-size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+      if [[ "${image_virtual_bytes}" =~ ^[0-9]+$ ]]; then
+        image_virtual_gib=$(( (image_virtual_bytes + 1024*1024*1024 - 1) / (1024*1024*1024) ))
+        if (( requested_disk_bytes < image_virtual_bytes )); then
+          whiptail_msgbox "STEP 08 - Disk Size Too Small" \
+            "The requested Sensor VM disk would be smaller than the qcow2 image virtual size.\n\nImage virtual size: ${image_virtual_gib}GB\nRequested VM disk size: ${sensor_disk_gb}GB\n\nEnter at least ${image_virtual_gib}GB. Deployment has been stopped before any existing VM is removed." \
+            17 92
+          log "[ERROR] STEP 08 blocked: requested disk ${sensor_disk_gb}GB < image virtual size ${image_virtual_gib}GB"
+          return 1
+        fi
+      else
+        log "[WARN] Could not read qcow2 virtual size; continuing with LV-fit validation only: ${sensor_image_path}"
+      fi
+    fi
+
+    log "[STEP 08] Sensor storage preflight passed: LV=${sensor_lv_gib}GB, VM disk=${sensor_disk_gb}GB, remaining headroom=${configured_headroom_gib}GB"
+  else
+    log "[DRY-RUN] Sensor storage plan: host LV=${LV_SIZE_GB:-unknown}GB, VM disk=${sensor_disk_gb}GB"
+  fi
 
   #######################################
   # 1) Current status check
@@ -6159,7 +6237,9 @@ step_08_sensor_deploy() {
     echo "- hostname: mds"
     echo "- vCPU: ${cpus}"
     echo "- Memory: ${sensor_mem_gb}GB (${mem_mb}MB)"
-    echo "- Disk Size: ${sensor_disk_gb}GB"
+    echo "- Host Sensor LV: ${LV_SIZE_GB:-unknown}GB"
+    echo "- VM Disk Size: ${sensor_disk_gb}GB"
+    echo "- Planned headroom: $(( ${LV_SIZE_GB:-0} - sensor_disk_gb ))GB (based on configured values)"
     echo "- Install Dir: /var/lib/libvirt/images/mds"
     echo
     echo " STEP: virt_deploy_modular_ds.sh script will be used"
@@ -9912,7 +9992,9 @@ Server Specifications (Physical Server Recommended):
 • Disk:
   - Use ubuntu-vg volume group for OS and Sensor
   - Minimum free space: 100GB minimum
-  - Sensor LV is created automatically in STEP 07
+  - Default host Sensor LV: 400GB (STEP 07)
+  - Default Sensor VM virtual disk: 350GB (STEP 08)
+  - Host LV and VM disk sizes are stored independently to preserve filesystem headroom
 
 • Network Interfaces:
   - Management (Host/MGT): 1GbE or more (for SSH access)

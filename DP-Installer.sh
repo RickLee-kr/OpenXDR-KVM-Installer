@@ -6208,11 +6208,11 @@ EOF
 
 
 #######################################
-# DP_VERSION >= 6.3: KT v1.8 Step 09~12 implementations (Ubuntu 24.04 based DL/DA)
+# DP_VERSION >= 6.2.1: versioned Step 09~12 implementations (6.5+ uses official Ubuntu 24.04 UEFI deploy script)
 #######################################
 
 step_09_dp_download_v621() {
-  log "[STEP 09] Download DP deploy script and image (KT v1.8 logic for DP_VERSION >= 6.3)"
+  log "[STEP 09] Download DP deploy script and image (versioned logic for DP_VERSION >= 6.2.1)"
   load_config
   local tmp_info="/tmp/xdr_step09_info.txt"
 
@@ -6256,22 +6256,31 @@ step_09_dp_download_v621() {
   #######################################
   # 2) Define download targets/URLs
   #######################################
-  # Script version fixed at 6.2.0
+  # Version-specific deploy artifacts
+  #   6.2.1 ~ 6.4.x : existing compatibility path (legacy deploy script + STEP 12 UEFI workaround for 6.3/6.4)
+  #   6.5.0+        : official Ubuntu 24.04 UEFI deploy script and original image filename (no rename)
   local script_ver="6.2.0"
   local dp_script="virt_deploy_uvp_centos.sh"
-
-  # File naming strategy: Long Name (remote) vs Short Name (local)
   local remote_qcow2="aella-dataprocessor-ubuntu2404-py2-${ver}.qcow2"
   local remote_xml="aella-dataprocessor-ubuntu2404-py2-${ver}.xml"
-  local remote_sha1="${remote_qcow2}.sha1"
-
-  # Local storage name (Short Name - compatible with Step 10/11)
   local local_qcow2="aella-dataprocessor-${ver}.qcow2"
+  local is_ubuntu2404_official=0
+
+  if version_ge "${ver}" "6.5.0"; then
+    is_ubuntu2404_official=1
+    script_ver="${ver}"
+    dp_script="virt_deploy_uvp_ubuntu2404.sh"
+    remote_qcow2="aella-dataprocessor-ubuntu2404-${ver}.qcow2"
+    remote_xml=""
+    local_qcow2="${remote_qcow2}"
+  fi
+  local remote_sha1="${remote_qcow2}.sha1"
 
   # URL assembly
   local url_script="${acps_url}/release/${script_ver}/dataprocessor/${dp_script}"
   local url_qcow2="${acps_url}/release/${ver}/dataprocessor/${remote_qcow2}"
-  local url_xml="${acps_url}/release/${ver}/dataprocessor/${remote_xml}"
+  local url_xml=""
+  [[ -n "${remote_xml}" ]] && url_xml="${acps_url}/release/${ver}/dataprocessor/${remote_xml}"
   local url_sha1="${acps_url}/release/${ver}/dataprocessor/${remote_sha1}"
 
   log "[STEP 09] Configuration summary:"
@@ -6337,11 +6346,13 @@ step_09_dp_download_v621() {
     log "[DRY-RUN] Will remove existing script/XML/SHA1 files"
     [[ "${use_local_qcow}" -eq 0 ]] && log "[DRY-RUN] Will remove existing image files"
   else
-    # Always remove script/XML/SHA1 to ensure latest versions
+    # Always remove the selected script/SHA1 to ensure latest versions.
     sudo rm -f "${dl_img_dir}/${dp_script}" \
-               "${dl_img_dir}/${remote_xml}" \
                "${dl_img_dir}/${remote_sha1}" \
-               "${dl_img_dir}/*.xml" "${dl_img_dir}/*.sha1" 2>/dev/null || true
+               "${dl_img_dir}/*.sha1" 2>/dev/null || true
+    if [[ -n "${remote_xml}" ]]; then
+      sudo rm -f "${dl_img_dir}/${remote_xml}" "${dl_img_dir}/*.xml" 2>/dev/null || true
+    fi
 
     # Remove image only if not using local file
     if [[ "${use_local_qcow}" -eq 0 ]]; then
@@ -6360,7 +6371,7 @@ step_09_dp_download_v621() {
   if [[ "${DRY_RUN}" -eq 1 ]]; then
     log "[DRY-RUN] (password is not shown in logs)"
     log "[DRY-RUN] Script: ${url_script}"
-    log "[DRY-RUN] XML:    ${url_xml}"
+    [[ -n "${url_xml}" ]] && log "[DRY-RUN] XML:    ${url_xml}"
     log "[DRY-RUN] SHA1:   ${url_sha1}"
     if [[ "${use_local_qcow}" -eq 0 ]]; then
       log "[DRY-RUN] Image:  ${url_qcow2}"
@@ -6371,31 +6382,54 @@ step_09_dp_download_v621() {
 
       # 1) Deploy script (always)
       log "[STEP 09] Starting ${dp_script} download..."
-      curl -O -k -u "${acps_user}:${acps_pass}" "${url_script}" || {
-        log "[ERROR] ${dp_script} download failed"
-        exit 1
-      }
+      if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+        curl --fail -O -k -u "${acps_user}:${acps_pass}" "${url_script}" || {
+          log "[ERROR] ${dp_script} download failed"
+          exit 1
+        }
+      else
+        curl -O -k -u "${acps_user}:${acps_pass}" "${url_script}" || {
+          log "[ERROR] ${dp_script} download failed"
+          exit 1
+        }
+      fi
 
-      # 2) XML file (always - Long Name)
-      log "[STEP 09] Starting ${remote_xml} download..."
-      curl -O -k -u "${acps_user}:${acps_pass}" "${url_xml}" || {
-        log "[WARN] XML download failed (continuing)"
-      }
+      # 2) XML is used only by the 6.2.1 ~ 6.4 compatibility path.
+      if [[ -n "${remote_xml}" ]]; then
+        log "[STEP 09] Starting ${remote_xml} download..."
+        curl -O -k -u "${acps_user}:${acps_pass}" "${url_xml}" || {
+          log "[WARN] XML download failed (continuing)"
+        }
+      fi
 
-      # 3) SHA1 file (always - Long Name)
+      # 3) SHA1 file
       log "[STEP 09] Starting ${remote_sha1} download..."
-      curl -O -k -u "${acps_user}:${acps_pass}" "${url_sha1}" || {
-        log "[WARN] SHA1 download failed (verification may be skipped)"
-      }
+      if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+        curl --fail -O -k -u "${acps_user}:${acps_pass}" "${url_sha1}" || {
+          log "[ERROR] SHA1 download failed for ${remote_sha1}"
+          exit 1
+        }
+      else
+        curl -O -k -u "${acps_user}:${acps_pass}" "${url_sha1}" || {
+          log "[WARN] SHA1 download failed (verification may be skipped)"
+        }
+      fi
 
-      # 4) qcow2 (only if not using local file - Long Name)
+      # 4) qcow2 (only if not using local file)
       if [[ "${use_local_qcow}" -eq 0 ]]; then
         log "[STEP 09] Starting image download: ${remote_qcow2}"
         echo "=== Downloading ${remote_qcow2} (curl progress below) ==="
-        curl -O -k -u "${acps_user}:${acps_pass}" "${url_qcow2}" || {
-          log "[ERROR] ${remote_qcow2} download failed"
-          exit 1
-        }
+        if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+          curl --fail -O -k -u "${acps_user}:${acps_pass}" "${url_qcow2}" || {
+            log "[ERROR] ${remote_qcow2} download failed"
+            exit 1
+          }
+        else
+          curl -O -k -u "${acps_user}:${acps_pass}" "${url_qcow2}" || {
+            log "[ERROR] ${remote_qcow2} download failed"
+            exit 1
+          }
+        fi
         echo "=== ${remote_qcow2} download complete ==="
         log "[STEP 09] Image download complete"
       else
@@ -6424,71 +6458,126 @@ step_09_dp_download_v621() {
       log "[STEP 09] WARN: ${dl_img_dir}/${dp_script} missing; skipping chmod."
     fi
 
-    # 4-2) SHA1 verification (only if both files exist)
-    if [[ -f "${dl_img_dir}/${remote_sha1}" && -f "${dl_img_dir}/${remote_qcow2}" ]]; then
-      log "[STEP 09] Running sha1sum verification for ${remote_qcow2}"
+    # 4-2) SHA1 verification
+    local verified_sha1=""
+    if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+      # 6.5+ must never continue past a failed or missing checksum.
+      if [[ ! -f "${dl_img_dir}/${remote_sha1}" || ! -f "${dl_img_dir}/${remote_qcow2}" ]]; then
+        log "[ERROR] DP 6.5+ requires both image and SHA1 file; verification cannot be skipped."
+        return 1
+      fi
 
-      (
-        cd "${dl_img_dir}" || exit 2
+      local expected_sha1 actual_sha1
+      expected_sha1="$(awk 'NF {print $1; exit}' "${dl_img_dir}/${remote_sha1}" | tr 'A-F' 'a-f')"
+      actual_sha1="$(sha1sum "${dl_img_dir}/${remote_qcow2}" | awk '{print $1}' | tr 'A-F' 'a-f')"
 
-        if ! sha1sum -c "${remote_sha1}"; then
-          log "[WARN] sha1sum verification failed."
+      if [[ ! "${expected_sha1}" =~ ^[0-9a-f]{40}$ ]] || [[ "${expected_sha1}" != "${actual_sha1}" ]]; then
+        log "[ERROR] SHA1 verification failed for ${remote_qcow2}. Expected=${expected_sha1:-invalid}, Actual=${actual_sha1:-unknown}"
+        return 1
+      fi
 
-          # Temporarily disable set -e to handle cancel gracefully (in subshell)
-          set +e
-          whiptail_yesno "STEP 09 - sha1 verification failed" "sha1 verification failed.\n\nFile may be corrupted.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 09"
-          local sha_continue_rc=$?
-          set -e
-          
-          if [[ ${sha_continue_rc} -eq 0 ]]; then
-            log "[STEP 09] User chose to continue despite sha1 failure."
-            exit 0
-          else
-            log "[STEP 09] User stopped STEP 09 due to sha1 failure."
-            exit 3
+      verified_sha1="${actual_sha1}"
+      # The Ubuntu 24.04 deploy script runs sha1sum -c from the caller's CWD.
+      # Store an absolute image path so the second verification is location-independent.
+      printf '%s  %s\n' "${verified_sha1}" "${dl_img_dir}/${remote_qcow2}" | sudo tee "${dl_img_dir}/${remote_sha1}" >/dev/null
+      log "[STEP 09] SHA1 verification succeeded (strict 6.5+ mode)."
+    else
+      # Preserve the existing 6.2.1 ~ 6.4 checksum behavior unchanged.
+      if [[ -f "${dl_img_dir}/${remote_sha1}" && -f "${dl_img_dir}/${remote_qcow2}" ]]; then
+        log "[STEP 09] Running sha1sum verification for ${remote_qcow2}"
+
+        (
+          cd "${dl_img_dir}" || exit 2
+
+          if ! sha1sum -c "${remote_sha1}"; then
+            log "[WARN] sha1sum verification failed."
+
+            # Temporarily disable set -e to handle cancel gracefully (in subshell)
+            set +e
+            whiptail_yesno "STEP 09 - sha1 verification failed" "sha1 verification failed.\n\nFile may be corrupted.\n\nProceed anyway?\n\n[Yes] continue\n[No] stop STEP 09"
+            local sha_continue_rc=$?
+            set -e
+            
+            if [[ ${sha_continue_rc} -eq 0 ]]; then
+              log "[STEP 09] User chose to continue despite sha1 failure."
+              exit 0
+            else
+              log "[STEP 09] User stopped STEP 09 due to sha1 failure."
+              exit 3
+            fi
           fi
+
+          log "[STEP 09] sha1sum verification succeeded."
+          exit 0
+        )
+
+        local sha_rc=$?
+        case "${sha_rc}" in
+          0) ;; # ok
+          2) log "[STEP 09] Failed to access directory during sha1 check"; return 1 ;;
+          3) log "[STEP 09] User aborted STEP 09 due to sha1 failure"; return 1 ;;
+          *) log "[STEP 09] Unknown error during sha1 verification (code=${sha_rc})"; return 1 ;;
+        esac
+      else
+        log "[STEP 09] SHA1 file or image missing; skipping sha1 verification."
+      fi
+    fi
+
+    # 4-3) Keep the official 6.5+ filename unchanged; preserve legacy rename behavior below 6.5.
+    if [[ -f "${dl_img_dir}/${remote_qcow2}" ]]; then
+      if [[ "${is_ubuntu2404_official}" -eq 0 ]]; then
+        if [[ "${remote_qcow2}" != "${local_qcow2}" ]]; then
+          log "[STEP 09] Renaming: ${remote_qcow2} -> ${local_qcow2}"
+          sudo mv "${dl_img_dir}/${remote_qcow2}" "${dl_img_dir}/${local_qcow2}"
         fi
 
-        log "[STEP 09] sha1sum verification succeeded."
-        exit 0
-      )
-
-      local sha_rc=$?
-      case "${sha_rc}" in
-        0) ;; # ok
-        2) log "[STEP 09] Failed to access directory during sha1 check"; return 1 ;;
-        3) log "[STEP 09] User aborted STEP 09 due to sha1 failure"; return 1 ;;
-        *) log "[STEP 09] Unknown error during sha1 verification (code=${sha_rc})"; return 1 ;;
-      esac
-    else
-      log "[STEP 09] SHA1 file or image missing; skipping sha1 verification."
-    fi
-
-    # 4-3) Rename: Long Name -> Short Name
-    if [[ -f "${dl_img_dir}/${remote_qcow2}" ]]; then
-      log "[STEP 09] Renaming: ${remote_qcow2} -> ${local_qcow2}"
-      sudo mv "${dl_img_dir}/${remote_qcow2}" "${dl_img_dir}/${local_qcow2}"
-
-      # Remove SHA1 file (no longer needed, avoid confusion)
-      sudo rm -f "${dl_img_dir}/${remote_sha1}"
+        # Legacy compatibility path does not retain the SHA1 file after verification.
+        sudo rm -f "${dl_img_dir}/${remote_sha1}"
+      else
+        log "[STEP 09] DP 6.5+: preserving official image filename: ${remote_qcow2}"
+      fi
     fi
 
     #######################################
-    # 5) Patch virt_deploy_uvp_centos.sh (Short Name + ACPS_BASE_URL)
+    # 5) Patch the selected deploy script only where required by this installer
     #######################################
     local target_script="${dl_img_dir}/${dp_script}"
-    local hardcoded_image_name="${local_qcow2}" # Short Name
+    local hardcoded_image_name="${local_qcow2}"
 
     if [[ -f "${target_script}" ]]; then
-      log "[STEP 09] Patching virt_deploy_uvp_centos.sh (Short Name + ACPS_BASE_URL)"
+      if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+        log "[STEP 09] Preparing virt_deploy_uvp_ubuntu2404.sh for DP Installer integration"
 
-      # 1. IMAGE variable patch
-      sed -i "s|^#\?IMAGE=\${DIR}/\${IMAGE_NAME}|IMAGE=${dl_img_dir}/${hardcoded_image_name}|" "${target_script}"
+        # STEP 08 is authoritative for /etc/libvirt/hooks/qemu. Disable only the
+        # deploy-script calls that would add duplicate DL/DA NAT rules.
+        sudo sed -i '/^[[:space:]]*gen_qemu_hook_file[[:space:]]*$/s|gen_qemu_hook_file|: # disabled by DP Installer; STEP 08 owns /etc/libvirt/hooks/qemu|' "${target_script}"
 
-      # 2. uvp_package_url patch (use ACPS_BASE_URL, not FS_SERVER or apsdev)
-      sed -i "s|^#\?uvp_package_url=.*|uvp_package_url=${acps_url}/release/\${RELEASE}/dataprocessor/${hardcoded_image_name}|" "${target_script}"
+        # The installer policy is strict: a failed checksum must abort deployment.
+        if grep -q 'Checksum failed. Continue anyway?' "${target_script}"; then
+          sudo sed -i '/read -e -p "Checksum failed\. Continue anyway?/,/\[\[ ! \$choice =~ \^\[Yy\]\$ \]\] && exit 1/c\    echo "Checksum failed. Deployment aborted by DP Installer policy."\n    exit 1' "${target_script}"
+        fi
 
-      log "[STEP 09] virt_deploy_uvp_centos.sh patched (IMAGE, uvp_package_url)."
+        if grep -Eq '^[[:space:]]*gen_qemu_hook_file[[:space:]]*$' "${target_script}"; then
+          log "[ERROR] Failed to disable Ubuntu 24.04 deploy-script qemu hook management."
+          return 1
+        fi
+        if grep -q 'Checksum failed. Continue anyway?' "${target_script}"; then
+          log "[ERROR] Failed to enforce strict checksum policy in ${dp_script}."
+          return 1
+        fi
+
+        log "[STEP 09] Ubuntu 24.04 deploy script prepared (STEP 08 hook ownership + strict checksum)."
+      else
+        log "[STEP 09] Patching virt_deploy_uvp_centos.sh (Short Name + ACPS_BASE_URL)"
+
+        # 1. IMAGE variable patch
+        sed -i "s|^#\?IMAGE=\${DIR}/\${IMAGE_NAME}|IMAGE=${dl_img_dir}/${hardcoded_image_name}|" "${target_script}"
+
+        # 2. uvp_package_url patch (use ACPS_BASE_URL, not FS_SERVER or apsdev)
+        sed -i "s|^#\?uvp_package_url=.*|uvp_package_url=${acps_url}/release/\${RELEASE}/dataprocessor/${hardcoded_image_name}|" "${target_script}"
+
+        log "[STEP 09] virt_deploy_uvp_centos.sh patched (IMAGE, uvp_package_url)."
+      fi
     fi
 
     #######################################
@@ -6498,7 +6587,7 @@ step_09_dp_download_v621() {
 
     run_cmd "sudo mkdir -p ${da_img_dir}"
 
-    # Copy image (Short Name)
+    # Copy image using the version-appropriate filename.
     if [[ -f "${dl_img_dir}/${local_qcow2}" ]]; then
       run_cmd "sudo cp ${dl_img_dir}/${local_qcow2} ${da_img_dir}/"
     else
@@ -6510,6 +6599,17 @@ step_09_dp_download_v621() {
       run_cmd "sudo cp ${dl_img_dir}/${dp_script} ${da_img_dir}/"
     else
       log "[WARN] ${dp_script} missing; skipping DA script copy."
+    fi
+
+    # DP 6.5+ deploy script verifies the local image again. Keep a DA-specific
+    # SHA1 file with an absolute DA image path so sha1sum -c is CWD-independent.
+    if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+      if [[ -z "${verified_sha1}" || ! -f "${da_img_dir}/${local_qcow2}" ]]; then
+        log "[ERROR] DP 6.5+ DA image/SHA1 preparation failed."
+        return 1
+      fi
+      printf '%s  %s\n' "${verified_sha1}" "${da_img_dir}/${local_qcow2}" | sudo tee "${da_img_dir}/${remote_sha1}" >/dev/null
+      log "[STEP 09] Preserved strict SHA1 files for DL and DA Ubuntu 24.04 images."
     fi
   else
     # DRY_RUN mode
@@ -6535,22 +6635,27 @@ step_09_dp_download_v621() {
     echo "# Final local name: ${local_qcow2}"
     echo "  (This filename is used in Step 10/11)"
     echo
+    echo "# Deploy script: ${dp_script}"
     echo "# Download path: ${dl_img_dir}"
-    echo "# Script patched: Yes (IMAGE, uvp_package_url)"
+    if [[ "${is_ubuntu2404_official}" -eq 1 ]]; then
+      echo "# DP 6.5+ mode: official Ubuntu 24.04 filename preserved; strict SHA1 enabled"
+    else
+      echo "# Compatibility mode: legacy deploy script patch retained"
+    fi
     echo "# ACPS_BASE_URL: ${acps_url}"
   } >> "${tmp_info}"
 
   show_textbox "STEP 09 - Summary (v621)" "${tmp_info}"
 }
 
-# Show v6.3+ DL/DA deployment warning (AELDEV-65301) and confirm before proceeding
+# Show the AELDEV-65301 workaround warning only for DP 6.3.x ~ 6.4.x
 show_v63_deployment_warning_and_confirm() {
   local step_num="$1"
   local role="$2"
   local tmp_file
   tmp_file=$(mktemp)
   cat << 'WARN_EOF' > "${tmp_file}"
-IMPORTANT: Ubuntu 24.04 based DP deployment (v6.3+)
+IMPORTANT: Ubuntu 24.04 compatibility deployment (v6.3.x ~ v6.4.x)
 
 - Starting from version 6.3, DP is deployed on Ubuntu 24.04-based images, which differs from the previous deployment method.
 
@@ -6570,7 +6675,7 @@ IMPORTANT: Ubuntu 24.04 based DP deployment (v6.3+)
 
 - After force exiting the DL/DA deployment and running Step 12, the deployment will complete normally.
 WARN_EOF
-  show_textbox "STEP ${step_num} - ${role} Deployment (v6.3+) - Read Before Proceeding" "${tmp_file}"
+  show_textbox "STEP ${step_num} - ${role} Deployment (v6.3.x ~ v6.4.x) - Read Before Proceeding" "${tmp_file}"
   rm -f "${tmp_file}"
   whiptail_yesno "Proceed with ${role} deployment?" "Do you want to proceed with the ${role} deployment?\n\n(You will need to press CTRL+C when the dots appear to complete deployment, then run Step 12.)" 14 80
 }
@@ -6588,10 +6693,13 @@ step_10_dl_master_deploy_v621() {
 
   local _DRY_RUN="${DRY_RUN:-0}"
 
-  # v6.3+ deployment warning (AELDEV-65301) - user must acknowledge before proceeding
-  if ! show_v63_deployment_warning_and_confirm "10" "DL"; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled. Skipping DL-master deploy."
-    return 0
+  # AELDEV-65301 manual workaround applies only to 6.3.x ~ 6.4.x.
+  local _STEP10_VER="${DP_VERSION:-}"
+  if [[ -n "${_STEP10_VER}" ]] && version_ge "${_STEP10_VER}" "6.3.0" && version_lt "${_STEP10_VER}" "6.5.0"; then
+    if ! show_v63_deployment_warning_and_confirm "10" "DL"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] User canceled. Skipping DL-master deploy."
+      return 0
+    fi
   fi
 
   # VM hostname input (KT v1.8 feature)
@@ -6653,6 +6761,16 @@ step_10_dl_master_deploy_v621() {
     return 0
   fi
 
+  # Select the deploy script/image for the requested DP version.
+  local DP_DEPLOY_SCRIPT="virt_deploy_uvp_centos.sh"
+  local QCOW2_BASENAME="aella-dataprocessor-${_DP_VERSION}.qcow2"
+  local IS_DP_65_PLUS=0
+  if version_ge "${_DP_VERSION}" "6.5.0"; then
+    IS_DP_65_PLUS=1
+    DP_DEPLOY_SCRIPT="virt_deploy_uvp_ubuntu2404.sh"
+    QCOW2_BASENAME="aella-dataprocessor-ubuntu2404-${_DP_VERSION}.qcow2"
+  fi
+
   # Safety: cleanup_dl_da_vm_and_images() already removed only the VM artifacts
   # explicitly authorized by exact-name confirmation. Do not delete additional
   # hostname/role directories that were not tied to a confirmed libvirt domain.
@@ -6671,12 +6789,14 @@ step_10_dl_master_deploy_v621() {
     fi
   fi
 
-  # Locate virt_deploy_uvp_centos.sh
+  # Locate the version-appropriate deploy script.
   local DP_SCRIPT_PATH_CANDIDATES=()
-  [[ -n "${DP_SCRIPT_PATH:-}" ]] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
-  DP_SCRIPT_PATH_CANDIDATES+=("${DL_IMAGE_DIR}/virt_deploy_uvp_centos.sh")
-  DP_SCRIPT_PATH_CANDIDATES+=("${DL_INSTALL_DIR}/virt_deploy_uvp_centos.sh")
-  DP_SCRIPT_PATH_CANDIDATES+=("./virt_deploy_uvp_centos.sh")
+  if [[ -n "${DP_SCRIPT_PATH:-}" && "$(basename "${DP_SCRIPT_PATH}")" == "${DP_DEPLOY_SCRIPT}" ]]; then
+    DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
+  fi
+  DP_SCRIPT_PATH_CANDIDATES+=("${DL_IMAGE_DIR}/${DP_DEPLOY_SCRIPT}")
+  DP_SCRIPT_PATH_CANDIDATES+=("${DL_INSTALL_DIR}/${DP_DEPLOY_SCRIPT}")
+  DP_SCRIPT_PATH_CANDIDATES+=("./${DP_DEPLOY_SCRIPT}")
 
   local DP_SCRIPT_PATH=""
   local c
@@ -6688,18 +6808,29 @@ step_10_dl_master_deploy_v621() {
   done
 
   if [[ -z "${DP_SCRIPT_PATH}" ]]; then
-    whiptail_msgbox "STEP 10 - DL deploy" "Could not find virt_deploy_uvp_centos.sh.\nComplete STEP 09 first.\nSkipping this step." 14 80
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] virt_deploy_uvp_centos.sh not found. Skipping."
+    whiptail_msgbox "STEP 10 - DL deploy" "Could not find ${DP_DEPLOY_SCRIPT}.\nComplete STEP 09 first.\nSkipping this step." 14 80
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] ${DP_DEPLOY_SCRIPT} not found. Skipping."
     return 0
   fi
 
   # Check DL image
   # Step 10 always uses --nodownload=true since Step 09 already downloaded the image
-  local QCOW2_PATH="${DL_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
+  local QCOW2_PATH="${DL_IMAGE_DIR}/${QCOW2_BASENAME}"
   local DL_NODOWNLOAD="true"
 
   if [[ ! -f "${QCOW2_PATH}" ]]; then
+    if [[ "${IS_DP_65_PLUS}" -eq 1 ]]; then
+      log "[ERROR] DP 6.5+ DL qcow2 image not found: ${QCOW2_PATH}"
+      whiptail_msgbox "STEP 10 - DL deploy" "Required DP 6.5+ image was not found:\n${QCOW2_PATH}\n\nRun STEP 09 again before deployment." 14 85
+      return 1
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] WARNING: DL qcow2 image not found at ${QCOW2_PATH}. Will run with --nodownload=true (Step 09 should have downloaded it)."
+  fi
+
+  if [[ "${IS_DP_65_PLUS}" -eq 1 && ! -f "${QCOW2_PATH}.sha1" ]]; then
+    log "[ERROR] DP 6.5+ DL SHA1 file not found: ${QCOW2_PATH}.sha1"
+    whiptail_msgbox "STEP 10 - DL deploy" "Required DP 6.5+ SHA1 file was not found:\n${QCOW2_PATH}.sha1\n\nRun STEP 09 again before deployment." 14 85
+    return 1
   fi
 
   # Check mount
@@ -6801,7 +6932,7 @@ step_10_dl_master_deploy_v621() {
   nodownload    : ${DL_NODOWNLOAD}
   Script path   : ${DP_SCRIPT_PATH}
 
-Run virt_deploy_uvp_centos.sh with these settings?"
+Run ${DP_DEPLOY_SCRIPT} with these settings?"
 
   # Temporarily disable set -e to handle cancel gracefully
   set +e
@@ -6833,7 +6964,7 @@ Run virt_deploy_uvp_centos.sh with these settings?"
   local RC=$?
 
   if [[ ${RC} -ne 0 ]]; then
-    whiptail_msgbox "STEP 10 - DL deploy" "virt_deploy_uvp_centos.sh exited with code ${RC}.\nCheck status via virsh list / virsh console ${DL_HOSTNAME}." 14 80
+    whiptail_msgbox "STEP 10 - DL deploy" "${DP_DEPLOY_SCRIPT} exited with code ${RC}.\nCheck status via virsh list / virsh console ${DL_HOSTNAME}." 14 80
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 10] DL-master deploy failed with RC=${RC}."
     return ${RC}
   fi
@@ -6900,10 +7031,13 @@ step_11_da_master_deploy_v621() {
 
   local _DRY_RUN="${DRY_RUN:-0}"
 
-  # v6.3+ deployment warning (AELDEV-65301) - user must acknowledge before proceeding
-  if ! show_v63_deployment_warning_and_confirm "11" "DA"; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled. Skipping DA-master deploy."
-    return 0
+  # AELDEV-65301 manual workaround applies only to 6.3.x ~ 6.4.x.
+  local _STEP11_VER="${DP_VERSION:-}"
+  if [[ -n "${_STEP11_VER}" ]] && version_ge "${_STEP11_VER}" "6.3.0" && version_lt "${_STEP11_VER}" "6.5.0"; then
+    if ! show_v63_deployment_warning_and_confirm "11" "DA"; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] User canceled. Skipping DA-master deploy."
+      return 0
+    fi
   fi
 
   # VM hostname input (KT v1.8 feature)
@@ -6962,6 +7096,16 @@ step_11_da_master_deploy_v621() {
     return 0
   fi
 
+  # Select the deploy script/image for the requested DP version.
+  local DP_DEPLOY_SCRIPT="virt_deploy_uvp_centos.sh"
+  local QCOW2_BASENAME="aella-dataprocessor-${_DP_VERSION}.qcow2"
+  local IS_DP_65_PLUS=0
+  if version_ge "${_DP_VERSION}" "6.5.0"; then
+    IS_DP_65_PLUS=1
+    DP_DEPLOY_SCRIPT="virt_deploy_uvp_ubuntu2404.sh"
+    QCOW2_BASENAME="aella-dataprocessor-ubuntu2404-${_DP_VERSION}.qcow2"
+  fi
+
   # Safety: cleanup_dl_da_vm_and_images() already removed only the VM artifacts
   # explicitly authorized by exact-name confirmation. Do not delete additional
   # hostname/role directories that were not tied to a confirmed libvirt domain.
@@ -6985,13 +7129,15 @@ step_11_da_master_deploy_v621() {
   : "${DL_IP:=192.168.122.2}"
   local CM_FQDN="${CM_FQDN:-${DL_IP}}"
 
-  # Locate virt_deploy_uvp_centos.sh
+  # Locate the version-appropriate deploy script.
   local DP_SCRIPT_PATH_CANDIDATES=()
-  [[ -n "${DP_SCRIPT_PATH:-}" ]] && DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
-  DP_SCRIPT_PATH_CANDIDATES+=("${DA_IMAGE_DIR}/virt_deploy_uvp_centos.sh")
-  DP_SCRIPT_PATH_CANDIDATES+=("${DA_INSTALL_DIR}/virt_deploy_uvp_centos.sh")
-  DP_SCRIPT_PATH_CANDIDATES+=("./virt_deploy_uvp_centos.sh")
-  DP_SCRIPT_PATH_CANDIDATES+=("/root/virt_deploy_uvp_centos.sh")
+  if [[ -n "${DP_SCRIPT_PATH:-}" && "$(basename "${DP_SCRIPT_PATH}")" == "${DP_DEPLOY_SCRIPT}" ]]; then
+    DP_SCRIPT_PATH_CANDIDATES+=("${DP_SCRIPT_PATH}")
+  fi
+  DP_SCRIPT_PATH_CANDIDATES+=("${DA_IMAGE_DIR}/${DP_DEPLOY_SCRIPT}")
+  DP_SCRIPT_PATH_CANDIDATES+=("${DA_INSTALL_DIR}/${DP_DEPLOY_SCRIPT}")
+  DP_SCRIPT_PATH_CANDIDATES+=("./${DP_DEPLOY_SCRIPT}")
+  DP_SCRIPT_PATH_CANDIDATES+=("/root/${DP_DEPLOY_SCRIPT}")
 
   local DP_SCRIPT_PATH=""
   local c
@@ -7003,18 +7149,29 @@ step_11_da_master_deploy_v621() {
   done
 
   if [[ -z "${DP_SCRIPT_PATH}" ]]; then
-    whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh file not found.\n\nComplete STEP 09 first, then run again.\nSkipping this step." 14 80
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] virt_deploy_uvp_centos.sh not found. Skipping."
+    whiptail_msgbox "STEP 11 - DA Deployment" "${DP_DEPLOY_SCRIPT} file not found.\n\nComplete STEP 09 first, then run again.\nSkipping this step." 14 80
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] ${DP_DEPLOY_SCRIPT} not found. Skipping."
     return 0
   fi
 
   # Check DA image
   # Step 11 always uses --nodownload=true since Step 09 already downloaded the image
-  local QCOW2_PATH="${DA_IMAGE_DIR}/aella-dataprocessor-${_DP_VERSION}.qcow2"
+  local QCOW2_PATH="${DA_IMAGE_DIR}/${QCOW2_BASENAME}"
   local DA_NODOWNLOAD="true"
 
   if [[ ! -f "${QCOW2_PATH}" ]]; then
+    if [[ "${IS_DP_65_PLUS}" -eq 1 ]]; then
+      log "[ERROR] DP 6.5+ DA qcow2 image not found: ${QCOW2_PATH}"
+      whiptail_msgbox "STEP 11 - DA Deployment" "Required DP 6.5+ image was not found:\n${QCOW2_PATH}\n\nRun STEP 09 again before deployment." 14 85
+      return 1
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] WARNING: DA qcow2 image not found at ${QCOW2_PATH}. Will run with --nodownload=true (Step 09 should have downloaded it)."
+  fi
+
+  if [[ "${IS_DP_65_PLUS}" -eq 1 && ! -f "${QCOW2_PATH}.sha1" ]]; then
+    log "[ERROR] DP 6.5+ DA SHA1 file not found: ${QCOW2_PATH}.sha1"
+    whiptail_msgbox "STEP 11 - DA Deployment" "Required DP 6.5+ SHA1 file was not found:\n${QCOW2_PATH}.sha1\n\nRun STEP 09 again before deployment." 14 85
+    return 1
   fi
 
   # Check mount
@@ -7084,6 +7241,10 @@ step_11_da_master_deploy_v621() {
 --gw=${DA_GW} \
 --dns=${DA_DNS}"
 
+  if [[ "${IS_DP_65_PLUS}" -eq 1 ]]; then
+    CMD+=" --planned-role=DA-master"
+  fi
+
   # Final confirmation
   local SUMMARY
   SUMMARY="Deploy DA-master VM with:
@@ -7105,7 +7266,7 @@ step_11_da_master_deploy_v621() {
   nodownload      : ${DA_NODOWNLOAD}
   Script Path     : ${DP_SCRIPT_PATH}
 
-Execute virt_deploy_uvp_centos.sh with the above settings?"
+Execute ${DP_DEPLOY_SCRIPT} with the above settings?"
 
   # Temporarily disable set -e to handle cancel gracefully
   set +e
@@ -7137,7 +7298,7 @@ Execute virt_deploy_uvp_centos.sh with the above settings?"
   local RC=$?
 
   if [[ ${RC} -ne 0 ]]; then
-    whiptail_msgbox "STEP 11 - DA Deployment" "virt_deploy_uvp_centos.sh exited with error code ${RC}.\n\nCheck status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
+    whiptail_msgbox "STEP 11 - DA Deployment" "${DP_DEPLOY_SCRIPT} exited with error code ${RC}.\n\nCheck status using virsh list, virsh console ${DA_HOSTNAME}, etc." 14 80
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STEP 11] DA-master deploy failed with RC=${RC}."
     return ${RC}
   fi
@@ -7834,6 +7995,12 @@ step_12_sriov_cpu_affinity_v621() {
   fi
 
   local _DRY="${DRY_RUN:-0}"
+  local _STEP12_DP_VERSION="${DP_VERSION:-}"
+  _STEP12_DP_VERSION="$(echo "${_STEP12_DP_VERSION}" | tr -d '"' | xargs)"
+  local APPLY_LEGACY_UEFI_WORKAROUND=0
+  if [[ -n "${_STEP12_DP_VERSION}" ]] && version_ge "${_STEP12_DP_VERSION}" "6.3.0" && version_lt "${_STEP12_DP_VERSION}" "6.5.0"; then
+    APPLY_LEGACY_UEFI_WORKAROUND=1
+  fi
 
   # Auto-detect VM names: if DL_HOSTNAME/DA_HOSTNAME not set, look in virsh list
   local DL_VM="${DL_HOSTNAME:-}"
@@ -7911,8 +8078,8 @@ Do you want to continue?"
   # =========================================================================
   # [Moved from Step 10/11] UEFI/XML conversion and partition expansion logic (modified version)
   # =========================================================================
-  if [[ "${_DRY}" -eq 0 ]]; then
-    log "[STEP 12] Performing PDF guide-based UEFI/XML conversion (regeneration) before SR-IOV/CPU settings"
+  if [[ "${APPLY_LEGACY_UEFI_WORKAROUND}" -eq 1 && "${_DRY}" -eq 0 ]]; then
+    log "[STEP 12] Performing 6.3/6.4 compatibility UEFI/XML conversion before SR-IOV/CPU settings"
 
     # -----------------------------------------------------------------
     # [Important] Force load memory values from config file (fixes 186GB issue)
@@ -7990,8 +8157,10 @@ Do you want to continue?"
     fi
 
     log "[STEP 12] UEFI XML conversion complete. Now adding SR-IOV and CPU Affinity settings."
+  elif [[ "${APPLY_LEGACY_UEFI_WORKAROUND}" -eq 1 ]]; then
+    log "[DRY-RUN] Simulating 6.3/6.4 UEFI XML conversion and Raw conversion process in Step 12."
   else
-    log "[DRY-RUN] Simulating UEFI XML conversion and Raw conversion process in Step 12."
+    log "[STEP 12] DP ${_STEP12_DP_VERSION}: skipping legacy UEFI/XML regeneration; preserving deploy-script VM definition."
   fi
   # =========================================================================
 
@@ -8050,8 +8219,8 @@ CLOUD
     fi
   }
 
-  # Ensure seed ISO for both VMs (after UEFI/XML conversion)
-  if [[ "${_DRY}" -eq 0 ]]; then
+  # Seed ISO regeneration belongs only to the 6.3/6.4 compatibility workaround.
+  if [[ "${APPLY_LEGACY_UEFI_WORKAROUND}" -eq 1 && "${_DRY}" -eq 0 ]]; then
     ensure_seed_iso "${DL_VM}"
     ensure_seed_iso "${DA_VM}"
   fi
@@ -8644,7 +8813,7 @@ EOF
 
 
 step_09_dp_download() {
-  log "[STEP 09] Download DP deploy script and image (virt_deploy_uvp_centos.sh + qcow2)"
+  log "[STEP 09] Download DP deploy script and image (version-dependent deploy script + qcow2)"
   load_config
   local tmp_info="/tmp/xdr_step09_info.txt"
 
@@ -8654,9 +8823,10 @@ step_09_dp_download() {
   local ver="${DP_VERSION:-}"
   
   # DP_VERSION gate:
-  #   - < 6.3 : keep legacy DP-Installer logic (do not change)
-  #   - >= 6.3 : use KT v1.8 Step 09 behavior (Ubuntu 24.04 based DL/DA)
-  if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
+  #   - <= 6.2.0      : keep existing legacy DP-Installer logic unchanged
+  #   - 6.2.1 ~ 6.4.x: use compatibility Step 09 path
+  #   - >= 6.5.0      : same versioned path, with official Ubuntu 24.04 deploy artifacts
+  if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
     step_09_dp_download_v621
     return
   fi
@@ -9449,10 +9619,11 @@ step_10_dl_master_deploy() {
     fi
 
     # DP_VERSION gate:
-    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.3 : use KT v1.8 Step 10 behavior (Ubuntu 24.04 based DL/DA)
+    #   - <= 6.2.0      : keep existing legacy DP-Installer logic unchanged
+    #   - 6.2.1 ~ 6.4.x: use compatibility Step 10 path
+    #   - >= 6.5.0      : same versioned path, with official Ubuntu 24.04 deploy artifacts
     local ver="${DP_VERSION:-}"
-    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
+    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
       step_10_dl_master_deploy_v621
       return
     fi
@@ -9864,10 +10035,11 @@ step_11_da_master_deploy() {
     fi
 
     # DP_VERSION gate:
-    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.3 : use KT v1.8 Step 11 behavior (Ubuntu 24.04 based DL/DA)
+    #   - <= 6.2.0      : keep existing legacy DP-Installer logic unchanged
+    #   - 6.2.1 ~ 6.4.x: use compatibility Step 11 path
+    #   - >= 6.5.0      : same versioned path, with official Ubuntu 24.04 deploy artifacts
     local ver="${DP_VERSION:-}"
-    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.3"; then
+    if [[ -n "${ver}" ]] && version_ge "${ver}" "6.2.1"; then
       step_11_da_master_deploy_v621
       return
     fi
@@ -10879,8 +11051,9 @@ step_12_sriov_cpu_affinity() {
     fi
 
     # DP_VERSION gate:
-    #   - < 6.3 : keep legacy DP-Installer logic (do not change)
-    #   - >= 6.3 : use KT v1.8 Step 12 behavior (Ubuntu 24.04 based DL/DA)
+    #   - <= 6.2.0      : keep existing legacy DP-Installer logic unchanged
+    #   - 6.2.1 ~ 6.4.x: use compatibility Step 12 path
+    #   - >= 6.5.0      : use the same Step 12 tuning path without legacy UEFI regeneration
    local ver="${DP_VERSION:-}"
     # Sanitize DP_VERSION: remove quotes and whitespace
     ver="$(echo "$ver" | tr -d '\"' | xargs)"
@@ -10893,7 +11066,7 @@ step_12_sriov_cpu_affinity() {
     fi
     
     # Compare version (after sanitization)
-    if version_ge "${ver}" "6.3"; then
+    if version_ge "${ver}" "6.2.1"; then
       step_12_sriov_cpu_affinity_v621
       local v621_rc=$?
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== STEP END:   ${STEP_ID} - 12. SR-IOV + CPU Affinity + CD-ROM removal + DL data LV ====="

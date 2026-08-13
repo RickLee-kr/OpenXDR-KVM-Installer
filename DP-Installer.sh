@@ -5317,42 +5317,133 @@ step_07_lvm_storage() {
   fi
 
   #######################################
-  # 0-5) Remove all existing LVM/VG/LV on selected disks
+  # 0-5) Safely remove existing LVM/VG/LV on selected disks
   #######################################
   log "[STEP 07] Removing existing LVM metadata (LV/VG/PV) from selected disks."
   log "[STEP 07] If existing volumes are present, clearing them may take more than 10 minutes. Please wait and do not interrupt the process."
 
-  local disk pv vg_name pv_list_for_disk
+  local disk pv vg_name pv_list_for_disk lv_path mount_target open_count
+  local -a selected_pvs=()
+  local -a selected_vgs=()
+  local -A selected_pv_seen=()
+  local -A selected_vg_seen=()
 
+  # Collect PV/VG membership first, before changing any LVM metadata.
+  # A striped VG such as vg_dl spans multiple disks, so it must be removed only once.
   for disk in ${DATA_SSD_LIST}; do
-    log "[STEP 07] Cleaning existing LVM structures on /dev/${disk}"
+    log "[STEP 07] Inspecting existing LVM structures on /dev/${disk}"
 
-    # List PVs on this disk (includes /dev/sdb, /dev/sdb1, etc.)
     pv_list_for_disk=$(sudo pvs --noheadings -o pv_name 2>/dev/null \
-                         | awk "\$1 ~ /^\\/dev\\/${disk}([0-9]+)?\$/ {print \$1}")
+                         | awk "\$1 ~ /^\/dev\/${disk}([0-9]+)?\$/ {print \$1}")
 
     for pv in ${pv_list_for_disk}; do
-      vg_name=$(sudo pvs --noheadings -o vg_name "${pv}" 2>/dev/null | awk '{print $1}')
-
-      if [[ -n "${vg_name}" && "${vg_name}" != "-" ]]; then
-        log "[STEP 07] PV ${pv} belongs to VG ${vg_name} → removing LV/VG"
-
-        # Remove all LVs in VG (ignore errors if repeated)
-        run_cmd "sudo lvremove -y ${vg_name} || true"
-
-        # Remove VG (ignore if already removed)
-        run_cmd "sudo vgremove -y ${vg_name} || true"
+      if [[ -z "${selected_pv_seen[${pv}]:-}" ]]; then
+        selected_pvs+=("${pv}")
+        selected_pv_seen["${pv}"]=1
       fi
 
-      # Remove PV metadata
-      run_cmd "sudo pvremove -y ${pv} || true"
+      vg_name=$(sudo pvs --noheadings -o vg_name "${pv}" 2>/dev/null | awk '{print $1}')
+      if [[ -n "${vg_name}" && "${vg_name}" != "-" && -z "${selected_vg_seen[${vg_name}]:-}" ]]; then
+        selected_vgs+=("${vg_name}")
+        selected_vg_seen["${vg_name}"]=1
+      fi
     done
-
-    # Wipe remaining filesystem/partition signatures on disk
-    log "[STEP 07] Running wipefs on /dev/${disk}"
-    run_cmd "sudo wipefs -a /dev/${disk} || true"
   done
 
+  # Allow libvirt/QEMU and udev to release block-device references after VM cleanup.
+  if [[ "${_DRY_RUN}" -eq 1 ]]; then
+    log "[DRY-RUN] Would wait for libvirt/QEMU/udev to release LVM block devices"
+  else
+    sync
+    sudo udevadm settle || true
+    sleep 2
+  fi
+
+  # Remove each VG exactly once. Before removal, ensure every LV is no longer in use.
+  for vg_name in "${selected_vgs[@]}"; do
+    log "[STEP 07] Preparing VG ${vg_name} for safe removal"
+
+    while IFS= read -r lv_path; do
+      [[ -z "${lv_path}" ]] && continue
+
+      # If an LV is mounted on the host, unmount it because destructive rerun was confirmed.
+      while IFS= read -r mount_target; do
+        [[ -z "${mount_target}" ]] && continue
+        log "[STEP 07] LV ${lv_path} is mounted on ${mount_target} → unmounting before removal"
+        if [[ "${_DRY_RUN}" -eq 1 ]]; then
+          log "[DRY-RUN] sudo umount -- ${mount_target}"
+        else
+          if ! sudo umount -- "${mount_target}"; then
+            log "[ERROR] Failed to unmount ${mount_target}. STEP 07 will stop before modifying LVM metadata."
+            return 1
+          fi
+        fi
+      done < <(findmnt -rn -S "${lv_path}" -o TARGET 2>/dev/null || true)
+
+      # A QEMU process or another consumer can keep an LV open even when it is not mounted.
+      # Never force-remove an open LV: report the holder and stop safely instead.
+      if [[ "${_DRY_RUN}" -eq 0 ]]; then
+        open_count=$(sudo dmsetup info -c --noheadings -o open "${lv_path}" 2>/dev/null \
+          | awk 'NF {gsub(/[[:space:]]/, "", $1); print $1; exit}' || true)
+        [[ "${open_count}" =~ ^[0-9]+$ ]] || open_count=0
+
+        if [[ "${open_count}" -gt 0 ]]; then
+          log "[ERROR] LV ${lv_path} is still in use (device-mapper open count=${open_count})."
+          log "[ERROR] Refusing to continue with lvremove/vgremove/pvremove/wipefs while the LV is busy."
+          log "[STEP 07] Processes using ${lv_path}:"
+          sudo fuser -vm "${lv_path}" 2>&1 | tee -a "${LOG_FILE}" || true
+          log "[STEP 07] Defined VM disks referencing ${lv_path}:"
+          local _check_vm
+          while IFS= read -r _check_vm; do
+            [[ -z "${_check_vm}" ]] && continue
+            sudo virsh domblklist "${_check_vm}" --details 2>/dev/null \
+              | grep -F "${lv_path}" \
+              | sed "s/^/[${_check_vm}] /" \
+              | tee -a "${LOG_FILE}" || true
+          done < <(sudo virsh list --all --name 2>/dev/null || true)
+          log "[ERROR] Release the process/device above and rerun STEP 07. No disk partitioning has been performed."
+          return 1
+        fi
+      else
+        log "[DRY-RUN] Would verify device-mapper open count is 0 for ${lv_path}"
+      fi
+    done < <(sudo lvs --noheadings -o lv_path "${vg_name}" 2>/dev/null | awk 'NF {print $1}' || true)
+
+    # Remove LVs and VG only after all LVs in this VG are confirmed unused.
+    if sudo lvs "${vg_name}" >/dev/null 2>&1; then
+      if ! run_cmd "sudo lvremove -y '${vg_name}'"; then
+        log "[ERROR] Failed to remove logical volumes in VG ${vg_name}. STEP 07 aborted safely."
+        return 1
+      fi
+    fi
+
+    if sudo vgs "${vg_name}" >/dev/null 2>&1; then
+      if ! run_cmd "sudo vgremove -y '${vg_name}'"; then
+        log "[ERROR] Failed to remove VG ${vg_name}. STEP 07 aborted safely."
+        return 1
+      fi
+    fi
+  done
+
+  # Remove PV labels only after their VGs are gone.
+  for pv in "${selected_pvs[@]}"; do
+    if sudo pvs "${pv}" >/dev/null 2>&1; then
+      log "[STEP 07] Removing PV metadata from ${pv}"
+      if ! run_cmd "sudo pvremove -y '${pv}'"; then
+        log "[ERROR] Failed to remove PV metadata from ${pv}. STEP 07 aborted safely."
+        return 1
+      fi
+    fi
+  done
+
+  # Finally wipe disk signatures. A busy disk is now a hard failure, not an ignored warning.
+  for disk in ${DATA_SSD_LIST}; do
+    log "[STEP 07] Running wipefs on /dev/${disk}"
+    if ! run_cmd "sudo wipefs -a '/dev/${disk}'"; then
+      log "[ERROR] /dev/${disk} is still busy or could not be wiped. STEP 07 aborted before repartitioning."
+      return 1
+    fi
+  done
 
   #######################################
   # 1) Create GPT label + single partition on each disk

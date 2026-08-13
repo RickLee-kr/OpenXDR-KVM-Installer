@@ -6290,6 +6290,51 @@ step_09_dp_download_v621() {
   log "  - Local filename  : ${local_qcow2}"
 
   #######################################
+  # 2-A) Remove non-target DP images before reinstall
+  #######################################
+  # Keep only the image name(s) valid for the requested DP_VERSION.
+  # This removes older/newer (and obsolete alternate-name) DP images so
+  # enough free space is available before the target image is downloaded.
+  local cleanup_dir cleanup_file cleanup_name
+  local keep_sha1_remote="${remote_qcow2}.sha1"
+  local keep_sha1_local="${local_qcow2}.sha1"
+
+  for cleanup_dir in "${dl_img_dir}" "/stellar/da/images"; do
+    if [[ ! -d "${cleanup_dir}" ]]; then
+      continue
+    fi
+
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      log "[DRY-RUN] [STEP 09] Would remove non-target DP images from ${cleanup_dir} (keep: ${remote_qcow2}, ${local_qcow2})"
+      continue
+    fi
+
+    log "[STEP 09] Cleaning non-target DP images from ${cleanup_dir}..."
+
+    while IFS= read -r -d '' cleanup_file; do
+      cleanup_name=$(basename "${cleanup_file}")
+      if [[ "${cleanup_name}" == "${remote_qcow2}" || "${cleanup_name}" == "${local_qcow2}" ]]; then
+        log "[STEP 09] Keeping target-version qcow2: ${cleanup_file}"
+        continue
+      fi
+
+      log "[STEP 09] Removing non-target qcow2: ${cleanup_file}"
+      sudo rm -f "${cleanup_file}" "${cleanup_file}.sha1" || log "[WARN] Failed to remove ${cleanup_file}"
+    done < <(find "${cleanup_dir}" -maxdepth 1 -type f -name 'aella-dataprocessor-*.qcow2' -print0 2>/dev/null || true)
+
+    # Remove orphan SHA1 files that do not belong to the requested target image.
+    while IFS= read -r -d '' cleanup_file; do
+      cleanup_name=$(basename "${cleanup_file}")
+      if [[ "${cleanup_name}" == "${keep_sha1_remote}" || "${cleanup_name}" == "${keep_sha1_local}" ]]; then
+        continue
+      fi
+
+      log "[STEP 09] Removing non-target/orphan SHA1: ${cleanup_file}"
+      sudo rm -f "${cleanup_file}" || log "[WARN] Failed to remove ${cleanup_file}"
+    done < <(find "${cleanup_dir}" -maxdepth 1 -type f -name 'aella-dataprocessor-*.qcow2.sha1' -print0 2>/dev/null || true)
+  done
+
+  #######################################
   # 3-A) Check for local qcow2 >= 1GB reuse
   #######################################
   local use_local_qcow=0
